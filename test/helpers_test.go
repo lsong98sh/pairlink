@@ -119,13 +119,15 @@ type relaySpec struct {
 	Tunnel, TCP, UDP, Manage string
 	AuthToken                string
 	TLSCert, TLSKey          string
-	Pprof                    bool
-	LogLevel                 string
-	PairTimeout              time.Duration
-	IdleTimeout              time.Duration
-	HeartbeatTimeout         time.Duration
-	UDPSessionTimeout        time.Duration
-	TokenTTL                 time.Duration
+	// TLS 是三态开关原文（auto/true/false）；空表示不写进 ini（默认 auto）。
+	TLS               string
+	Pprof             bool
+	LogLevel          string
+	PairTimeout       time.Duration
+	IdleTimeout       time.Duration
+	HeartbeatTimeout  time.Duration
+	UDPSessionTimeout time.Duration
+	TokenTTL          time.Duration
 }
 
 type serverService struct {
@@ -139,10 +141,12 @@ type agentSpec struct {
 	Services                 []serverService
 	TLSCA                    string
 	TLSInsecure              bool
-	Pprof                    bool
-	LogLevel                 string
-	Heartbeat                time.Duration
-	UDPSessionTimeout        time.Duration
+	// TLS 是三态开关原文（auto/true/false）；空表示不写进 ini（默认 auto）。
+	TLS               string
+	Pprof             bool
+	LogLevel          string
+	Heartbeat         time.Duration
+	UDPSessionTimeout time.Duration
 	// NoReconnect 写 reconnect = false（阶段 6C 之前的行为：控制连接断开即退出）。
 	NoReconnect bool
 	// ReconnectMaxBackoff 覆盖 reconnect_max_backoff。
@@ -159,12 +163,14 @@ type clientSpec struct {
 	Services                 []clientService
 	TLSCA                    string
 	TLSInsecure              bool
-	Pprof                    bool
-	LogLevel                 string
-	Heartbeat                time.Duration
-	PairTimeout              time.Duration
-	UDPSessionTimeout        time.Duration
-	NoSubscribe              bool
+	// TLS 是三态开关原文（auto/true/false）；空表示不写进 ini（默认 auto）。
+	TLS               string
+	Pprof             bool
+	LogLevel          string
+	Heartbeat         time.Duration
+	PairTimeout       time.Duration
+	UDPSessionTimeout time.Duration
+	NoSubscribe       bool
 	// NoReconnect 写 reconnect = false（阶段 6C 之前的行为：控制连接断开即退出）。
 	NoReconnect bool
 	// ReconnectMaxBackoff 覆盖 reconnect_max_backoff。
@@ -197,6 +203,7 @@ func writeRelayINI(t *testing.T, s relaySpec) (*config.Config, string) {
 	if s.TLSKey != "" {
 		fmt.Fprintf(&b, "tls_key = %s\n", s.TLSKey)
 	}
+	writeTLS(&b, s.TLS)
 	writeDuration(&b, "pair_timeout", s.PairTimeout)
 	writeDuration(&b, "idle_timeout", s.IdleTimeout)
 	writeDuration(&b, "heartbeat_timeout", s.HeartbeatTimeout)
@@ -234,6 +241,7 @@ func writeAgentINI(t *testing.T, s agentSpec) (*config.Config, string) {
 	if s.TLSInsecure {
 		b.WriteString("tls_insecure_skip_verify = true\n")
 	}
+	writeTLS(&b, s.TLS)
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
 	if s.NoReconnect {
@@ -271,6 +279,7 @@ func writeClientINI(t *testing.T, s clientSpec) (*config.Config, string) {
 	if s.TLSInsecure {
 		b.WriteString("tls_insecure_skip_verify = true\n")
 	}
+	writeTLS(&b, s.TLS)
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "pair_timeout", s.PairTimeout)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
@@ -291,6 +300,13 @@ func defaultLogLevel(s string) string {
 func writeDuration(b *strings.Builder, key string, d time.Duration) {
 	if d > 0 {
 		fmt.Fprintf(b, "%s = %s\n", key, d.String())
+	}
+}
+
+// writeTLS 写入三态 tls 键（原文透传，便于测试非法值以外的显式取值）。
+func writeTLS(b *strings.Builder, mode string) {
+	if strings.TrimSpace(mode) != "" {
+		fmt.Fprintf(b, "tls = %s\n", mode)
 	}
 }
 

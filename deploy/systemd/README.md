@@ -15,18 +15,18 @@
 
 ### 方式 A：用仓库脚本（推荐）
 
-```bash
-sudo ./deploy/linux/install.sh --binary ./pairlink --systemd
-```
-
-脚本会：安装二进制 → 创建 `/etc/pairlink`（0750、`root:pairlink`）→ 只在缺失时安装示例 ini
-（不覆盖已有配置）→ 安装三个 unit 到 `/etc/systemd/system` → `daemon-reload` → enable 三个 unit。
-**不会自动 start**。单机只跑一个角色时，先 disable 不需要的：
+按角色执行对应的一个脚本（**每个脚本只安装/启动自己那个服务**）：
 
 ```bash
-sudo systemctl disable pairlink-agent pairlink-client   # 只保留 relay 的机器
-sudo systemctl start pairlink-relay
+sudo ./deploy/linux/install-relay.sh --binary ./pairlink
+sudo ./deploy/linux/install-agent.sh --binary ./pairlink
+sudo ./deploy/linux/install-client.sh --binary ./pairlink
 ```
+
+脚本会：安装共享二进制 → 创建 `/etc/pairlink`（0750、`root:pairlink`）→ 只在缺失时安装
+该角色的示例 ini（不覆盖已有配置）→ 安装该角色的 unit → `daemon-reload` → `enable` → `start`
+（`--no-start` 只 enable；`--no-systemd` 不装 unit）。一台机器通常只部署一个角色；
+需要三个角色都跑时分别执行三个脚本，不需要先装三个再 disable。
 
 ### 方式 B：手工安装
 
@@ -41,7 +41,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now pairlink-relay
 ```
 
-`pairlink` 用户不存在时先创建（`install.sh` 会自动做）：
+`pairlink` 用户不存在时先创建（`install-<mode>.sh` 会自动做）：
 
 ```bash
 sudo groupadd --system pairlink
@@ -118,9 +118,18 @@ sudo journalctl -u pairlink-relay -o json-pretty | head
 ## 6. 卸载
 
 ```bash
-sudo ./deploy/linux/uninstall.sh            # 移除二进制与 unit，保留 /etc/pairlink
-sudo ./deploy/linux/uninstall.sh --purge    # 连 /etc/pairlink 一起删除
+# 按角色卸载：只删本模式 unit；默认保留 /etc/pairlink
+sudo ./deploy/linux/install-relay.sh --uninstall
+sudo ./deploy/linux/install-agent.sh --uninstall
+sudo ./deploy/linux/install-client.sh --uninstall
+
+# 额外删除本模式 ini 与明确属于本模式的证书（不删其它模式的）
+sudo ./deploy/linux/install-relay.sh --uninstall --purge
 ```
+
+共享二进制 `/usr/local/bin/pairlink` 只有在**没有任何其它 `pairlink-*.service` 残留**时才删除，
+所以先卸载 relay 不会把还在运行的 agent/client 的二进制删掉。`pairlink` 用户/组默认保留，
+确认不再使用后再手动 `userdel` / `groupdel`。
 
 ## 7. 验证 unit 语法（任何装有 systemd 的机器）
 

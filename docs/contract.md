@@ -141,9 +141,10 @@ TLS：`cfg.Relay.TLSCert`/`TLSKey` 均非空时隧道 `tls.Listen`（`tls.Config
 ### 2.4 agent.Run 的职责
 
 1. `tls`/明文连接 `cfg.Server.RelayAddr`（`cfg.Server.DialTimeout`）；TLS 配置规则见
-   `docs/architecture.md` §7.6（`tls_ca` 非空 → 自定义 RootCAs；`tls_ca` 为空但
-   `tls_insecure_skip_verify=true` → 跳过校验；两者皆空 → **明文**）。`tls_ca` 存在时
-   `ServerName` 从 `relay_addr` 的主机名取。
+   `docs/architecture.md` §7.6（阶段 6G 起为三态 `tls`：`true` 强制 TLS——`tls_ca` 非空时
+   只信任该 CA，为空时用系统根证书；`false` 强制明文；`auto` 保持旧推断：`tls_ca` 非空或
+   `tls_insecure_skip_verify=true` 才 TLS，否则**明文**）。`ServerName` 从 `relay_addr`
+   的主机名取。
 2. 发 `MsgHello{role:"agent", token: cfg.Server.Token, version: protocol.ProtocolVersion,
    client_name: 主机名}`；等 `MsgHelloOK`；`CheckVersion` 校验返回版本，并记录
    `HelloOK.UDPMode`（未识别值回退 `native` 并 WARN）。
@@ -211,7 +212,7 @@ TLS：`cfg.Relay.TLSCert`/`TLSKey` 均非空时隧道 `tls.Listen`（`tls.Config
      `revision` 归零；沿用"忽略更旧 revision"会让视图永久卡死）；
    - 重连期间关闭全部在途本地 TCP 连接/UDP 会话（`reason=reconnect`），不做迁移；
    - 不重连：`MsgKicked`（返回错误）、`MsgServerShutdown`（返回 `nil`）、
-     鉴权失败/版本不兼容/`tls_ca` 读取失败（永久错误）、`ctx` 取消（返回 `nil`）；
+     鉴权失败/版本不兼容/TLS 握手失败/`tls_ca` 读取失败（永久错误）、`ctx` 取消（返回 `nil`）；
    - `reconnect = false` 时控制连接断开 → `Run` 返回错误（旧行为）。
 10. 订阅到服务 `proto` 变化时**热切换本地监听**（阶段 6C）：
     - 关旧监听 → 在**原地址**按新协议重开（配置为 `:0` 时用旧监听的实际端口）；
@@ -600,17 +601,27 @@ func IsWindowsService() bool
 
 ### 4.3 TLS
 
-- relay：`tls_cert`+`tls_key` 非空 → `tls.Listen`（TLS 1.2+）；缺一则明文 + WARN。
-- agent/client 的 TLS **触发规则**（阶段 4 明确，文档与代码一致）：
-  - `tls_ca` 非空 → 使用 TLS，`RootCAs` 只含该 CA，`ServerName` 取 `relay_addr` 的 host；
-  - 仅 `tls_insecure_skip_verify=true`（`tls_ca` 为空）→ 使用 TLS 但跳过证书校验（WARN）；
-  - 两者皆空 → **明文连接**（对应 relay 未配置证书的部署），而不是"用系统根证书建 TLS"。
+- **三态开关**（阶段 6G / E7）：`[relay]`、`[server]`、`[client]` 各有一个 `tls` 键，
+  取值 `auto`（默认）| `true` | `false`，大小写不敏感；非法值在配置校验阶段直接报错。
+  `auto` 完全保持阶段 1~6 的推断行为，旧 ini 无需改动。
+- relay：
+  - `auto`：`tls_cert`+`tls_key` 均非空 → `tls.Listen`（TLS 1.2+）；否则明文 + WARN；
+  - `true`：必须 TLS，`tls_cert`/`tls_key` 任一为空 → `Validate` 报错（文件不存在仍只 WARN）；
+  - `false`：一律明文；若配了证书则 WARN（材料被忽略）。
+- agent/client：
+  - `auto`：`tls_ca` 非空 → TLS 且 `RootCAs` 只含该 CA；仅 `tls_insecure_skip_verify=true`
+    → TLS 但跳过校验（WARN）；两者皆空 → **明文**（与旧版本一致）；
+  - `true`：必须 TLS。`tls_ca` 非空 → `RootCAs` 只含该 CA；`tls_ca` 为空 →
+    `RootCAs = nil`（**系统根证书**标准校验，不需要 `tls_insecure_skip_verify`）。
+    `tls_insecure_skip_verify=true` 优先级最高，仍跳过校验并 WARN（`tls=true` 时该开关多余）。
+  - `false`：一律明文；若配了 `tls_ca` / `tls_insecure_skip_verify` 则 WARN（被忽略）。
+  - `ServerName` 始终取 `relay_addr` 的 host。公网 CA 场景写 `tls = true`、不配 `tls_ca`。
 - 两侧配置不匹配（relay 有证书而 agent/client 明文，或反之）时 TLS 握手失败，属**预期**行为：
-  不做协议探测、不自动降级，错误信息需可读。
-  阶段 6C 起：本端 TLS **握手**失败（`tls_ca` 与 relay 证书不匹配、relay 没开 TLS）按**永久
-  错误**处理，立即返回 `Run` 错误（不重试）；而"relay 要求 TLS、本端明文"只能表现为读
-  HelloOK 时 EOF，与瞬时断链不可区分，因此按可重试断开处理（`reconnect=false` 时仍立即
-  失败退出，见 §2.5 第 9 条）。
+  不做协议探测、不自动降级，错误信息需可读（提示检查 relay 的 tls 与本端 tls/tls_ca）。
+  阶段 6C 起：本端 TLS **握手**失败（`tls_ca` 与 relay 证书不匹配、relay 没开 TLS、
+  `tls=true` 但系统根证书拒绝自签证书）按**永久错误**处理，立即返回 `Run` 错误（不重试）；
+  而"relay 要求 TLS、本端明文"只能表现为读 HelloOK 时 EOF，与瞬时断链不可区分，因此按可
+  重试断开处理（`reconnect=false` 时仍立即失败退出，见 §2.5 第 9 条）。
 - 数据面**永远明文**（哑管道），不得包 TLS。
 
 ### 4.4 超时使用

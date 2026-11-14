@@ -205,6 +205,8 @@ tunnel_listen     = 0.0.0.0:7000
 tcp_listen        = 0.0.0.0:7001
 ; udp_listen 可选：配置则走原生 UDP；留空/删除则 UDP 数据面走 TCP 隧道（省一个公网端口）
 udp_listen        = 0.0.0.0:7002
+; 三态开关：auto（默认，按证书推断）| true（强制 TLS）| false（强制明文）
+tls               = true
 tls_cert          = /etc/pairlink/cert.pem
 tls_key           = /etc/pairlink/key.pem
 auth_token        = 请改成随机长字符串
@@ -226,7 +228,10 @@ relay_addr = relay.example.com:7000
 token      = 与 relay 的 auth_token 一致
 protocol   = tcp
 local      = 127.0.0.1:8080
-; 可选：自签 CA 时指定。配置了 CA 才会走 TLS；不配置则明文（relay 必须同为明文）
+; 三态开关：auto（默认，按 CA 推断）| true（强制 TLS）| false（强制明文）
+; 公网 CA 场景写 tls = true 且不要配 tls_ca（用系统根证书校验）
+tls        = auto
+; 自签/私有 CA 时指定；只有 tls = auto 或 true 时才生效
 ; tls_ca   = /etc/pairlink/ca.pem
 heartbeat  = 30s
 
@@ -248,7 +253,9 @@ manage_listen = 127.0.0.1:9200
 [client]
 relay_addr = relay.example.com:7000
 token      = 与 relay 的 auth_token 一致
-; 可选：自签 CA 时指定；配置了 CA 才会走 TLS
+; 三态开关：auto（默认，按 CA 推断）| true（强制 TLS）| false（强制明文）
+tls        = auto
+; 自签/私有 CA 时指定；公网 CA 场景写 tls = true、不要配 tls_ca
 ; tls_ca   = /etc/pairlink/ca.pem
 subscribe  = true
 heartbeat  = 30s
@@ -315,8 +322,9 @@ udp_session_timeout = 60s
 | `tunnel_listen` | `host:port` | **是** | — | 控制面（信令）监听地址 |
 | `tcp_listen` | `host:port` | **是** | — | TCP 数据面监听地址 |
 | `udp_listen` | `host:port` | 否 | 空 | 原生 UDP 数据面监听地址；为空表示不监听 UDP，UDP 走 TCP 隧道（`udp_mode = tcp_tunnel`） |
-| `tls_cert` | 路径 | 否 | 空 | 隧道 TLS 证书；与 `tls_key` 成对。都为空则明文并 WARN |
-| `tls_key` | 路径 | 否 | 空 | 隧道 TLS 私钥；与 `tls_cert` 成对 |
+| `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（按 `tls_cert`/`tls_key` 推断）/ `true`（强制 TLS，证书必须成对且路径非空，否则启动校验失败）/ `false`（强制明文，证书被忽略并 WARN）；只接受 `auto`/`true`/`false` |
+| `tls_cert` | 路径 | `tls=true` 时是 | 空 | 隧道 TLS 证书；`tls = true` 时必须与 `tls_key` 成对，`auto` 下都为空则明文并 WARN |
+| `tls_key` | 路径 | `tls=true` 时是 | 空 | 隧道 TLS 私钥；`tls = true` 时必须与 `tls_cert` 成对 |
 | `auth_token` | string | 建议 | 空 | agent/client 接入密钥；为空则 WARN 并放行（仅内网调试） |
 | `pair_timeout` | duration | 否 | `10s` | 待配对表占位超时 / 数据面报到读帧超时 |
 | `idle_timeout` | duration | 否 | `300s` | TCP 数据面空闲超时（无流量即断开） |
@@ -333,7 +341,8 @@ udp_session_timeout = 60s
 | `protocol` | `tcp`/`udp` | 否 | `tcp` | **主服务**协议；配置了 `local` 而未写 `protocol` 时按 `tcp` |
 | `local` | `host:port` / 端口 | 否 | 空 | **主服务**的本地目标地址（缺 host 补 `127.0.0.1`） |
 | `service.<ID>` | `<proto>:<port>` 或 `<proto>:<host>:<port>` | 否 | — | 附加服务映射；见 §5.6 |
-| `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；为空且未开 `tls_insecure_skip_verify` 时走**明文**（见 §7.1） |
+| `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（有 `tls_ca` 或 `tls_insecure_skip_verify` 才 TLS，否则明文）/ `true`（强制 TLS；`tls_ca` 为空时用**系统根证书**做标准校验，公网 CA 场景写这个）/ `false`（强制明文，`tls_ca`/insecure 被忽略并 WARN）；只接受 `auto`/`true`/`false` |
+| `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；`tls = auto` 时为空且未开 `tls_insecure_skip_verify` 则走**明文**，`tls = true` 时为空则用**系统根证书**校验（见 §7.1） |
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过 relay 证书校验（仅测试，启动 WARN） |
 | `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
 | `dial_timeout` | duration | 否 | `10s` | 连接 relay / 本地目标超时 |
@@ -348,7 +357,8 @@ udp_session_timeout = 60s
 | `relay_addr` | `host:port` | **是** | — | relay 隧道地址 |
 | `token` | string | **是** | — | 接入密钥 |
 | `service.<ID>` | `host:port` / 端口 | 否 | — | 本地监听地址（缺 host 补 `127.0.0.1`）；见 §5.6 |
-| `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；为空且未开 `tls_insecure_skip_verify` 时走**明文**（见 §7.1） |
+| `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（有 `tls_ca` 或 `tls_insecure_skip_verify` 才 TLS，否则明文）/ `true`（强制 TLS；`tls_ca` 为空时用**系统根证书**做标准校验，公网 CA 场景写这个）/ `false`（强制明文，`tls_ca`/insecure 被忽略并 WARN）；只接受 `auto`/`true`/`false` |
+| `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；`tls = auto` 时为空且未开 `tls_insecure_skip_verify` 则走**明文**，`tls = true` 时为空则用**系统根证书**校验（见 §7.1） |
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过证书校验（仅测试，启动 WARN） |
 | `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
 | `subscribe` | bool | 否 | `true` | 是否订阅服务列表变更 |
@@ -410,7 +420,11 @@ service.ssh = :2222
 - duration 必须带单位（`10s`/`5m`/`1h`）且 > 0；
 - `manage_listen` 监听 `0.0.0.0` 会 WARN（管理页无鉴权）；
 - 证书/CA 文件不存在只 WARN（允许先写配置后拷证书）；
-- `[server]`/`[client]` 的 `reconnect_max_backoff` 必须是 > 0 的 duration（`0s`、负值、无单位都直接报错）。
+- `[server]`/`[client]` 的 `reconnect_max_backoff` 必须是 > 0 的 duration（`0s`、负值、无单位都直接报错）；
+- `tls` 只能是 `auto` / `true` / `false`（大小写不敏感），其它值（`on`、`yes`、`1` 等）直接报错；
+- `[relay] tls = true` 要求 `tls_cert` 与 `tls_key` 成对且路径非空（文件不存在仍只 WARN）；
+- `[server]`/`[client] tls = false` 时已配置的 `tls_ca`/`tls_insecure_skip_verify` 被忽略并 WARN；
+  `tls = true` 且 `tls_insecure_skip_verify = true` 允许但 WARN（开关多余）。
 
 ---
 
@@ -442,11 +456,16 @@ service.ssh = :2222
 
 ## 7. 安全说明
 
-1. **隧道 TLS**：公网部署必须配置 `tls_cert`/`tls_key`。agent/client 的 TLS **触发规则**：
-   - `tls_ca` 非空 → 用 TLS，且只信任该 CA（`ServerName` 取 `relay_addr` 的主机名）；
-   - 只配 `tls_insecure_skip_verify = true` → 用 TLS 但跳过证书校验（仅测试）；
-   - 两者皆空 → **明文连接**（对应 relay 未配证书的部署）；不是"回退到系统根证书建 TLS"。
-   两侧配置不匹配时 TLS 握手直接失败并报可读错误，属预期行为（不会自动降级）。
+1. **隧道 TLS（阶段 6G：三态显式开关）**：公网部署必须配置 `tls_cert`/`tls_key`，
+   并建议 relay / agent / client 三端都显式写 `tls = true`。`tls` 取值（只接受这三个字面量）：
+   - `auto`（默认，向后兼容）：按材料推断——relay 的 `tls_cert`+`tls_key` 均非空才 TLS；
+     agent/client 的 `tls_ca` 非空或 `tls_insecure_skip_verify = true` 才 TLS，否则明文；
+   - `true`（强制 TLS）：relay 缺证书对直接启动失败；agent/client 必须 TLS，
+     `tls_ca` 非空时只信任该 CA，**为空时使用系统根证书做标准校验**——
+     公网 CA 场景就写 `tls = true` 且不要配 `tls_ca`，更不要打开 `tls_insecure_skip_verify`；
+   - `false`（强制明文）：即使配了证书/CA 也不启用 TLS，并 WARN 提示材料被忽略。
+   两侧配置不匹配时 TLS 握手直接失败并报可读错误（提示检查 relay 的 tls 与本端 tls/tls_ca），
+   属预期行为（不会自动降级、不做协议探测）。
 2. **接入密钥**：`[relay] auth_token` 是 agent/client 接入隧道的共享密钥，务必改成随机长串
    并与两端一致；为空时 relay 会 WARN 并放行，仅限内网调试。
 3. **一次性配对令牌**：与配对键绑定、32 字节 `crypto/rand`、短有效期（默认 15s）、
@@ -469,11 +488,14 @@ service.ssh = :2222
 | 路径 | 用途 |
 | --- | --- |
 | `deploy/systemd/pairlink-{relay,agent,client}.service` | Linux systemd unit（`Type=simple`、`Restart=on-failure`、日志进 journal） |
-| `deploy/linux/install.sh` / `uninstall.sh` | Linux 安装/卸载（幂等、`--dry-run`、`--systemd`、`--purge`） |
-| `deploy/windows/install-service.ps1` / `uninstall-service.ps1` | Windows SCM 安装/卸载（管理员 PowerShell，服务名 `pairlink-<mode>`） |
+| `deploy/linux/install-{relay,agent,client}.sh` + `common.sh` | Linux **按角色**安装/卸载（每个脚本只装自己那个服务；幂等、`--dry-run`、`--no-systemd`、`--no-start`、`--purge`） |
+| `deploy/windows/install-{relay,agent,client}.ps1` + `common.ps1` | Windows SCM **按角色**安装/卸载（管理员 PowerShell，服务名 `pairlink-<mode>`） |
 | `Dockerfile` / `.dockerignore` / `deploy/docker-compose.yml` | 多阶段容器镜像 + relay/agent/client/nginx 演示编排 |
-| `examples/*.ini` | 主机侧 5 份模板（relay / relay-no-udp / agent / client / client-udp） |
+| `examples/*.ini` | 主机侧 7 份模板（relay / relay-no-udp / relay-tls / agent / agent-tls / client / client-udp） |
 | `examples/docker/*.ini` | 容器侧 3 份模板（管理页绑 `0.0.0.0`） |
+
+> **一台机器通常只部署一个角色**：Linux 的三个 `install-<mode>.sh` 与 Windows 的三个
+> `install-<mode>.ps1` **各自只安装/启动自己的服务**，不会顺带拉起另外两个角色。
 
 > 所有模板的 token 都是 `CHANGE-ME-...` 占位符，投产前必须替换（`openssl rand -hex 32`）。
 > 模板使用 17000 段端口；§8.3 的 7000/7001/7002 是默认生产端口示例，防火墙按实际 ini 放行。
@@ -481,34 +503,38 @@ service.ssh = :2222
 
 ### 8.1 Linux（systemd）
 
-推荐用脚本安装（二进制 + `/etc/pairlink` + 示例 ini；`--systemd` 同时安装三个 unit 并 enable，但不会自动 start）：
+按角色选一个脚本：安装共享二进制 + `/etc/pairlink/<mode>.ini` + `pairlink-<mode>.service`，
+`enable` 并默认 `start`（`--no-start` 只 enable）：
 
 ```bash
-./deploy/linux/install.sh --dry-run                 # 预览，可非 root
-sudo ./deploy/linux/install.sh --binary ./pairlink --systemd
-sudo systemctl start pairlink-relay                 # 按角色只启动需要的
+./deploy/linux/install-relay.sh --dry-run                  # 预览，可非 root
+sudo ./deploy/linux/install-relay.sh --binary ./pairlink   # relay 机器
+sudo ./deploy/linux/install-agent.sh --binary ./pairlink   # agent 机器
+sudo ./deploy/linux/install-client.sh --binary ./pairlink  # client 机器
 sudo systemctl status pairlink-relay --no-pager
 sudo journalctl -u pairlink-relay -f
 ```
 
-- unit：`pairlink-relay` / `pairlink-agent` / `pairlink-client`；**Linux 不要加 `-service`**（那只是 Windows SCM）。
+- 三个脚本**不会互相安装/启动**；单机只跑 relay 时不会出现 agent/client 的 unit 或 ini。
+- 共享二进制 `/usr/local/bin/pairlink`；卸载时仅当没有任何其它 `pairlink-*.service` 残留才删除。
 - `/etc/pairlink` 为 `0750 root:pairlink`，ini 为 `0640`；非 root 运行需在 unit 启用 `User=pairlink`/`Group=pairlink`（见 `deploy/systemd/README.md`）。
 - 默认以 root 运行；`Restart=on-failure` + `RestartSec=3s` + 60s/5 次启动限制兜底；agent/client 自身也会自动重连（`reconnect`/`reconnect_max_backoff`，见 §5.4/§5.5 与 §10 #1）。
-- 卸载：`sudo ./deploy/linux/uninstall.sh` 保留 `/etc/pairlink`；`--purge` 才删除配置与证书。
+- `--no-systemd` 只放二进制与配置；卸载用 `sudo ./deploy/linux/install-<mode>.sh --uninstall`，默认保留 `/etc/pairlink`，`--purge` 只删本模式 ini/证书。
 
 ### 8.2 Windows（SCM）
 
-用**管理员** PowerShell：
+用**管理员** PowerShell，按角色执行一个脚本：
 
 ```powershell
-.\deploy\windows\install-service.ps1 -Mode relay -Config C:\PairLink\relay.ini
-.\deploy\windows\install-service.ps1 -Mode agent -Config C:\PairLink\agent.ini -Binary C:\PairLink\pairlink.exe
-.\deploy\windows\install-service.ps1 -Mode relay -Config C:\PairLink\relay.ini -Force   # 重装
-.\deploy\windows\uninstall-service.ps1 -Mode relay -KeepLogs
+.\deploy\windows\install-relay.ps1 -Config C:\PairLink\relay.ini
+.\deploy\windows\install-agent.ps1 -Config C:\PairLink\agent.ini -Binary C:\PairLink\pairlink.exe
+.\deploy\windows\install-relay.ps1 -Config C:\PairLink\relay.ini -Force   # 重装
+.\deploy\windows\install-relay.ps1 -Uninstall -KeepLogs
 ```
 
-- 服务名固定 `pairlink-<mode>`，启动类型自动；日志在 **exe 同目录的 `pairlink-<mode>.log`**；
-- 脚本把 `-Config` 解析为绝对路径（SCM 工作目录不是 exe 目录）；服务已存在默认提示，`-Force` 才 stop+uninstall+重装；
+- 每个脚本只操作 `pairlink-<mode>` 一个服务；服务名固定、启动类型自动；
+- 日志在 **exe 同目录的 `pairlink-<mode>.log`**；`-Config` 解析为绝对路径；
+- `-NoStart` 只注册不启动；服务已存在默认提示，`-Force` 才 stop+uninstall+重装；
 - 查看：`sc.exe query pairlink-relay` / `Get-Service pairlink-relay`；
 - 非管理员会被 `#Requires -RunAsAdministrator` 直接拦截；详见 `deploy/windows/README.md`。
 - 也可以直接调二进制：`pairlink.exe -relay -config C:\PairLink\relay.ini -service install|start|stop|uninstall`；
@@ -602,12 +628,16 @@ docker compose -f deploy/docker-compose.yml down
     详见 §13.15。systemd 真实托管已由阶段 6D 在 WSL2 验证（见 §13.16）；仍未覆盖非 loopback 多网卡、长时间 soak、非 root `User=pairlink` 运行。
 12. **Windows 服务未做完整生命周期验证**：本机非管理员，只验证了 `-service install` 的
     "需要管理员权限"错误路径与服务命名 `pairlink-<mode>`；install→start→stop→uninstall
-    的实际 SCM 状态、`pairlink-<mode>.log` 落盘需管理员环境复核。阶段 6D 已提供
-    `deploy/windows/install-service.ps1` 与 `uninstall-service.ps1`，但真实 SCM 生命周期仍需管理员环境复核。
+    的实际 SCM 状态、`pairlink-<mode>.log` 落盘需管理员环境复核。阶段 6F 已把脚本拆为
+    `deploy/windows/install-{relay,agent,client}.ps1`（每个只操作自己的服务），
+    但真实 SCM 生命周期仍需管理员环境复核。
 13. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；广域网下的
     TCP/UDP 行为（尤其 UDP over TCP 的队头阻塞）可能不同。
-14. **TLS 组合未覆盖公网 CA 场景**：e2e 覆盖了自签 CA（`tls_ca`）、`tls_insecure_skip_verify`
-    以及"明文连 TLS / TLS 连明文"的失败路径；未验证公网 CA 签发的证书 + 系统根证书路径。
+14. **TLS 公网 CA 正向路径仍未实测**：e2e 覆盖自签 CA（`tls_ca`）、`tls_insecure_skip_verify`、
+    `tls = true` 且不配 `tls_ca`（用系统根证书**拒绝**自签证书的负向断言），以及
+    "明文连 TLS / TLS 连明文"的失败路径；但没有用真实公网 CA 证书跑通系统根证书的**正向**路径
+    （本机无公网域名/证书）。另外 `relay_addr` 若写 IP，relay 证书必须带该 IP 的 SAN，
+    否则系统根证书校验同样会失败。
 15. **soak 只跑了 2–3 分钟短版**：`test/soak_test.go`（`-tags soak`）可参数化长跑；本机实测
     30 轮 / 2m30s（TCP/UDP 每轮全部成功、goroutine 44→40、RSS 峰值 19.9 MiB、句柄 201→213），
     完整命令与数字见 §13.17；30–60 分钟长时间稳定性仍需在目标环境复跑。
@@ -639,11 +669,11 @@ pairlink/
 │   └── traceability.md      # 需求追踪矩阵（需求 ↔ 实现 ↔ 测试）
 ├── deploy/
 │   ├── systemd/             # relay/agent/client 三个 unit + 说明
-│   ├── linux/               # install.sh / uninstall.sh（幂等、--dry-run、--systemd）
-│   ├── windows/             # install-service.ps1 / uninstall-service.ps1 + 说明
+│   ├── linux/               # install-{relay,agent,client}.sh + common.sh（按角色、幂等、--dry-run）
+│   ├── windows/             # install-{relay,agent,client}.ps1 + common.ps1 + 说明
 │   ├── docker-compose.yml   # relay/agent/client/nginx 演示编排
 │   └── README.md            # 运维件总说明与验证状态
-├── examples/                # 5 份主机侧 ini + docker/ 3 份容器侧 ini
+├── examples/                # 7 份主机侧 ini + docker/ 3 份容器侧 ini
 ├── test/                    # e2e / 真实二进制 / examples / soak 测试
 └── internal/
     ├── config/              # ini 解析 + 默认值 + 按模式校验
@@ -1148,18 +1178,19 @@ go test ./test/... -v -count=1  # ok 21.701s；27 个顶层 --- PASS、0 个 ---
    未加 `netsh portproxy`、未动防火墙，未做进一步调优。
 6. **长时间 soak**：同 §13.14 第 8 条，未做数小时压测。
 
-### 13.16 阶段 6D：部署运维件验证
+### 13.16 阶段 6D/6F：部署运维件验证
 
-- `go test ./test -run TestExamples -v -count=1`：8/8 PASS（主机 5 + 容器 3；Windows 与 WSL2 都通过）。
-- PowerShell `Parser::ParseFile`：两个 `.ps1` 均 `errors.Count = 0`；非管理员运行
-  `install-service.ps1` 被 `#Requires -RunAsAdministrator` 拦截（exit 1，中文提示可读）。
-- `go build ./...` / `go vet ./...`：通过；`shellcheck 0.11.0` 对 `deploy/linux/*.sh` 无告警。
-- WSL2（Ubuntu，systemd 259，`is-system-running=degraded` 但 unit 可启停）：
-  - `systemd-analyze verify` 三个 unit：exit 0；
-  - `install.sh --binary /tmp/pairlink --systemd` 成功，第二次执行幂等（跳过二进制/配置）；
-  - 三个 unit `active`/`enabled`，管理页 17090/17091/17092 均 200；agent 注册 3 个服务、
-    client 拉到 3 个服务；journal 有 `start`/`hello_ok`/`service_registered`/`service_list`；
-  - `stop` 后端口释放；`uninstall` 默认保留 `/etc/pairlink`（0750），`--purge` 删除；重复卸载 exit 0。
+- 6D（历史）：旧脚本一次安装三个 unit；WSL2 上三个 unit 均
+  `active`/`enabled`，管理页 17090/17091/17092 均 200；旧卸载脚本默认保留
+  `/etc/pairlink`（0750），`--purge` 删除，重复卸载 exit 0。
+- 6F 起改为**按角色拆分**（§8.1/§8.2、`deploy/README.md` §3/§4），当前脚本证据：
+  - `go test ./test -run TestExamples -v -count=1`：全部示例模板 PASS（Load/Validate）；
+  - PowerShell `Parser::ParseFile`：四个 `.ps1` 均 `errors.Count = 0`；非管理员运行
+    `install-relay.ps1` 被 `#Requires -RunAsAdministrator` 拦截（exit 1，提示可读）；
+  - `shellcheck 0.11.0` 对 `common.sh` 与三个 `install-*.sh` 无告警（`bash -n` 通过）；
+  - WSL2：只装 relay 时 `pairlink-agent` 报 `could not be found`、`agent.ini` 不存在；
+    管理页 17090 返回 200；无残留 unit 才删共享二进制；agent unit 仍在时卸载 relay 保留二进制。
+  - 逐条断言与命令见 §13.18。
 - 未验证：Docker/Podman 构建与 compose、Windows 管理员 SCM 生命周期、
   systemd 非 root `User=pairlink`、真实证书 TLS。
 
@@ -1193,6 +1224,40 @@ SOAK_ROUNDS=120 SOAK_DURATION=20m go test -race -tags soak ./test -run TestSoak 
 WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 `go test -race ./test -run 'TestE2EReconnectAfterControlCut|TestE2EUDPModeTCPTunnel|TestE2EUDPModeNative'`（全 PASS）。
 
+### 13.18 阶段 6F：部署脚本按模式拆分
+
+**目标**：原脚本一次装三个 unit，不符合"一台机器通常只跑一个角色"
+的部署习惯（只部署 relay 时也被顺带拉起 agent/client）。拆成按角色的入口，
+删除旧入口，避免两套命令混淆。
+
+**Linux（WSL2 Ubuntu，systemd 259，Go 1.24.4）实测**：
+
+| 场景 | 断言与结果 |
+| --- | --- |
+| 只装 relay | `pairlink-relay` `active`/`enabled`；`systemctl status pairlink-agent` 报 `Unit pairlink-agent.service could not be found`；`/etc/pairlink/relay.ini` 为 `0640 root:pairlink`；`/etc/pairlink/agent.ini` 不存在；`curl 127.0.0.1:17090` = 200 |
+| 卸载 relay（无其它 unit） | relay unit 删除；无残留 unit → `/usr/local/bin/pairlink` 删除；`/etc/pairlink` 与 `relay.ini` 保留 |
+| 只装 agent `--no-start` | 仅出现 `pairlink-agent`（`is-active=inactive`、`is-enabled=enabled`）；relay/client unit 文件不存在 |
+| agent 在时卸载 relay | 共享二进制保留；agent unit 仍存在且 `enabled`；relay unit 删除 |
+| 全部卸载 + `--purge` | 无残留 unit → 二进制删除；`/etc/pairlink` 保留；`--purge` 只删 `agent.ini` 与 `tls/agent.*`，`relay.ini`/`tls/relay.crt` 保留；重复卸载 exit 0 |
+| 幂等 | 连续两次 `install relay`：第二次输出"内容相同，跳过复制"/"保留已有配置，跳过"，exit 0 |
+| `--dry-run` / `--no-systemd` | 非 root dry-run exit 0，输出不含 agent/client unit 操作；`--no-systemd` 不装 unit、只放二进制与 `client.ini` |
+
+- `shellcheck 0.11.0 -x`：`common.sh` + 三个 `install-*.sh` 0 告警；`bash -n` 通过。
+- 卸载残留检测同时看 unit 文件、`*.wants` 符号链接与 `systemctl list-unit-files`，
+  并排除当前正在删的 unit，避免 dry-run 误判。
+
+**Windows（开发机非管理员）**：
+
+- `Parser::ParseFile` 对 4 个 `.ps1` 均 `errors.Count = 0`；
+- 非管理员运行 `install-relay.ps1 -Config <abs>`：`#Requires -RunAsAdministrator` 拦截，
+  PowerShell 5.1 与 7 的退出码均为 1；
+- `Format-Hex -Count 3` 对 4 个 `.ps1` 均为 `EF BB BF`（UTF-8 BOM，Windows PowerShell 5.1
+  中文兼容）；脚本无执行位需求，提交时按普通文件（`100644`）处理；
+- 真实 SCM 生命周期仍未验证（环境限制）。
+
+**回归**：`gofmt -l .` 无输出；`go vet ./...`、`go build ./...`、`go test ./... -count=1`
+通过；WSL 侧 `go test ./test -run TestExamples -count=1` 通过。
+
 ## 14. 版本与许可证
 
 - 版本：`v0.2.0`
@@ -1201,6 +1266,34 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 ---
 
 ## 15. 变更记录（Changelog）
+
+### v0.3.0（未发布）
+
+**新增**
+
+- **TLS 显式开关（阶段 6G）**：`[relay]`/`[server]`/`[client]` 新增三态 `tls`
+  （`auto` 默认 / `true` 强制 TLS / `false` 强制明文）。`tls = true` 且未配 `tls_ca` 时
+  使用**系统根证书**做标准校验——公网 CA 场景不再需要 `tls_insecure_skip_verify`；
+  relay 侧 `tls = true` 缺证书对直接启动失败；`tls = false` 时证书/CA 被忽略并 WARN。
+  新增 `examples/relay-tls.ini` 与 `examples/agent-tls.ini`（含 openssl 自签示例）。
+
+**变更**
+
+- **部署脚本按模式拆分（阶段 6F）**：删除 `deploy/linux/{install,uninstall}.sh` 与
+  `deploy/windows/{install-service,uninstall-service}.ps1`；改为每个角色一个入口
+  （Linux `install-<mode>.sh`、Windows `install-<mode>.ps1`），各自只安装/启动自己的服务，
+  不再出现"装 relay 却顺带拉起 agent/client"。共享二进制只在没有任何其它
+  `pairlink-*.service` 残留时删除；`--purge` 只删本模式 ini 与明确属于本模式的证书。
+  **迁移**：`install.sh --systemd` → `sudo deploy/linux/install-relay.sh`（agent/client 同理）；
+  `uninstall.sh [--purge]` → `install-<mode>.sh --uninstall [--purge]`；
+  Windows `install-service.ps1 -Mode relay -Config X` → `install-relay.ps1 -Config X`；
+  `uninstall-service.ps1 -Mode relay` → `install-relay.ps1 -Uninstall`。
+
+**兼容性**
+
+- **旧 ini 无需改动**：`tls` 默认 `auto`，行为与 v0.2.0 完全一致；只有显式写
+  `tls = true` / `tls = false` 才会改变 TLS 判定。旧 relay 与新 agent/client（或反之）混跑
+  仍按 `auto` 推断，线协议不变（`ProtocolVersion = 1`）。
 
 ### v0.2.0（相对 v0.1.0）
 
@@ -1223,12 +1316,13 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 - **soak 测试**：`test/soak_test.go`（`-tags soak`），默认 30 轮 / 150s / 4 会话，可配
   `SOAK_ROUNDS`/`SOAK_DURATION`/`SOAK_SESSIONS`/`SOAK_ROUND_SLEEP`，每轮输出
   goroutine / RSS / 句柄并与起止值对比（`TestSoak`、`TestSoakShort`）。
-- **部署运维件（阶段 6D）**：`deploy/systemd/` 三个 unit、`deploy/linux/{install,uninstall}.sh`、
-  `deploy/windows/{install-service,uninstall-service}.ps1`、`Dockerfile`、`.dockerignore`、
+- **部署运维件（阶段 6D；6F 起按角色拆分）**：`deploy/systemd/` 三个 unit、
+  `deploy/linux/install-{relay,agent,client}.sh` + `common.sh`、
+  `deploy/windows/install-{relay,agent,client}.ps1` + `common.ps1`、`Dockerfile`、`.dockerignore`、
   `deploy/docker-compose.yml`、`examples/*.ini`（5 份）+ `examples/docker/*.ini`（3 份），
   模板由 `test/examples_test.go` 自检（`TestExamples`）。
 - 文档：新增 [`docs/traceability.md`](docs/traceability.md)（需求 ↔ 实现 ↔ 测试矩阵）、
-  README §8 部署、§13.16/§13.17 验证记录。
+  README §8 部署、§13.16/§13.17/§13.18 验证记录。
 
 **变更**
 

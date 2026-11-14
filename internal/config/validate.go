@@ -19,6 +19,7 @@ var knownKeys = map[string]map[string]bool{
 		"tunnel_listen":       true,
 		"tcp_listen":          true,
 		"udp_listen":          true,
+		"tls":                 true,
 		"tls_cert":            true,
 		"tls_key":             true,
 		"auth_token":          true,
@@ -33,6 +34,7 @@ var knownKeys = map[string]map[string]bool{
 		"token":                    true,
 		"protocol":                 true,
 		"local":                    true,
+		"tls":                      true,
 		"tls_ca":                   true,
 		"tls_insecure_skip_verify": true,
 		"heartbeat":                true,
@@ -44,6 +46,7 @@ var knownKeys = map[string]map[string]bool{
 	"client": {
 		"relay_addr":               true,
 		"token":                    true,
+		"tls":                      true,
 		"tls_ca":                   true,
 		"tls_insecure_skip_verify": true,
 		"heartbeat":                true,
@@ -111,6 +114,14 @@ func (c *Config) addWarning(format string, args ...any) {
 	c.Warnings = append(c.Warnings, msg)
 }
 
+// checkTLSMode 校验三态 tls 取值并返回归一化后的模式。
+func (c *Config) checkTLSMode(section string, m TLSMode) (TLSMode, error) {
+	if !m.Valid() {
+		return "", fmt.Errorf("%s tls = %q 非法，只允许 auto / true / false", section, string(m))
+	}
+	return m.normalized(), nil
+}
+
 // validateCommon 校验三种模式共享的 [common] 配置。
 func (c *Config) validateCommon() error {
 	switch c.Common.LogLevel {
@@ -174,19 +185,37 @@ func (c *Config) validateRelay() error {
 		seen[key] = f.name
 	}
 
+	mode, err := c.checkTLSMode("[relay]", r.TLS)
+	if err != nil {
+		return err
+	}
 	hasCert := strings.TrimSpace(r.TLSCert) != ""
 	hasKey := strings.TrimSpace(r.TLSKey) != ""
-	switch {
-	case !hasCert && !hasKey:
-		c.addWarning("[relay] 未配置 tls_cert / tls_key，隧道将以明文运行（不建议在公网使用）")
-	case hasCert != hasKey:
-		c.addWarning("[relay] tls_cert 与 tls_key 必须成对配置，当前按明文隧道运行")
+	switch mode {
+	case TLSFalse:
+		if hasCert || hasKey {
+			c.addWarning("[relay] 已配置 tls_cert / tls_key 但 tls = false，隧道按明文监听（证书被忽略）")
+		}
+	case TLSTrue:
+		if !hasCert || !hasKey {
+			return fmt.Errorf("[relay] tls = true 但缺少 tls_cert / tls_key：强制 TLS 必须同时配置证书与私钥路径")
+		}
+	default: // auto：完全保持原有推断行为
+		switch {
+		case !hasCert && !hasKey:
+			c.addWarning("[relay] 未配置 tls_cert / tls_key，隧道将以明文运行（不建议在公网使用；可设 tls = true 强制 TLS）")
+		case hasCert != hasKey:
+			c.addWarning("[relay] tls_cert 与 tls_key 必须成对配置，当前按明文隧道运行")
+		}
 	}
-	if hasCert {
-		warnFileMissing(c, "tls_cert", r.TLSCert)
-	}
-	if hasKey {
-		warnFileMissing(c, "tls_key", r.TLSKey)
+	// tls=false 时证书材料被显式忽略，不再检查文件是否存在（避免误导）。
+	if mode != TLSFalse {
+		if hasCert {
+			warnFileMissing(c, "tls_cert", r.TLSCert)
+		}
+		if hasKey {
+			warnFileMissing(c, "tls_key", r.TLSKey)
+		}
 	}
 	if strings.TrimSpace(r.AuthToken) == "" {
 		c.addWarning("[relay] auth_token 为空，任何 agent/client 都可接入隧道（仅建议内网调试使用）")
@@ -234,11 +263,25 @@ func (c *Config) validateServer() error {
 			return err
 		}
 	}
-	if s.TLSCA != "" {
-		warnFileMissing(c, "tls_ca", s.TLSCA)
+	mode, err := c.checkTLSMode("[server]", s.TLS)
+	if err != nil {
+		return err
 	}
-	if s.TLSInsecureSkipVerify {
-		c.addWarning("[server] tls_insecure_skip_verify = true，将跳过 relay 证书校验（仅建议测试环境）")
+	if mode == TLSFalse {
+		if s.TLSCA != "" || s.TLSInsecureSkipVerify {
+			c.addWarning("[server] 已配置 tls_ca / tls_insecure_skip_verify 但 tls = false，控制面按明文拨号（上述配置被忽略）")
+		}
+	} else {
+		if s.TLSCA != "" {
+			warnFileMissing(c, "tls_ca", s.TLSCA)
+		}
+		if s.TLSInsecureSkipVerify {
+			if mode == TLSTrue {
+				c.addWarning("[server] tls = true 且 tls_insecure_skip_verify = true：该开关多余但会跳过 relay 证书校验（仅建议测试环境）")
+			} else {
+				c.addWarning("[server] tls_insecure_skip_verify = true，将跳过 relay 证书校验（仅建议测试环境）")
+			}
+		}
 	}
 	// duration 解析阶段已拒绝 <= 0；这里兜住「绕过 ini 直接构造 Config」的情形。
 	if s.ReconnectMaxBackoff < 0 {
@@ -298,11 +341,25 @@ func (c *Config) validateClient() error {
 			c.addWarning("[client] 服务 %q（%s）与服务 %q（%s）监听同一端口，可能绑定冲突", id, key, otherID, otherKey)
 		}
 	}
-	if cl.TLSCA != "" {
-		warnFileMissing(c, "tls_ca", cl.TLSCA)
+	mode, err := c.checkTLSMode("[client]", cl.TLS)
+	if err != nil {
+		return err
 	}
-	if cl.TLSInsecureSkipVerify {
-		c.addWarning("[client] tls_insecure_skip_verify = true，将跳过 relay 证书校验（仅建议测试环境）")
+	if mode == TLSFalse {
+		if cl.TLSCA != "" || cl.TLSInsecureSkipVerify {
+			c.addWarning("[client] 已配置 tls_ca / tls_insecure_skip_verify 但 tls = false，控制面按明文拨号（上述配置被忽略）")
+		}
+	} else {
+		if cl.TLSCA != "" {
+			warnFileMissing(c, "tls_ca", cl.TLSCA)
+		}
+		if cl.TLSInsecureSkipVerify {
+			if mode == TLSTrue {
+				c.addWarning("[client] tls = true 且 tls_insecure_skip_verify = true：该开关多余但会跳过 relay 证书校验（仅建议测试环境）")
+			} else {
+				c.addWarning("[client] tls_insecure_skip_verify = true，将跳过 relay 证书校验（仅建议测试环境）")
+			}
+		}
 	}
 	// duration 解析阶段已拒绝 <= 0 的值；这里兜住"绕过 ini 直接构造 Config"的情形，
 	// 保证 client 侧 UDP 空闲清理不会退化成"立刻清理"或"永不清理"。

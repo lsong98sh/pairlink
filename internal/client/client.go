@@ -19,8 +19,9 @@
 //   - 订阅到 proto 变化时热切换本地监听（TCP↔UDP），失败回滚到旧协议（见 listener.go）；
 //   - reconnect = false 时保持旧行为（断开即返回错误，由外部守护重启）；
 //   - UDP 本地会话空闲超时由 [client] udp_session_timeout 控制（默认 60s）；
-//   - TLS 当且仅当配置了 tls_ca 或 tls_insecure_skip_verify 时启用；两者皆空走明文，
-//     与 relay 的 tls_cert/tls_key 配置必须匹配，不匹配时握手失败并报清晰错误；
+//   - TLS 由三态 [client] tls 控制（阶段 6G）：auto 时按 tls_ca / tls_insecure_skip_verify
+//     推断（两者皆空走明文，既有行为）；true 强制 TLS，tls_ca 为空时用系统根证书；
+//     false 强制明文。两侧配置必须匹配，不匹配时握手失败并报清晰错误；
 //   - relay 未下发数据面端口且本机 ini 无 [relay] 兜底端口时只 WARN，
 //     Run 继续运行，失败的只是需要数据面的那一次配对。
 package client

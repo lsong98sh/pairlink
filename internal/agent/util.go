@@ -19,35 +19,51 @@ import (
 
 // serverTLSConfig 按 docs/architecture.md §7.6 构造控制面 TLS 配置。
 //
-// 规则：
-//   - tls_ca 非空 → RootCAs 只包含该 CA，ServerName 取 relay_addr 的 host；
-//   - tls_ca 为空且未开启 insecure → 返回 nil，表示使用明文连接
-//     （agent 的 ini 没有显式 tls 开关，明文是阶段 1/2 的默认部署方式，
-//     需要 TLS 时配置 tls_ca 或 tls_insecure_skip_verify）；
-//   - tls_insecure_skip_verify = true → 跳过校验并 WARN。
+// 三层决策（显式 tls → auto 推断 → 校验材料）：
+//   - tls = true → 必须 TLS；tls_ca 非空时 RootCAs 只含该 CA，
+//     tls_ca 为空时 RootCAs = nil，使用系统根证书做标准校验（无需 insecure）；
+//   - tls = false → 一律明文，即使配了 tls_ca / tls_insecure_skip_verify 也忽略并 WARN；
+//   - tls = auto（默认）→ tls_ca 非空或 tls_insecure_skip_verify=true 时 TLS，否则明文，
+//     与阶段 1~6 的既有行为完全一致。
 //
+// tls_insecure_skip_verify = true 优先级最高：即使 tls=true 也跳过校验并 WARN。
 // 注：数据面永远是明文哑管道，不经过本函数。
 func serverTLSConfig(s *config.ServerConfig, host string, log *slog.Logger) (*tls.Config, error) {
-	if s.TLSCA == "" && !s.TLSInsecureSkipVerify {
+	mode := s.TLS
+	useTLS := mode.DialTLS(s.TLSCA, s.TLSInsecureSkipVerify)
+	if !useTLS {
+		// 只有显式 tls = false 且配了材料时才提示「材料被忽略」；
+		// auto + 无材料是既有明文默认，不额外刷日志。
+		if mode == config.TLSFalse && (s.TLSCA != "" || s.TLSInsecureSkipVerify) {
+			if log != nil {
+				log.Warn("tls = false：已配置的 tls_ca / tls_insecure_skip_verify 被忽略，控制面按明文拨号",
+					"event", "config_warning", "detail", "plaintext_forced")
+			}
+		}
 		return nil, nil
 	}
 	tc := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
-	if s.TLSCA != "" {
-		pem, err := os.ReadFile(s.TLSCA)
+	if ca := strings.TrimSpace(s.TLSCA); ca != "" {
+		pem, err := os.ReadFile(ca)
 		if err != nil {
-			return nil, fmt.Errorf("agent: 读取 tls_ca %q: %w", s.TLSCA, err)
+			return nil, fmt.Errorf("agent: 读取 tls_ca %q: %w", ca, err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("agent: tls_ca %q 中没有可用的 PEM 证书", s.TLSCA)
+			return nil, fmt.Errorf("agent: tls_ca %q 中没有可用的 PEM 证书", ca)
 		}
 		tc.RootCAs = pool
 	}
+	// tls_ca 为空且未 insecure 时 RootCAs 保持 nil：tls=true 强制走系统根证书。
 	if s.TLSInsecureSkipVerify {
 		tc.InsecureSkipVerify = true
 		if log != nil {
+			detail := "仅建议测试环境使用"
+			if mode == config.TLSTrue {
+				detail = "tls = true 时该开关是多余的，但它会关闭证书校验，仅建议测试环境使用"
+			}
 			log.Warn("已跳过 relay 证书校验（tls_insecure_skip_verify = true）", "event", "config_warning",
-				"detail", "仅建议测试环境使用")
+				"detail", detail)
 		}
 	}
 	return tc, nil
@@ -72,7 +88,9 @@ func (a *agent) dialRelay(tcfg *tls.Config) (net.Conn, error) {
 	if err := tconn.HandshakeContext(a.ctx); err != nil {
 		_ = raw.Close()
 		// TLS 握手失败几乎总是配置不匹配（relay 没开 TLS / CA 不对），重连无意义。
-		return nil, permanent(fmt.Errorf("TLS 握手: %w", err))
+		// 提示里给出可执行的排查方向：relay 的 tls、本端 tls / tls_ca。
+		return nil, permanent(fmt.Errorf(
+			"TLS 握手失败（请检查 relay 是否启用 TLS，以及本端 tls / tls_ca 是否与 relay 证书匹配）: %w", err))
 	}
 	if err := tconn.SetDeadline(time.Time{}); err != nil {
 		_ = tconn.Close()

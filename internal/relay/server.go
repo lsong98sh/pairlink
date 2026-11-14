@@ -173,35 +173,63 @@ func (s *server) serve(parent context.Context) error {
 	return nil
 }
 
-// listenTunnel 按 TLS 配置监听隧道端口；证书缺失/不完整时退回明文并告警。
+// listenTunnel 按三态 tls 开关监听隧道端口。
+//
+// 决策顺序（docs/architecture.md §7.6）：
+//   - tls = true：必须 TLS；tls_cert/tls_key 缺失时返回错误（Validate 已提前拦截）；
+//   - tls = false：一律明文；若配了证书则 WARN（材料被忽略）；
+//   - tls = auto（默认）：证书+私钥均非空 → TLS；否则明文 + WARN（既有行为）。
 func (s *server) listenTunnel() (net.Listener, error) {
 	certPath := strings.TrimSpace(s.cfg.Relay.TLSCert)
 	keyPath := strings.TrimSpace(s.cfg.Relay.TLSKey)
+	complete := certPath != "" && keyPath != ""
+	mode := s.cfg.Relay.TLS
 
-	if certPath != "" && keyPath != "" {
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-		if err != nil {
-			return nil, fmt.Errorf("relay: 加载 TLS 证书 %s / %s: %w", certPath, keyPath, err)
+	switch mode {
+	case config.TLSFalse:
+		if certPath != "" || keyPath != "" {
+			s.log.Warn("已配置 tls_cert / tls_key 但 tls = false，隧道按明文监听（证书被忽略）",
+				"event", "config_warning", "detail", "tls=false")
+		} else {
+			s.log.Warn("tls = false，隧道以明文运行（不建议在公网使用）",
+				"event", "config_warning", "detail", "tls=false")
 		}
-		tlsCfg := &tls.Config{
-			MinVersion:   tls.VersionTLS12,
-			Certificates: []tls.Certificate{cert},
+		return s.listenPlainTunnel()
+	case config.TLSTrue:
+		if !complete {
+			return nil, fmt.Errorf("relay: tls = true 但缺少 tls_cert / tls_key（强制 TLS 必须同时配置证书与私钥）")
 		}
-		ln, err := tls.Listen("tcp", s.cfg.Relay.TunnelListen, tlsCfg)
-		if err != nil {
-			return nil, fmt.Errorf("relay: 监听隧道（TLS）%s: %w", s.cfg.Relay.TunnelListen, err)
+	default: // auto
+		if !complete {
+			if certPath != "" || keyPath != "" {
+				s.log.Warn("tls_cert 与 tls_key 必须成对配置，隧道按明文运行",
+					"event", "config_warning", "detail", "TLS 证书配置不完整")
+			} else {
+				s.log.Warn("未配置 TLS，隧道以明文运行（不建议在公网使用）",
+					"event", "config_warning", "detail", "隧道明文")
+			}
+			return s.listenPlainTunnel()
 		}
-		s.log.Info("隧道使用 TLS 监听", "event", "start", "tunnel_listen", ln.Addr().String(), "tls_min_version", "1.2")
-		return ln, nil
 	}
 
-	if certPath != "" || keyPath != "" {
-		s.log.Warn("tls_cert 与 tls_key 必须成对配置，隧道按明文运行",
-			"event", "config_warning", "detail", "TLS 证书配置不完整")
-	} else {
-		s.log.Warn("未配置 TLS，隧道以明文运行（不建议在公网使用）",
-			"event", "config_warning", "detail", "隧道明文")
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("relay: 加载 TLS 证书 %s / %s: %w", certPath, keyPath, err)
 	}
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}
+	ln, err := tls.Listen("tcp", s.cfg.Relay.TunnelListen, tlsCfg)
+	if err != nil {
+		return nil, fmt.Errorf("relay: 监听隧道（TLS）%s: %w", s.cfg.Relay.TunnelListen, err)
+	}
+	s.log.Info("隧道使用 TLS 监听", "event", "start", "tunnel_listen", ln.Addr().String(), "tls_min_version", "1.2")
+	return ln, nil
+}
+
+// listenPlainTunnel 以明文监听隧道端口（tls=false 或 auto 且证书不完整）。
+func (s *server) listenPlainTunnel() (net.Listener, error) {
 	ln, err := net.Listen("tcp", s.cfg.Relay.TunnelListen)
 	if err != nil {
 		return nil, fmt.Errorf("relay: 监听隧道 %s: %w", s.cfg.Relay.TunnelListen, err)

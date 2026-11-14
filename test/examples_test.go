@@ -15,8 +15,8 @@ const examplesDir = "../examples"
 
 // exampleMode 按文件名前缀推断示例配置对应的模式：
 //
-//	relay*.ini  -> relay（含 relay-no-udp.ini，故意不配 udp_listen）
-//	agent*.ini  -> agent
+//	relay*.ini  -> relay（含 relay-no-udp.ini / relay-tls.ini）
+//	agent*.ini  -> agent（含 agent-tls.ini）
 //	client*.ini -> client（含 client-udp.ini）
 //
 // 以后新增示例时，文件名必须保持这个前缀约定，否则本测试会直接失败，
@@ -53,7 +53,9 @@ func TestExamples(t *testing.T) {
 			expected: map[string]bool{
 				"relay.ini":        true,
 				"relay-no-udp.ini": true,
+				"relay-tls.ini":    true,
 				"agent.ini":        true,
+				"agent-tls.ini":    true,
 				"client.ini":       true,
 				"client-udp.ini":   true,
 			},

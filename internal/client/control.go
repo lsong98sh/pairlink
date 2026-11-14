@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lsong98sh/pairlink/internal/config"
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
 )
@@ -191,15 +192,22 @@ func (c *client) closeControl() {
 
 // dialControl 建立到 relay 隧道端口的连接，返回连接与是否使用了 TLS。
 //
-// TLS 触发规则（阶段 2 三模式统一，见 docs/architecture.md §7.6）：
-//   - tls_ca 非空 → 使用 TLS，RootCAs 只含该 CA，ServerName 取 relay_addr 的 host；
-//   - 仅 tls_insecure_skip_verify=true → 使用 TLS 但跳过证书校验（WARN）；
-//   - 两者皆空 → 明文连接（对应 relay 未配置 tls_cert/tls_key 的部署）。
+// TLS 三层决策（阶段 6G，见 docs/architecture.md §7.6）：
+//   - tls = true → 必须 TLS；tls_ca 非空时 RootCAs 只含该 CA，
+//     tls_ca 为空时使用系统根证书做标准校验（无需 tls_insecure_skip_verify）；
+//   - tls = false → 必定明文，tls_ca / tls_insecure_skip_verify 被忽略（配了材料则 WARN）；
+//   - tls = auto（默认）→ tls_ca 非空或 tls_insecure_skip_verify=true 时 TLS，否则明文，
+//     与阶段 1~6 的既有行为一致。
 //
-// 该规则与 relay 侧「有 tls_cert+tls_key 就 tls.Listen」是不对称的：两侧配置不匹配时
+// 该规则与 relay 侧「tls=true 或 auto 且有证书 → tls.Listen」是对称的；两侧配置不匹配时
 // 握手会失败，此时返回带排查提示的错误，属预期行为，不做自动降级/协议探测。
 func (c *client) dialControl() (net.Conn, bool, error) {
-	if c.cfg.Client.TLSCA == "" && !c.cfg.Client.TLSInsecureSkipVerify {
+	mode := c.cfg.Client.TLS
+	if !mode.DialTLS(c.cfg.Client.TLSCA, c.cfg.Client.TLSInsecureSkipVerify) {
+		if mode == config.TLSFalse && (c.cfg.Client.TLSCA != "" || c.cfg.Client.TLSInsecureSkipVerify) {
+			c.ctrlLog.Warn("tls = false：已配置的 tls_ca / tls_insecure_skip_verify 被忽略，控制面按明文拨号",
+				"event", "control_connect", "detail", "plaintext_forced")
+		}
 		dialer := &net.Dialer{Timeout: c.dialTimeout()}
 		conn, err := dialer.DialContext(c.ctx, "tcp", c.cfg.Client.RelayAddr)
 		if err != nil {
@@ -209,8 +217,12 @@ func (c *client) dialControl() (net.Conn, bool, error) {
 	}
 
 	if c.cfg.Client.TLSInsecureSkipVerify {
+		detail := "tls_insecure_skip_verify=true"
+		if mode == config.TLSTrue {
+			detail = "tls=true 时该开关是多余的，但它会关闭证书校验（仅建议测试环境）"
+		}
 		c.ctrlLog.Warn("已跳过 relay 证书校验（仅建议测试环境）", "event", "control_connect",
-			"detail", "tls_insecure_skip_verify=true")
+			"detail", detail)
 	}
 	tlsCfg, err := c.tlsConfig()
 	if err != nil {
@@ -225,6 +237,8 @@ func (c *client) dialControl() (net.Conn, bool, error) {
 }
 
 // tlsConfig 按 tls_ca / tls_insecure_skip_verify 构造客户端 TLS 配置。
+//
+// tls_ca 为空时 RootCAs 保持 nil，表示使用系统根证书（tls=true 场景的标准校验路径）。
 func (c *client) tlsConfig() (*tls.Config, error) {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -260,8 +274,9 @@ func (c *client) dialTLS(dialer *net.Dialer, tlsCfg *tls.Config) (net.Conn, erro
 	if err := tlsConn.HandshakeContext(hctx); err != nil {
 		_ = raw.Close()
 		// TLS 握手失败几乎总是配置不匹配（relay 没开 TLS / CA 不对），重连无意义。
+		// 提示里给出可执行排查方向：relay 的 tls、本端 tls / tls_ca、是否误配 tls=false。
 		return nil, permanent(fmt.Errorf(
-			"client: TLS 握手失败（relay 可能未启用 TLS，或本端 tls_ca 与 relay 证书不匹配）: %w", err))
+			"client: TLS 握手失败（请检查 relay 是否启用 TLS，以及本端 tls / tls_ca 是否与 relay 证书匹配）: %w", err))
 	}
 	return tlsConn, nil
 }

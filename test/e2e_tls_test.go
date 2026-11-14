@@ -320,6 +320,183 @@ func TestE2ETLSAgentTLSAgainstPlaintextRelay(t *testing.T) {
 	stopAll(t, relayH)
 }
 
+// TestE2ETLSExplicitOn 覆盖三端都显式 tls=true 的正向路径：
+// relay tls=true + 自签证书，agent/client tls=true + tls_ca 正常校验，TCP echo 通。
+func TestE2ETLSExplicitOn(t *testing.T) {
+	guardGoroutines(t)
+	pki := newTestPKI(t)
+	echoAddr := startTCPEchoServer(t)
+
+	relayManage := hostPort(freeTCPPort(t))
+	relayCfg, _ := writeRelayINI(t, relaySpec{
+		Tunnel:  hostPort(freeTCPPort(t)),
+		TCP:     hostPort(freeTCPPort(t)),
+		Manage:  relayManage,
+		TLSCert: pki.CertPath,
+		TLSKey:  pki.KeyPath,
+		TLS:     "true",
+	})
+	relayH := startRelay(t, relayCfg)
+
+	agentCfg, _ := writeAgentINI(t, agentSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    hostPort(freeTCPPort(t)),
+		Protocol:  "tcp",
+		Local:     echoAddr,
+		TLSCA:     pki.CAPath,
+		TLS:       "true",
+	})
+	agentH := startAgent(t, agentCfg)
+	waitServicesRegistered(t, relayH, relayManage, "default")
+
+	clientPort := freeTCPPort(t)
+	clientCfg, _ := writeClientINI(t, clientSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    hostPort(freeTCPPort(t)),
+		Services:  []clientService{{ID: "default", Listen: hostPort(clientPort)}},
+		TLSCA:     pki.CAPath,
+		TLS:       "true",
+	})
+	clientH := startClient(t, clientCfg)
+	waitClientMappings(t, clientH, clientCfg.Common.ManageListen, map[string]string{
+		"default": hostPort(clientPort),
+	})
+
+	conn := dialWithRetry(t, hostPort(clientPort))
+	echoText(t, conn, "tls-explicit-on")
+	_ = conn.Close()
+
+	waitRelayPairCount(t, relayH, relayManage, 0)
+	stopAll(t, clientH, agentH, relayH)
+}
+
+// TestE2ETLSSystemRootsRejectsSelfSigned 覆盖 tls=true + 不配 tls_ca：
+// 必须使用系统根证书做标准校验，因此自签 relay 证书**必然被拒绝**——
+// 这证明 tls=true 不会像 tls_insecure_skip_verify 那样静默跳过校验。
+func TestE2ETLSSystemRootsRejectsSelfSigned(t *testing.T) {
+	guardGoroutines(t)
+	pki := newTestPKI(t)
+	echoAddr := startTCPEchoServer(t)
+
+	relayCfg, _ := writeRelayINI(t, relaySpec{
+		Tunnel:  hostPort(freeTCPPort(t)),
+		TCP:     hostPort(freeTCPPort(t)),
+		TLSCert: pki.CertPath,
+		TLSKey:  pki.KeyPath,
+		TLS:     "true",
+	})
+	relayH := startRelay(t, relayCfg)
+
+	// 不配 tls_ca（也不配 insecure）：tls=true 必须走系统根证书。
+	agentCfg, _ := writeAgentINI(t, agentSpec{
+		RelayAddr:   relayCfg.Relay.TunnelListen,
+		Protocol:    "tcp",
+		Local:       echoAddr,
+		TLS:         "true",
+		NoReconnect: true,
+	})
+	agentH := startAgent(t, agentCfg)
+
+	err := waitRunError(t, agentH, 10*time.Second)
+	if err == nil {
+		t.Fatal("tls=true 且不配 tls_ca 时，自签 relay 证书必须校验失败")
+	}
+	msg := err.Error()
+	if !strings.Contains(strings.ToLower(msg), "tls") {
+		t.Fatalf("错误信息应提到 TLS，实际 %q", msg)
+	}
+	if !containsAny(msg, "x509", "unknown authority", "certificate", "证书") {
+		t.Fatalf("错误信息应给出证书校验失败的可读原因，实际 %q", msg)
+	}
+	if !agentH.exited() {
+		t.Fatal("agent Run 应已退出")
+	}
+	stopAll(t, relayH)
+}
+
+// TestE2ETLSPlainWhenFalse 覆盖 tls=false 强制明文：
+// 即使 relay 配了证书，三端都显式 false 时也必须按明文连通。
+func TestE2ETLSPlainWhenFalse(t *testing.T) {
+	guardGoroutines(t)
+	pki := newTestPKI(t)
+	echoAddr := startTCPEchoServer(t)
+
+	relayManage := hostPort(freeTCPPort(t))
+	relayCfg, _ := writeRelayINI(t, relaySpec{
+		Tunnel:  hostPort(freeTCPPort(t)),
+		TCP:     hostPort(freeTCPPort(t)),
+		Manage:  relayManage,
+		TLSCert: pki.CertPath,
+		TLSKey:  pki.KeyPath,
+		TLS:     "false",
+	})
+	relayH := startRelay(t, relayCfg)
+
+	agentCfg, _ := writeAgentINI(t, agentSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    hostPort(freeTCPPort(t)),
+		Protocol:  "tcp",
+		Local:     echoAddr,
+		TLS:       "false",
+	})
+	agentH := startAgent(t, agentCfg)
+	waitServicesRegistered(t, relayH, relayManage, "default")
+
+	clientPort := freeTCPPort(t)
+	clientCfg, _ := writeClientINI(t, clientSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    hostPort(freeTCPPort(t)),
+		Services:  []clientService{{ID: "default", Listen: hostPort(clientPort)}},
+		TLS:       "false",
+	})
+	clientH := startClient(t, clientCfg)
+	waitClientMappings(t, clientH, clientCfg.Common.ManageListen, map[string]string{
+		"default": hostPort(clientPort),
+	})
+
+	conn := dialWithRetry(t, hostPort(clientPort))
+	echoText(t, conn, "tls-forced-plain")
+	_ = conn.Close()
+
+	waitRelayPairCount(t, relayH, relayManage, 0)
+	stopAll(t, clientH, agentH, relayH)
+}
+
+// TestE2ETLSMismatchExplicit 覆盖显式不匹配：relay tls=false（明文）而 agent tls=true。
+// TLS 握手必须失败，且错误要指向 tls 配置（而不是静默卡住或重试）。
+func TestE2ETLSMismatchExplicit(t *testing.T) {
+	guardGoroutines(t)
+	echoAddr := startTCPEchoServer(t)
+
+	relayCfg, _ := writeRelayINI(t, relaySpec{
+		Tunnel: hostPort(freeTCPPort(t)),
+		TCP:    hostPort(freeTCPPort(t)),
+		TLS:    "false",
+	})
+	relayH := startRelay(t, relayCfg)
+
+	agentCfg, _ := writeAgentINI(t, agentSpec{
+		RelayAddr:   relayCfg.Relay.TunnelListen,
+		Protocol:    "tcp",
+		Local:       echoAddr,
+		TLS:         "true",
+		NoReconnect: true,
+	})
+	agentH := startAgent(t, agentCfg)
+
+	err := waitRunError(t, agentH, 10*time.Second)
+	if err == nil {
+		t.Fatal("relay 明文而 agent tls=true 必须失败")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "tls") {
+		t.Fatalf("错误信息应指向 tls 配置，实际 %q", err.Error())
+	}
+	if !agentH.exited() {
+		t.Fatal("agent Run 应已退出")
+	}
+	stopAll(t, relayH)
+}
+
 // ---------------------------------------------------------------------------
 // 小工具
 // ---------------------------------------------------------------------------

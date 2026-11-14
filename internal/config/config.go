@@ -99,6 +99,8 @@ type RelayConfig struct {
 	// 为空表示不监听 UDP 端口，UDP 数据面改走 TCP 通信端口的封装隧道
 	// （udp_mode = tcp_tunnel）。
 	UDPListen string
+	// TLS 是三态 TLS 开关：auto（默认，按证书推断）| true（强制 TLS）| false（强制明文）。
+	TLS TLSMode
 	// TLSCert 是隧道 TLS 证书路径；与 TLSKey 成对出现。
 	TLSCert string
 	// TLSKey 是隧道 TLS 私钥路径；与 TLSCert 成对出现。
@@ -139,6 +141,8 @@ type ServerConfig struct {
 	Local string
 	// Services 是附加服务映射，按 ini 中出现顺序排列。
 	Services []ServerService
+	// TLS 是三态 TLS 开关：auto（默认，按 CA/insecure 推断）| true（强制 TLS）| false（强制明文）。
+	TLS TLSMode
 	// TLSCA 是可选 CA 文件路径，用于校验 relay 证书。
 	TLSCA string
 	// TLSInsecureSkipVerify 为 true 时跳过 relay 证书校验（仅建议测试环境）。
@@ -190,6 +194,8 @@ type ClientConfig struct {
 	Token string
 	// Services 是本地监听映射，按 ini 中出现顺序排列。
 	Services []ClientService
+	// TLS 是三态 TLS 开关：auto（默认，按 CA/insecure 推断）| true（强制 TLS）| false（强制明文）。
+	TLS TLSMode
 	// TLSCA 是可选 CA 文件路径，用于校验 relay 证书。
 	TLSCA string
 	// TLSInsecureSkipVerify 为 true 时跳过 relay 证书校验（仅建议测试环境）。
@@ -222,6 +228,7 @@ func newDefault() *Config {
 			LogFormat: "text",
 		},
 		Relay: RelayConfig{
+			TLS:               TLSAuto,
 			PairTimeout:       10 * time.Second,
 			IdleTimeout:       300 * time.Second,
 			HeartbeatTimeout:  90 * time.Second,
@@ -229,6 +236,7 @@ func newDefault() *Config {
 			TokenTTL:          15 * time.Second,
 		},
 		Server: ServerConfig{
+			TLS:                 TLSAuto,
 			Heartbeat:           30 * time.Second,
 			DialTimeout:         10 * time.Second,
 			UDPSessionTimeout:   60 * time.Second,
@@ -236,6 +244,7 @@ func newDefault() *Config {
 			ReconnectMaxBackoff: 60 * time.Second,
 		},
 		Client: ClientConfig{
+			TLS:                 TLSAuto,
 			Heartbeat:           30 * time.Second,
 			Subscribe:           true,
 			DialTimeout:         10 * time.Second,
@@ -349,6 +358,19 @@ func (b *builder) boolean(section, key string, def bool) (bool, error) {
 	}
 }
 
+// tlsMode 解析三态 tls 键；键不存在或值为空时返回默认值。
+func (b *builder) tlsMode(section, key string, def TLSMode) (TLSMode, error) {
+	v, ok := b.raw(section, key)
+	if !ok || strings.TrimSpace(v.Value) == "" {
+		return def, nil
+	}
+	m, err := ParseTLSMode(v.Value)
+	if err != nil {
+		return def, fmt.Errorf("第 %d 行: [%s] %s = %q: %w", v.Line, section, key, v.Value, err)
+	}
+	return m, nil
+}
+
 // load 依次解析各段。
 func (b *builder) load() error {
 	if err := b.loadCommon(); err != nil {
@@ -396,6 +418,9 @@ func (b *builder) loadRelay() error {
 	r.TLSKey = b.absPath(b.str("relay", "tls_key"))
 
 	var err error
+	if r.TLS, err = b.tlsMode("relay", "tls", r.TLS); err != nil {
+		return err
+	}
 	if r.PairTimeout, err = b.duration("relay", "pair_timeout", r.PairTimeout); err != nil {
 		return err
 	}
@@ -424,6 +449,9 @@ func (b *builder) loadServer() error {
 	s.TLSCA = b.absPath(b.str("server", "tls_ca"))
 
 	var err error
+	if s.TLS, err = b.tlsMode("server", "tls", s.TLS); err != nil {
+		return err
+	}
 	if s.TLSInsecureSkipVerify, err = b.boolean("server", "tls_insecure_skip_verify", false); err != nil {
 		return err
 	}
@@ -479,6 +507,9 @@ func (b *builder) loadClient() error {
 	c.TLSCA = b.absPath(b.str("client", "tls_ca"))
 
 	var err error
+	if c.TLS, err = b.tlsMode("client", "tls", c.TLS); err != nil {
+		return err
+	}
 	if c.TLSInsecureSkipVerify, err = b.boolean("client", "tls_insecure_skip_verify", false); err != nil {
 		return err
 	}

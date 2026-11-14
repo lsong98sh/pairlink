@@ -3,8 +3,9 @@
 > **生成方式**：逐条对照 `task.md`（150 行，§1–§12）与 `task2.txt`（11 行）到当前实现与测试；
 > 所有「实现位置」均来自本轮 `grep`/读码取证（非凭印象），行号为**当前工作区**真实行号。
 > 取证基线：v0.2.0 发布提交（tag `v0.2.0`，工作区含阶段 6B/6C/6D/6E 成果）、
-> `go1.24.4 windows/amd64`。阶段 6E 只更新 §5 工程增强状态、版本号与 §6 复核结论，
-> 不改需求侧判定；§5.2 新增条目全部使用 v0.2.0 真实行号（阶段 6C 重构过的文件已逐条复核）。
+> `go1.24.4 windows/amd64`。阶段 6E 更新 §5 工程增强状态、版本号与 §6 复核结论；
+> 阶段 6G 追加 E7（TLS 显式开关）的实现、测试与文档，不改需求侧判定；
+> §5.2 新增条目使用当前工作区真实行号（阶段 6C 重构过的文件已逐条复核）。
 >
 > **定位约定**：`文件:行` 写成可点击链接（相对 `docs/`），如 `../internal/relay/tcp_data.go#L131`；
 > 测试写作 `包/文件:TestName`（链接指向该测试函数起始行）。
@@ -29,13 +30,12 @@
 | task.md §12（版本/许可） | 2 | 2 | 0 | 0 | 0 | tag `v0.1.0` 与 `v0.2.0` 均存在；Apache-2.0 |
 | task2.txt（UDP 承载模式改造） | 6 | 6 | 0 | 0 | 0 | `udp_mode` 三处下发、`carrier`、隧道帧、README 取舍全部落地 |
 | **合计** | **85** | **84** | **0** | **0** | **1** | 需求缺口 = 0；唯一未了项 = Windows 服务完整生命周期（环境受限，需管理员） |
-| 工程增强（§5.2，不计入需求统计） | 8 | 7 | 0 | 1 | 0 | E1–E6 已落地（阶段 6C/6D）；E8 文档时点已标注；E7（TLS 强制开关）仍未做，非需求项 |
-| 工程增强（§5.2，不计入需求统计） | 8 | 7 | 0 | 1 | 0 | E1–E6 已落地（阶段 6C/6D）；E8 文档时点已标注；E7（TLS 强制开关）仍未做 |
+| 工程增强（§5.2，不计入需求统计） | 8 | 8 | 0 | 0 | 0 | E1–E6（阶段 6C/6D）、E8（文档修正）、E7（阶段 6G：TLS 显式开关）全部落地；不计入需求统计 |
 
 **一句话结论**：v0.2.0 对 `task.md` + `task2.txt` 的**功能需求已全部实现且可验证**；
-剩下的不是「功能缺失」，而是 **2 处 README 应有说明缺失**（§11 的两个自由度）+
-**1 处必须管理员环境才能验证的 Windows 服务生命周期**；v0.1.0 时点的 6 项工程增强
-（自动重连、热切换、发送队列、UDP 重传、soak、部署件）已在阶段 6C/6D 全部落地（§5.2）。
+唯一未了项是 **1 处必须管理员环境才能验证的 Windows 服务生命周期**；v0.1.0 时点的
+6 项工程增强已在阶段 6C/6D 全部落地，E8（文档时点）与 E7（TLS 显式开关）分别在阶段
+6E/6G 补齐，§5.2 的 8 项工程增强全部 ✅。
 
 ---
 
@@ -112,7 +112,7 @@
 
 | 需求ID | 需求原文摘要 | 实现位置 | 测试证据 | 状态 | 差距说明 |
 | --- | --- | --- | --- | --- | --- |
-| task.md §6.1 | 隧道端口信令使用 TLS；agent/client 用预置 CA 或证书校验 | relay：[internal/relay/server.go:177-211](../internal/relay/server.go#L177-L211)（`tls.Listen`，MinVersion 1.2）；agent：[internal/agent/util.go:30-56](../internal/agent/util.go#L30-L56)；client：[internal/client/control.go:170-208](../internal/client/control.go#L170-L208) | [TestTunnelTLSHelloOK](../internal/relay/tunnel_test.go#L247)、[TestE2ETLSTCPEcho](../test/e2e_tls_test.go#L106)、[TestE2ETLSInsecureSkipVerify](../test/e2e_tls_test.go#L157)、3 个「配置不匹配必须失败」用例（[:207](../test/e2e_tls_test.go#L207)/[:248](../test/e2e_tls_test.go#L248)/[:287](../test/e2e_tls_test.go#L287)） | ✅ 已实现 | TLS 为**部署时启用**（未配证书→明文+WARN，README §7.1 已声明）；"强制 TLS"属工程增强 E7，不算本行缺口 |
+| task.md §6.1 | 隧道端口信令使用 TLS；agent/client 用预置 CA 或证书校验 | relay：[internal/relay/server.go:182-246](../internal/relay/server.go#L182-L246)（`tls.Listen`，MinVersion 1.2 + 三态开关）；agent：[internal/agent/util.go:31-101](../internal/agent/util.go#L31-L101)；client：[internal/client/control.go:204-282](../internal/client/control.go#L204-L282) | [TestTunnelTLSHelloOK](../internal/relay/tunnel_test.go#L247)、[TestE2ETLSTCPEcho](../test/e2e_tls_test.go#L106)、[TestE2ETLSInsecureSkipVerify](../test/e2e_tls_test.go#L157)、3 个「配置不匹配必须失败」用例（[:207](../test/e2e_tls_test.go#L207)/[:253](../test/e2e_tls_test.go#L253)/[:294](../test/e2e_tls_test.go#L294)） | ✅ 已实现 | TLS 为**部署时启用**（未配证书→明文+WARN）；阶段 6G 起可用 `tls = true` 强制 TLS（工程增强 E7，见 §5.2），不算本行缺口 |
 | task.md §6.2 | 通信端口保持哑管道，不终止、不解析上层协议 | [internal/relay/tcp_data.go:285-287](../internal/relay/tcp_data.go#L285-L287)；[docs/protocol.md:17-18](protocol.md#L17-L18) | [TestE2EHTTPZeroChange](../test/e2e_basic_test.go#L18)（HTTP 头/体原样透传） | ✅ 已实现 | task2 允许的唯一例外：UDP over TCP 的**封装帧**（PairLink 自有格式），见 §T2.3 |
 | task.md §6.3 | HTTPS/SSH 端到端加密由第三方与真实服务完成，中继透明转发 | [README.md:418-420](../README.md#L418-L420)；[docs/protocol.md:17-18](protocol.md#L17-L18)；转发层无任何加解密（[forward.go:115-131](../internal/forward/forward.go#L115-L131)） | [TestE2EHTTPZeroChange](../test/e2e_basic_test.go#L18)（响应头 `X-PairLink-Test` 原样到达） | ✅ 已实现 | 数据面**永远明文**（见 README §10 #10） |
 | task.md §6.4 | 一次性令牌与配对键绑定、短有效期、用后即焚，TCP/UDP 通信端口都校验 | [internal/token/token.go:75-152](../internal/token/token.go#L75-L152)（Issue/Validate/Consume/Sweep）；三处调用见 §3.11 行；默认 TTL 15s [config.go:216](../internal/config/config.go#L216) | [TestConsume](../internal/token/token_test.go#L100)、[TestExpiry](../internal/token/token_test.go#L117)、[TestE2EFailureTokenReuse](../test/e2e_failure_test.go#L37)、[TestE2EFailureTokenExpiry](../test/e2e_failure_test.go#L77)、[TestNativeUDPHalfPairTimeout](../internal/relay/udp_data_test.go#L171) | ✅ 已实现 | 日志不含令牌明文（[TestRelayLogsDoNotContainToken](../internal/relay/logs_test.go#L69)、[TestLogsDoNotContainToken](../internal/agent/tunnel_test.go#L237)） |
@@ -250,15 +250,16 @@
 
 | ID | 差距 | 类型 | 影响 | 优先级 | 处置 |
 | --- | --- | --- | --- | --- | --- |
-| G3 | Windows 服务完整生命周期未验证：`install → start → stop → uninstall` 的 SCM 状态迁移、`pairlink-<mode>.log` 落盘 | 🔒 仅环境受限 | §10.6 只能证明"代码在、错误路径正确"；交付验收存在"未证明"项 | **P1**（需管理员环境） | 人工管理员复核：`deploy/windows/install-service.ps1` → `sc query pairlink-relay` → `uninstall-service.ps1`（非代码改动） |
+| G3 | Windows 服务完整生命周期未验证：`install → start → stop → uninstall` 的 SCM 状态迁移、`pairlink-<mode>.log` 落盘 | 🔒 仅环境受限 | §10.6 只能证明"代码在、错误路径正确"；交付验收存在"未证明"项 | **P1**（需管理员环境） | 人工管理员复核：`deploy/windows/install-relay.ps1` → `sc query pairlink-relay` → `install-relay.ps1 -Uninstall`（非代码改动） |
 
 > G1（README 未说明 `client_conn_id` 生成方）与 G2（README 未说明管理页 HTML 组织方式）
 > 已由阶段 6E 在 README §3.2 / §6 补齐并闭环，见 §1 表 `task.md §11.1`、`§11.2` 两行。
 
 ### 5.2 工程增强（task.md / task2 未要求，不计入需求缺失）
 
-> **阶段 6E 复核**：v0.1.0 时点列出的 E1–E6 已在阶段 6C/6D 全部实现，下表状态改为「✅ 已实现」
-> 并补充 v0.2.0 实现位置与测试证据；E7 仍未做，E8（文档时点）已在本轮标注/修正。
+> **阶段 6E/6G 复核**：E1–E6 已在阶段 6C/6D 全部实现，E8（文档时点）在阶段 6E 修正；
+> E7（TLS 显式开关）已在阶段 6G 落地（三态 `tls` + 示例 + 文档），下表状态统一为「✅ 已实现」，
+> 并补充当前工作区实现位置与测试证据。
 
 | ID | 增强项 | 状态 | 实现位置（v0.2.0） | 测试证据 | 备注 |
 | --- | --- | --- | --- | --- | --- |
@@ -267,8 +268,8 @@
 | E3 | UDP over TCP **每会话发送队列/写者 goroutine**，消除队头阻塞对读循环的放大 | ✅ 已实现 | [internal/tunnelqueue/queue.go:64](../internal/tunnelqueue/queue.go#L64)（`Queue`）、[:145](../internal/tunnelqueue/queue.go#L145)（`SendData`）、[:249](../internal/tunnelqueue/queue.go#L249)（`writeLoop`）；接入 [agent/tunnel.go:176](../internal/agent/tunnel.go#L176)、[client/tunnel.go:60](../internal/client/tunnel.go#L60)、[relay/carrier.go:291](../internal/relay/carrier.go#L291) | [TestTunnelQueueDropPolicy](../internal/tunnelqueue/queue_test.go#L101)、[TestTunnelQueueCloseDrains](../internal/tunnelqueue/queue_test.go#L183)、[TestTunnelQueueEnqueueNeverBlocks](../internal/tunnelqueue/queue_test.go#L269)、[TestTunnelQueueNoGoroutineLeak](../internal/tunnelqueue/queue_test.go#L297)、[TestCarrierSlowSessionDoesNotBlockOthers](../internal/relay/carrier_slow_test.go#L21) | 字节+条数双限；满队列丢弃并记 `tunnel_drop`；关闭排空 |
 | E4 | 原生 UDP 报到/BindOK 丢包处理（首包重传、幂等） | ✅ 已实现 | [internal/agent/data.go:113-117](../internal/agent/data.go#L113-L117)（约 300ms × 3）、[:198](../internal/agent/data.go#L198)（重发循环）；[internal/client/session_udp.go:174-178](../internal/client/session_udp.go#L174-L178)；[internal/relay/udp_data.go:52](../internal/relay/udp_data.go#L52)（半开重复 Bind 幂等）、[:143](../internal/relay/udp_data.go#L143)（`Full` 后丢弃） | [TestNativeUDPBindOKLostRetry（agent）](../internal/agent/reconnect_test.go#L187)、[TestNativeUDPBindOKLostRetry（client）](../internal/client/reconnect_test.go#L423)、[TestNativeUDPBindIdempotent](../internal/relay/udp_bind_test.go#L29)、[TestNativeUDPFullDuplicateBindDropped](../internal/relay/udp_bind_test.go#L65) | 收到 `BindOK` 或首个业务数据报即就绪；`bind_dup_drop` |
 | E5 | soak/压力测试（长时间稳定、资源增长曲线） | ✅ 已实现 | [test/soak_test.go:49](../test/soak_test.go#L49)（`TestSoak`）、[:54](../test/soak_test.go#L54)（`TestSoakShort`）、[test/soak_metrics_windows.go:1](../test/soak_metrics_windows.go#L1)（跨平台资源采样）；[README.md:1150](../README.md#L1150) §13.17 | `go test -tags soak ./test -run TestSoakShort -timeout 10m`（30 轮 / 2m30s 全绿，TCP/UDP 每轮 4/4）；完整长跑命令见 README §13.17 | 默认 30 轮 / 150s；可配 `SOAK_ROUNDS`/`SOAK_DURATION`/`SOAK_SESSIONS` |
-| E6 | systemd unit（三模式）、安装/卸载 shell、Windows PowerShell 安装/卸载、Dockerfile、docker-compose、`examples/*.ini` | ✅ 已实现 | [deploy/systemd/pairlink-relay.service:1](../deploy/systemd/pairlink-relay.service#L1)、[deploy/linux/install.sh:1](../deploy/linux/install.sh#L1)、[deploy/windows/install-service.ps1:1](../deploy/windows/install-service.ps1#L1)、[Dockerfile:1](../Dockerfile#L1)、[deploy/docker-compose.yml:1](../deploy/docker-compose.yml#L1)、[examples/relay.ini:1](../examples/relay.ini#L1) | [TestExamples](../test/examples_test.go#L46)（8 份模板全部 Load/Validate）；[README.md:1135](../README.md#L1135) §13.16 WSL2 systemd 实测 | Docker 构建与 Windows 管理员 SCM 生命周期仍未验证（环境限制） |
-| E7 | TLS 强制开关（`tls_required` 或 relay 侧拒绝明文） | ❌ 未做 | 现状：[internal/relay/server.go:198](../internal/relay/server.go#L198)（未配证书即明文 + WARN） | 文档兜底：[README.md:429](../README.md#L429) §7.1 | 非需求缺口；P3，保留为后续增强 |
+| E6 | systemd unit（三模式）、按角色安装/卸载 shell、Windows PowerShell 按角色安装/卸载、Dockerfile、docker-compose、`examples/*.ini` | ✅ 已实现 | [deploy/systemd/pairlink-relay.service:1](../deploy/systemd/pairlink-relay.service#L1)、[deploy/linux/install-relay.sh:1](../deploy/linux/install-relay.sh#L1)、[deploy/linux/common.sh:1](../deploy/linux/common.sh#L1)、[deploy/windows/install-relay.ps1:1](../deploy/windows/install-relay.ps1#L1)、[deploy/windows/common.ps1:1](../deploy/windows/common.ps1#L1)、[Dockerfile:1](../Dockerfile#L1)、[deploy/docker-compose.yml:1](../deploy/docker-compose.yml#L1)、[examples/relay.ini:1](../examples/relay.ini#L1) | [TestExamples](../test/examples_test.go#L46)（10 份模板全部 Load/Validate）；[README.md](../README.md) §13.16/§13.18 WSL2 systemd 与按模式拆分实测 | Docker 构建与 Windows 管理员 SCM 生命周期仍未验证（环境限制） |
+| E7 | TLS 显式开关（三态 `tls = auto/true/false`，覆盖 relay 监听侧与 agent/client 拨号侧；`true` 且无 `tls_ca` 时用系统根证书） | ✅ 已实现（阶段 6G） | [internal/config/tls.go:16](../internal/config/tls.go#L16)（`TLSMode` / `ParseTLSMode` / `DialTLS` / `ListenTLS`）；[config.go:103](../internal/config/config.go#L103)（`[relay]` 字段）、[:145](../internal/config/config.go#L145)（`[server]`）、[:198](../internal/config/config.go#L198)（`[client]`）；[validate.go:188](../internal/config/validate.go#L188)（relay 校验）、[:266](../internal/config/validate.go#L266)（server）、[:344](../internal/config/validate.go#L344)（client）；[relay/server.go:182](../internal/relay/server.go#L182)（`listenTunnel`）；[agent/util.go:31](../internal/agent/util.go#L31)（`serverTLSConfig`）；[client/control.go:204](../internal/client/control.go#L204)（`dialControl`） | [TestTLSModeDefaultAuto](../internal/config/tls_test.go#L25)、[TestParseTLSMode](../internal/config/tls_test.go#L42)、[TestLoadInvalidTLSValue](../internal/config/tls_test.go#L107)、[TestValidateRelayTLSRequired](../internal/config/tls_test.go#L155)、[TestValidateDialTLSOnWithoutCA](../internal/config/tls_test.go#L211)、[TestServerTLSConfigTrueWithoutCAUsesSystemRoots](../internal/agent/tls_test.go#L97)、[TestClientTLSConfigTrueWithoutCAUsesSystemRoots](../internal/client/tls_test.go#L137)、[TestTunnelListenTLSExplicitOn](../internal/relay/tls_listen_test.go#L17)、[TestTunnelListenTLSFalseWithCert](../internal/relay/tls_listen_test.go#L54)、[TestE2ETLSExplicitOn](../test/e2e_tls_test.go#L325)、[TestE2ETLSSystemRootsRejectsSelfSigned](../test/e2e_tls_test.go#L376)、[TestE2ETLSPlainWhenFalse](../test/e2e_tls_test.go#L419)、[TestE2ETLSMismatchExplicit](../test/e2e_tls_test.go#L467) | 默认 `auto` 100% 保持旧行为；`true` 让"漏配 CA 静默降级为明文"不再可能（无 ca 时走系统根证书、校验失败即报错）；示例见 `examples/relay-tls.ini` / `examples/agent-tls.ini` |
 | E8 | README 阶段 4 时点数据/命令过期（`33 个 PASS`、`taskkill /PID`） | ✅ 已实现（文档） | [README.md:705](../README.md#L705)（§13.1 已标注「阶段 4 收尾」）、[README.md:862](../README.md#L862)（§13.12 同时点标注）；[README.md:841](../README.md#L841)（`taskkill` 已改为 `os.Process.Kill()`） | 与 §13.15.6 的 27 个 `--- PASS` 并存但已标明时点，不再自相矛盾 | 纯文档修正 |
 
 ---

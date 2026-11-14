@@ -342,20 +342,54 @@ type carrier struct {
 - Windows 服务模式：日志落到 **exe 同目录的 `pairlink-<mode>.log`**（`service.LogPath`），
   同时把 `os.Stderr`/`os.Stdout` 指向该文件，保证各包内 `logx.New` 的日志也落盘。
 
-### 7.6 TLS 策略
+### 7.6 TLS 策略（阶段 6G：E7 显式开关）
 
-- relay 配置了 `tls_cert` + `tls_key` 时隧道强制 TLS（`tls.Listen`，最低 TLS 1.2）；
-  缺一不可用（按明文运行并 WARN）。
-- agent/client 的 TLS **只在以下两种情况启用**：
-  1. `tls_ca` 非空 → 使用 TLS，且 `RootCAs` **只**包含该 CA（不使用系统根），
-     `ServerName` 取 `relay_addr` 的 host；
-  2. `tls_ca` 为空但 `tls_insecure_skip_verify = true` → 使用 TLS 但不校验证书（WARN）。
-- **两者皆空 → 明文连接**（对应 relay 未配置证书的部署）。注意：这不是"回退到系统根证书
-  建 TLS"，而是阶段 1~4 一直使用的明文默认；想用系统根证书校验公网 CA 签发的 relay 证书时，
-  请显式配置 `tls_ca` 指向该 CA（或使用 `tls_insecure_skip_verify` 仅测试）。
-- 两侧配置不匹配（relay 有证书而 agent/client 明文，或反之）→ TLS 握手失败，
-  agent/client 的 `Run` 返回可读错误并退出，属**预期**行为；不做协议探测/自动降级。
+TLS 是否启用由**三层**决定，优先级从高到低：
+
+1. **显式 `tls` 开关**：`[relay]` / `[server]` / `[client]` 各一个，取值 `auto`（默认）|
+   `true`（强制 TLS）| `false`（强制明文）；大小写不敏感，只接受这三个字面量
+   （`on` / `yes` / `1` 等一律启动校验失败）；
+2. **`auto` 时按材料推断**：完全复刻阶段 1~6 的旧行为；
+3. **校验材料**（`tls_cert`/`tls_key`、`tls_ca`、`tls_insecure_skip_verify`）只在允许 TLS 时生效。
+
+#### relay 监听侧
+
+| `tls` | 证书材料 | 结果 |
+| --- | --- | --- |
+| `auto`（默认） | `tls_cert` + `tls_key` 均非空 | `tls.Listen`（TLS 1.2+） |
+| `auto` | 都为空 | 明文 + WARN |
+| `auto` | 只有一个 | 明文 + WARN（必须成对） |
+| `true` | `tls_cert` + `tls_key` 均非空 | `tls.Listen`（TLS 1.2+） |
+| `true` | 任一为空 | **启动校验失败**（配置错误，提示补 `tls_cert`/`tls_key`） |
+| `false` | 任意（含已配证书） | 明文；配了证书则 WARN（"证书被忽略"） |
+
+文件不存在仍只 WARN（允许先写配置后拷证书），但 `true` 时路径**必须非空**。
+
+#### agent/client 拨号侧
+
+| `tls` | `tls_ca` | `tls_insecure_skip_verify` | 结果 |
+| --- | --- | --- | --- |
+| `auto`（默认） | 空 | false | **明文** |
+| `auto` | 非空 | false | TLS，`RootCAs` 只含该 CA |
+| `auto` | 空 | true | TLS，跳过校验 + WARN |
+| `auto` | 非空 | true | TLS，`RootCAs` 只含该 CA 且跳过校验 + WARN |
+| `true` | 非空 | false | TLS，`RootCAs` 只含该 CA |
+| `true` | 空 | false | TLS，**`RootCAs = nil`（系统根证书）**，标准校验 |
+| `true` | 任意 | true | TLS，跳过校验 + WARN（`tls=true` 时开关多余，但仍生效） |
+| `false` | 任意 | 任意 | **明文**；配了材料则 WARN（`tls_ca` / insecure 被忽略） |
+
+- `ServerName` 始终取 `relay_addr` 的 host，证书必须包含该主机名或 IP SAN。
+  **公网 CA 场景的安全写法**：relay 用公网证书，agent/client 只写 `tls = true`（不配 `tls_ca`），
+  由系统根证书完成标准校验，不需要也不应该打开 `tls_insecure_skip_verify`。
+- 两侧配置不匹配（relay 明文而 agent/client TLS，或反之）→ TLS 握手失败（relay 侧表现为
+  读帧失败），agent/client 的 `Run` 返回可读错误并退出；TLS 握手失败按永久错误处理（不重连），
+  不做协议探测/自动降级。
 - 数据面永远是明文哑管道（端到端加密由第三方协议自己完成）。
+
+> **兼容性**：默认 `auto` 与阶段 6 之前 100% 一致，旧 ini 不改一个字也能跑。
+> 注意 `auto` 下"没配 `tls_ca` = 明文"仍是历史行为；新部署建议显式写 `tls = true`，
+> 让"漏配 CA 静默降级为明文"不再可能发生（`tls = true` 时用系统根证书或直接失败）。
+
 
 ### 7.7 UDP 数据面承载模式
 

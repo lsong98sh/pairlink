@@ -5,8 +5,8 @@
 | 路径 | 内容 |
 | --- | --- |
 | `deploy/systemd/` | Linux systemd unit（relay / agent / client）+ 部署说明 |
-| `deploy/linux/` | Linux 安装/卸载脚本（systemd、配置目录、幂等、dry-run） |
-| `deploy/windows/` | Windows 服务安装/卸载 PowerShell + 部署说明 |
+| `deploy/linux/` | 按角色拆分的 `install-{relay,agent,client}.sh` + `common.sh`（systemd、配置目录、幂等、dry-run） |
+| `deploy/windows/` | 按角色拆分的 `install-{relay,agent,client}.ps1` + `common.ps1` + 部署说明 |
 | `Dockerfile`、`.dockerignore`、`deploy/docker-compose.yml` | 多阶段容器镜像 + relay/agent/client/nginx 演示编排 |
 | `examples/` | 5 份主机侧 ini 模板 + `examples/docker/` 3 份容器侧 ini 模板 |
 
@@ -96,64 +96,94 @@ sudo journalctl -u pairlink-relay -f
 
 ---
 
-## 3. Linux 安装/卸载脚本（`deploy/linux/`）
+## 3. Linux 按角色安装/卸载脚本（`deploy/linux/`）
+
+一台机器通常只部署一个角色。三个入口脚本**各自只安装/启动自己那个服务**：
+
+| 脚本 | 安装的本模式 ini | 安装的本模式 unit |
+| --- | --- | --- |
+| `install-relay.sh` | `/etc/pairlink/relay.ini` | `pairlink-relay.service` |
+| `install-agent.sh` | `/etc/pairlink/agent.ini` | `pairlink-agent.service` |
+| `install-client.sh` | `/etc/pairlink/client.ini` | `pairlink-client.service` |
+
+`common.sh` 是内部函数库（文件头已注明），由三个入口 source，不是部署入口。
 
 ```bash
 # 预览（可非 root）
-./deploy/linux/install.sh --dry-run
+./deploy/linux/install-relay.sh --dry-run
 
-# 真装：二进制 + /etc/pairlink + 示例 ini；--systemd 同时装 unit 并 enable
-sudo ./deploy/linux/install.sh --binary ./pairlink --systemd
+# relay 机器：共享二进制 + relay.ini + pairlink-relay.service（enable + start）
+sudo ./deploy/linux/install-relay.sh --binary ./pairlink
 
-# 只装二进制/配置，不碰 systemd
-sudo ./deploy/linux/install.sh --binary ./pairlink
+# agent 机器
+sudo ./deploy/linux/install-agent.sh --binary ./pairlink
 
-# 卸载：默认保留 /etc/pairlink
-sudo ./deploy/linux/uninstall.sh
-# 连配置/证书一起删（不可恢复）
-sudo ./deploy/linux/uninstall.sh --purge
+# client 机器
+sudo ./deploy/linux/install-client.sh --binary ./pairlink
+
+# 只放二进制与配置，不装 unit
+sudo ./deploy/linux/install-client.sh --binary ./pairlink --no-systemd
+
+# 卸载：只删本模式 unit；默认保留 /etc/pairlink
+sudo ./deploy/linux/install-relay.sh --uninstall
+# 额外删除本模式 ini 与明确属于本模式的证书（不删其它模式的）
+sudo ./deploy/linux/install-relay.sh --uninstall --purge
 ```
 
-`install.sh` 的行为：
+共同行为：
 
 - `set -euo pipefail`；非 root 且非 `--dry-run` 直接拒绝；
-- 二进制默认依次找脚本同目录、仓库根目录的 `pairlink` / `pairlink-linux`，也可 `--binary`；
-- 创建系统用户/组 `pairlink`（`useradd --system --no-create-home --shell nologin`）；
-- `/etc/pairlink` 为 `0750 root:pairlink`，示例 ini 为 `0640 root:pairlink`；
-- **已有配置绝不覆盖**；二进制内容相同则跳过，不同则先写临时文件再 rename
+- 共享二进制 `/usr/local/bin/pairlink`：内容相同跳过；不同则先写临时文件再 rename
   （避免覆盖正在运行的二进制时 `ETXTBSY`）；
-- `--systemd` 安装三个 unit、`daemon-reload`、`enable` 三个；**不自动 start**。
-  生产机器请按角色 `systemctl disable` 不需要的两个；
-- 完全幂等，可重复执行；结束时打印后续步骤。
+- 创建 `pairlink` 系统用户/组；`/etc/pairlink` 为 `0750 root:pairlink`，
+  本模式 ini 为 `0640 root:pairlink`；
+- **已有配置绝不覆盖**，且只安装自己那一份示例 ini；
+- 安装本模式 unit → `daemon-reload` → `enable` → 默认 `start`；
+  `--no-start` 只 enable；`--no-systemd` 只放二进制与配置；
+- 卸载：`disable --now` 本模式 unit → 删除本模式 unit → `daemon-reload`；
+  **共享二进制只在没有任何其它 `pairlink-*.service` 残留时才删除**
+  （先卸载 relay 不会把还在运行的 agent 的二进制删掉）；
+- 默认保留 `/etc/pairlink` 与 `pairlink` 用户/组；`--purge` 只删本模式 ini
+  与明确属于本模式的证书（`tls/<mode>.crt`、`<mode>.key` 等）；
+- 服务/文件不存在时视为成功（退出码 0），可重复执行；未检测到 systemd 时只删文件并告警；
+- `--dry-run` 只打印将执行的命令，不落盘。
 
-`uninstall.sh` 的行为：
-
-- `systemctl disable --now` 三个 unit（存在才操作）→ 删除 `/etc/systemd/system/pairlink-*.service`
-  → `daemon-reload` → 删除 `/usr/local/bin/pairlink`；
-- **默认保留 `/etc/pairlink`** 与 `pairlink` 用户/组；`--purge` 才删除配置目录；
-- 服务/文件不存在时视为成功（退出码 0），可重复执行；`--dry-run` 只打印。
-
-两个脚本通过 `shellcheck 0.11.0`（`shellcheck -x` 无告警）与 `bash -n`。
+三个脚本 + `common.sh` 通过 `shellcheck 0.11.0`（`shellcheck -x` 无告警）与 `bash -n`。
 
 > 本仓库在 Windows 上开发时 `core.filemode=false`，提交脚本需显式保留可执行位：
-> `git add --chmod=+x deploy/linux/install.sh deploy/linux/uninstall.sh`；
-> 否则 Linux 上克隆后只能 `bash install.sh`，不能 `./install.sh`。
+> `git add --chmod=+x deploy/linux/install-relay.sh deploy/linux/install-agent.sh deploy/linux/install-client.sh`；
+> 否则 Linux 上克隆后只能 `bash install-relay.sh`，不能 `./install-relay.sh`。
 
 ---
 
 ## 4. Windows 服务（`deploy/windows/`）
 
+同样按角色拆成三个入口，**每个只操作自己的服务**（服务名固定 `pairlink-<mode>`）：
+
+| 脚本 | 作用 |
+| --- | --- |
+| `install-relay.ps1` | 只安装/卸载 `pairlink-relay` |
+| `install-agent.ps1` | 只安装/卸载 `pairlink-agent` |
+| `install-client.ps1` | 只安装/卸载 `pairlink-client` |
+
+`common.ps1` 是内部函数库（参数/文件解析、服务状态、日志路径、`-service` 调用），不是入口。
+
 ```powershell
 # 必须以管理员身份运行 PowerShell
-.\deploy\windows\install-service.ps1 -Mode relay -Config C:\PairLink\relay.ini
-.\deploy\windows\install-service.ps1 -Mode agent -Config C:\PairLink\agent.ini -Binary C:\PairLink\pairlink.exe
-.\deploy\windows\install-service.ps1 -Mode relay -Config C:\PairLink\relay.ini -Force   # 已存在时重装
-.\deploy\windows\uninstall-service.ps1 -Mode relay [-KeepLogs]
+.\deploy\windows\install-relay.ps1 -Config C:\PairLink\relay.ini
+.\deploy\windows\install-agent.ps1 -Config C:\PairLink\agent.ini -Binary C:\PairLink\pairlink.exe
+.\deploy\windows\install-client.ps1 -Config C:\PairLink\client.ini -NoStart
+
+# 已存在时重装
+.\deploy\windows\install-relay.ps1 -Config C:\PairLink\relay.ini -Force
+
+# 卸载（-KeepLogs 保留日志）
+.\deploy\windows\install-relay.ps1 -Uninstall
+.\deploy\windows\install-relay.ps1 -Uninstall -KeepLogs
 ```
 
-- 服务名固定 `pairlink-<mode>`，启动类型自动；
-- 日志固定 `pairlink.exe` 同目录的 `pairlink-<mode>.log`（stdout/stderr 也重定向进去）；
-- 脚本先校验二进制/配置存在，把 `-Config` 解析为绝对路径（SCM 的工作目录不是 exe 目录），
+- 启动类型自动；日志固定 `pairlink.exe` 同目录的 `pairlink-<mode>.log`（stdout/stderr 也重定向进去）；
+- 先校验二进制/配置存在，把 `-Config` 解析为绝对路径（SCM 的工作目录不是 exe 目录），
   再调用 `pairlink.exe -<mode> -config <abs> -service install|start`；
 - 服务已存在时默认提示并退出，`-Force` 才 stop + uninstall + 重装；
 - 卸载先 `-service stop` 再 `-service uninstall`，`-KeepLogs` 保留日志；ini/证书不删；
@@ -264,21 +294,24 @@ docker compose -f deploy/docker-compose.yml down
 
 | 项目 | 状态 | 证据/说明 |
 | --- | --- | --- |
-| `go test ./test -run TestExamples` | ✅ 通过 | 8 份模板（5 主机 + 3 docker）全部 Load/Validate 通过 |
-| PowerShell 语法解析 | ✅ 0 错误 | `Parser::ParseFile` 对两个 `.ps1` 均为 `errors.Count = 0` |
+| `go test ./test -run TestExamples` | ✅ 通过 | 全部主机/容器示例模板 Load/Validate 通过 |
+| PowerShell 语法解析 | ✅ 0 错误 | `Parser::ParseFile` 对四个 `.ps1` 均为 `errors.Count = 0`（阶段 6F） |
 | 非管理员运行安装脚本 | ✅ 被拦截 | `#Requires -RunAsAdministrator` 报 `PermissionDenied`，退出码 1 |
 | `go build ./...` / `go vet ./...` | ✅ 通过 | 工作树（并行子代理改完 `internal/**` 后）复跑通过 |
-| shellcheck | ✅ 无告警 | 0.11.0 `shellcheck -x deploy/linux/*.sh` |
+| shellcheck | ✅ 无告警 | 0.11.0 `shellcheck -x deploy/linux/common.sh deploy/linux/install-*.sh` |
 | `systemd-analyze verify` | ✅ 退出码 0 | 三个 unit（临时复制为 0644、二进制已安装） |
-| WSL2 真机 systemd | ✅ 通过 | 三 unit `active/enabled`；管理页 17090/17091/17092 均 200；agent 注册 3 个服务、client 拉到 3 个服务；stop 后端口释放 |
-| install.sh 幂等 | ✅ 通过 | 第二次执行跳过二进制/配置，`systemctl enable` 无副作用 |
-| uninstall.sh | ✅ 通过 | 默认保留 `/etc/pairlink`（0750）；`--purge` 删除；重复执行退出 0；端口释放 |
+| WSL2 真机 systemd（阶段 6D） | ✅ 通过 | 三 unit 同时安装时 `active/enabled`；管理页 17090/17091/17092 均 200；stop 后端口释放 |
+| 按模式安装（阶段 6F） | ✅ 通过 | 只装 relay 后 `pairlink-agent` 报 `could not be found`，`/etc/pairlink/agent.ini` 不存在；管理页 17090 返回 200 |
+| 按模式卸载与共享二进制（6F） | ✅ 通过 | 无残留 unit 才删 `/usr/local/bin/pairlink`；卸载 relay 时 agent unit 仍在 → 二进制保留、agent 仍 enabled |
+| 幂等 / 重复卸载（6F） | ✅ 通过 | 第二次 install 跳过二进制复制与配置覆盖；重复 `--uninstall` 退出 0；`--purge` 只删本模式 ini/证书 |
+| `--dry-run` / `--no-systemd`（6F） | ✅ 通过 | 非 root dry-run 只打印且不出现其它模式 unit 操作；`--no-systemd` 不放 unit、只放二进制与 ini |
 | Docker 镜像构建 / compose | ❌ **未验证** | 本机无 Docker/Podman；Dockerfile 仅做静态审查与 `CGO_ENABLED=0` 等价编译验证 |
 | Windows SCM 完整生命周期 | ❌ **未验证** | 开发机非管理员；仅验证了脚本语法、`#Requires` 拦截与 `-service` 错误路径 |
 
 WSL 验证环境：Ubuntu（内核 6.18 WSL2）、systemd 259（`is-system-running` 报 `degraded`，
-但 unit 可正常启停）、Go 1.24.4。WSL 测试用二进制由当时的 `git archive HEAD`（`65f7064`）编译，
-因为并行子代理当时正在修改 `internal/**`、工作树短暂不可编译；部署件与该改动无关。
+但 unit 可正常启停）、Go 1.24.4。阶段 6D 的三 unit 验证使用 `git archive HEAD`（`65f7064`）
+编译的二进制；阶段 6F 的按模式验证使用工作树 `CGO_ENABLED=0 go build -o /tmp/pairlink .` 产物。
+部署脚本与 Go 实现解耦，两种产物均验证过。
 
 ---
 
