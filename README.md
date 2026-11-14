@@ -1,0 +1,860 @@
+# PairLink
+
+**PairLink 是配对式中继系统，不是 P2P NAT 穿透工具**：所有流量都经过中继服务器，
+两个不同局域网、都没有公网 IP 的端点通过一台公网 relay 用"配对键"匹配后通信。
+
+PairLink 是一个**协议无关的字节流中转**：同一套系统可以承载 HTTP、SSH、RDP/VNC、
+数据库、自定义 TCP/UDP 服务，中继不解析也不终止上层协议（HTTPS/SSH 的端到端加密由
+第三方客户端与真实服务自行完成，中继透明转发）。
+
+- 版本：`v0.1.0`
+- 许可证：Apache-2.0
+- 语言：Go 1.24.4，单二进制三模式
+- 唯一第三方依赖：`golang.org/x/sys`（Windows 服务 SCM）
+
+---
+
+## 1. 与 P2P NAT 穿透的区别
+
+| | PairLink（配对式中继） | P2P NAT 穿透（如 frp P2P、WireGuard 直连） |
+| --- | --- | --- |
+| 流量路径 | **始终经过 relay** | 尽量点对点直连 |
+| 依赖 | 一台公网 relay（只需普通 TCP/UDP 端口） | 需要可打洞的 NAT、STUN/TURN 等 |
+| 适用 | 对称 NAT、企业防火墙、无公网 IP、只需要"能用" | 低延迟、大带宽、可控网络 |
+| 安全边界 | relay 是明文哑管道，端到端加密靠上层协议 | 由隧道协议自身加密 |
+| 鉴权 | 隧道 `auth_token` + 一次性配对令牌 | 各协议自己的密钥体系 |
+
+PairLink 的取舍很明确：**放弃直连优化，换取"任何网络都能连、部署一个公网端口即可"**。
+
+---
+
+## 2. 架构
+
+```mermaid
+graph LR
+  subgraph 局域网 A
+    C[第三方客户端<br/>浏览器/SSH/RDP] -->|127.0.0.1:本地端口| CL[pairlink -client]
+    CL -->|本地监听| C
+  end
+  subgraph 公网服务器
+    R[pairlink -relay<br/>tunnel:7000<br/>tcp:7001<br/>udp:7002]
+  end
+  subgraph 局域网 B
+    A[pairlink -agent] -->|127.0.0.1:8080| S[真实服务<br/>HTTP/SSH/RDP]
+  end
+  CL -->|控制面 7000<br/>数据面 7001/7002| R
+  A -->|控制面 7000<br/>数据面 7001/7002| R
+```
+
+- **控制面**（`tunnel_listen`）：agent/client 接入、服务注册、服务列表/订阅、接入请求、
+  配对信息下发、心跳、错误、踢出。
+- **TCP 数据面**（`tcp_listen`）：纯字节流。连接建立瞬间只发一帧 `MsgBind`（配对键+令牌），
+  之后双向 `io.Copy` 原样透传；**relay 在配对成功前不写任何字节**。
+- **UDP 数据面**（`udp_listen`，可选）：配置了就走原生 UDP——首个数据报是 `MsgBind`，
+  relay 记录两侧 `(IP,Port)` 建立会话映射，之后按源地址反查配对键转发数据报；
+  未配置则复用 `tcp_listen`，UDP 数据报封装进 UDP 隧道帧（见 §3.3）。
+- 详细协议见 [`docs/protocol.md`](docs/protocol.md)，架构与并发模型见
+  [`docs/architecture.md`](docs/architecture.md)，阶段 2 契约见 [`docs/contract.md`](docs/contract.md)。
+
+---
+
+## 3. 三种模式职责
+
+| 模式 | 角色 | 做的事 |
+| --- | --- | --- |
+| `-relay` | 公网中继服务器 | 监听隧道/TCP/UDP 三个端口；维护服务注册表、agent 连接表、待配对表、UDP 会话表、一次性令牌表；下发配对信息；双向转发；管理页与踢出 |
+| `-agent` | 服务提供者侧 | 连 relay 控制面并注册服务；收到接入通知后携带配对键+令牌回连数据面；在数据面连接与本地目标之间双向转发 |
+| `-client` | 访问侧 | 连 relay 控制面、拉取/订阅服务列表；为配置的服务在本机开监听；第三方连本地端口时发起接入请求，配对后双向转发 |
+
+同一份 ini 同时包含三段配置；**每种模式只读取自己的段**与 `[common]`。
+
+### 3.1 连接注册表与并发保护（relay）
+
+relay 的共享状态全部在内存中，按职责拆成 5 个并发安全结构（实现位于 `internal/registry`、
+`internal/pairing`、`internal/token`）：
+
+| 结构 | 键 | 内容 | 并发保护 | 清理方式 |
+| --- | --- | --- | --- | --- |
+| `ServiceRegistry` | `service_id` | 服务ID、协议、所属 agent、在线状态、注册时间 | `sync.RWMutex`（读多写少），变更时 `revision++` 并通知订阅者 | agent 断开/注销时 `Unregister`/`UnregisterAgent` |
+| `AgentRegistry` | `agent_id` | 控制连接、远端地址、连接时间、最后活跃、服务列表 | `sync.RWMutex`，`Add`/`Get` 存取副本 | 控制连接关闭或心跳判死时 `Remove` |
+| `PairingTable` | `PairingKey` | 已到侧、peer 对象、创建/截止时间、是否完成 | 单把 `sync.Mutex`，临界区只做 map 操作 | 单一 ticker 调 `Sweep(pair_timeout/2)`，回调 `OnExpire` 关闭占位连接 |
+| `UDPTable` | `PairingKey` + `netip.AddrPort` | 两侧 UDP 端点、完整标记、最后活跃 | 单把 `sync.Mutex`，双索引（key→会话、endpoint→key） | 半会话 `pair_timeout`、完整会话 `udp_session_timeout`，`Sweep` 返回被清理键 |
+| `token.Store` | `PairingKey` | 令牌 SHA-256、签发/过期时间、是否已消费 | 单把 `sync.Mutex`，`subtle.ConstantTimeCompare` | 单一 ticker 调 `Sweep()` 清理过期 |
+
+原则：**不在锁内做 IO**；订阅回调与 `OnExpire` 在锁外执行；所有 `Get/List/Snapshot`
+返回副本；清理顺序固定为"关连接 → 等转发返回 → 删表项"。详见
+[`docs/architecture.md`](docs/architecture.md) §4、§5。
+
+### 3.2 协议速览
+
+帧格式（控制面信令与数据面报到共用）：
+
+```
+type(1B) | payload_len(4B, big-endian) | payload(JSON, ≤ 1 MiB)
+```
+
+| type | 消息 | 方向 | 用途 |
+| --- | --- | --- | --- |
+| `0x01` | Hello | agent/client → relay | 接入（role / token / version） |
+| `0x02` | HelloOK | relay → agent/client | 分配 ID、心跳建议 |
+| `0x03` | RegisterService | agent → relay | 注册服务 |
+| `0x04` | ServiceRegistered | relay → agent | 注册确认 |
+| `0x05` | ListServices | client → relay | 查服务列表 |
+| `0x06` | ServiceList | relay → client | 服务列表 + revision |
+| `0x07` | Subscribe | client → relay | 订阅变更 |
+| `0x08` | ServiceEvent | relay → client | added/removed/updated |
+| `0x09` | ConnectRequest | client → relay | 请求接入 |
+| `0x0A` | PairResult | relay → client | 配对键 + 一次性令牌 |
+| `0x0B` | Incoming | relay → agent | 接入通知（配对键 + 令牌） |
+| `0x0C` | Bind | agent/client → relay | 数据面报到（仅一次；`carrier` 区分 `tcp` / `udp-over-tcp`） |
+| `0x0D` | BindOK | relay → agent/client | UDP 报到应答（纯 TCP 数据面不发） |
+| `0x0E` / `0x0F` | Heartbeat / HeartbeatAck | 双向 | 心跳 |
+| `0x10` | Error | 双向 | 错误码 + 信息 |
+| `0x11` | Kicked | relay → agent/client | 被管理页踢出 |
+| `0x12` | ServerShutdown | relay → agent/client | relay 停机通知 |
+
+TCP 配对状态机（完整版与 UDP 状态机见 [`docs/protocol.md`](docs/protocol.md) §5）：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Signaled: client 发 ConnectRequest，relay 签发配对键+令牌
+    Signaled --> Half: agent 或 client 先回连数据面并 Bind
+    Half --> Paired: 另一侧 Bind + 令牌校验通过
+    Half --> Expired: pair_timeout 到期，关闭已到连接
+    Paired --> Closed: 任一端关闭 / 空闲超时 / 踢出
+    Expired --> [*]
+    Closed --> [*]
+```
+
+关键不变量：一个配对键最多成功配对一次；令牌恰好消费一次；配对完成前 relay 不向数据面
+写任何字节；报到帧只出现在连接建立瞬间，之后字节原样透传。relay 的三个监听器类型名固定为
+`TunnelListener`、`TCPDataListener`、`UDPDataListener`。
+
+订阅推送的一致性：订阅成功后 relay 立即下发一次**全量** `ServiceList` 作为基线；之后只在
+`revision` 严格连续时推单条 `ServiceEvent`。若事件断档（推送队列满丢弃）或乱序（多个写入者
+并发 dispatch），relay 改发一次全量 `ServiceList` 让 client 整体重同步——因此丢事件不会让
+client 永久停留在旧视图，`MsgServiceEvent.revision` 仍然单调递增。
+
+`MsgError` 可选携带 `client_conn_id`（阶段 4 新增，向后兼容）：relay 应答某个
+`ConnectRequest` 的错误时填入该请求的 ID，client 据此**精确**关闭对应本地连接；旧 relay
+不填时 client 回退到"最早等待的连接"的 FIFO 近似匹配。
+
+`HelloOK` 还会携带 `udp_mode`（`native` / `tcp_tunnel`）与 `tcp_data_port` / `udp_data_port`，
+agent/client 据此选择 UDP 数据面承载方式并推导数据面拨号地址（无需在 agent/client 的 ini 里
+重复写 `[relay]` 端口）。
+
+### 3.3 UDP 数据面承载模式与取舍
+
+`[relay] udp_listen` 是**可选**的。relay 启动时确定模式，并通过
+`HelloOK` / `ServiceRegistered` / `ServiceList` 的 `udp_mode` 字段下发给 agent/client：
+
+| 模式 | 触发条件 | 数据面 | 取舍 |
+| --- | --- | --- | --- |
+| `native` | 配置了 `udp_listen` | 原生 UDP 端口 | **无队头阻塞**、延迟最低；公网需要多放行一个 UDP 端口 |
+| `tcp_tunnel` | 未配置 `udp_listen` | 复用 `tcp_listen`，UDP 数据报封装进 UDP 隧道帧（一条 TCP 连接可复用多个 UDP 会话） | **省一个公网端口**，只需放行 TCP；但 TCP 是有序字节流，丢包/阻塞会拖慢同连接上的所有 UDP 会话（**队头阻塞**） |
+
+> **取舍**：UDP over TCP 省一个公网端口，但引入队头阻塞；实时性敏感场景（语音、游戏、
+> 高频遥测）应配置原生 `udp_listen`。两种模式的配对键、令牌、超时语义完全一致，
+> agent/client 自动按 `udp_mode` 选择承载方式，无需改配置。
+
+
+
+---
+
+## 4. 快速开始
+
+### 4.1 编译
+
+```bash
+# 任意平台构建当前平台二进制
+go build -o pairlink .
+
+# 交叉编译（Linux / Windows）
+GOOS=linux   GOARCH=amd64 go build -o pairlink-linux .
+GOOS=windows GOARCH=amd64 go build -o pairlink.exe .
+```
+
+要求 Go 1.24.4+；依赖只有 `golang.org/x/sys`（`go mod tidy` 已生成 `go.sum`）。
+
+### 4.2 三份示例 ini
+
+**relay.ini（公网服务器）**
+
+```ini
+[common]
+manage_listen = 127.0.0.1:9000
+pprof         = false
+
+[relay]
+tunnel_listen     = 0.0.0.0:7000
+tcp_listen        = 0.0.0.0:7001
+; udp_listen 可选：配置则走原生 UDP；留空/删除则 UDP 数据面走 TCP 隧道（省一个公网端口）
+udp_listen        = 0.0.0.0:7002
+tls_cert          = /etc/pairlink/cert.pem
+tls_key           = /etc/pairlink/key.pem
+auth_token        = 请改成随机长字符串
+pair_timeout      = 10s
+idle_timeout      = 300s
+heartbeat_timeout = 90s
+udp_session_timeout = 60s
+token_ttl         = 15s
+```
+
+**server.ini（agent 侧，服务提供者）**
+
+```ini
+[common]
+manage_listen = 127.0.0.1:9100
+
+[server]
+relay_addr = relay.example.com:7000
+token      = 与 relay 的 auth_token 一致
+protocol   = tcp
+local      = 127.0.0.1:8080
+tls_ca     = /etc/pairlink/ca.pem      ; 可选：自签 CA 时指定
+heartbeat  = 30s
+
+; 附加服务：服务ID = 协议:本地端口（也支持 协议:主机:端口）
+service.dsh  = tcp:18080
+service.rdp  = tcp:10.0.0.5:3389
+service.game = udp:19000
+
+; 可选：agent 侧本地 UDP 会话空闲清理（默认 60s）
+udp_session_timeout = 60s
+```
+
+**client.ini（访问侧）**
+
+```ini
+[common]
+manage_listen = 127.0.0.1:9200
+
+[client]
+relay_addr = relay.example.com:7000
+token      = 与 relay 的 auth_token 一致
+tls_ca     = /etc/pairlink/ca.pem      ; 可选
+subscribe  = true
+heartbeat  = 30s
+
+; 服务ID = 本地监听地址（缺 host 时补 127.0.0.1）
+service.dsh = 127.0.0.1:8080
+service.rdp = 127.0.0.1:13389
+service.game = 127.0.0.1:19000
+
+; 可选：client 侧本地 UDP 会话空闲清理（默认 60s，必须 > 0）
+udp_session_timeout = 60s
+```
+
+然后分别启动：
+
+```bash
+./pairlink -relay  -config relay.ini
+./pairlink -agent  -config server.ini
+./pairlink -client -config client.ini
+```
+
+第三方客户端直接连 `127.0.0.1:8080`（client 侧）即可，无任何改造。
+
+### 4.3 命令行参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `-relay` / `-agent` / `-client` | 必须且只能指定一个模式 |
+| `-config <path>` | ini 配置文件路径（必填） |
+| `-version` | 打印 `pairlink v0.1.0` 并退出（退出码 0） |
+| `-service <op>` | 仅 Windows：`install` / `start` / `stop` / `uninstall`（另有内部使用的 `run`） |
+
+退出码：`0` 正常；`1` 运行/配置错误；`2` 参数用法错误（会打印帮助）。
+
+---
+
+## 5. ini 配置格式
+
+### 5.1 语法规则
+
+- 一行一个 `key = value`，键与值两侧空白会被裁剪；
+- 整行注释用 `;` 或 `#`（行首，允许前导空白）；**不支持行尾注释**
+  （值里出现的 `;`/`#` 属于值本身，因为令牌可能包含它们）；
+- `[section]` 段名大小写不敏感；同名段重复出现会合并；
+- 同一段内重复键**后者覆盖**（`service.<ID>` 也是后者覆盖且保留首次出现的位置）；
+- 未知段、未知键**不报错**，只在启动时打印警告（`event=config_warning`）；
+- 值不做引号/转义处理，直接取字符串；
+- 证书/CA 路径支持 `/` 分隔符，**相对路径相对于 ini 文件所在目录**解析为绝对路径
+  （服务模式下工作目录不是 exe 目录，这一点很重要）。
+
+### 5.2 `[common]`（三种模式共享）
+
+| 键 | 类型 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `manage_listen` | `host:port` | 否 | 空 | 管理页监听地址；为空表示不启动管理页。建议只监听 `127.0.0.1` |
+| `pprof` | bool | 否 | `false` | 为 `true` 时在管理端口挂载 `/debug/pprof/` |
+| `log_level` | string | 否 | `info` | `debug` / `info` / `warn` / `error` |
+| `log_format` | string | 否 | `text` | `text` / `json` |
+
+### 5.3 `[relay]`（relay 模式）
+
+| 键 | 类型 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `tunnel_listen` | `host:port` | **是** | — | 控制面（信令）监听地址 |
+| `tcp_listen` | `host:port` | **是** | — | TCP 数据面监听地址 |
+| `udp_listen` | `host:port` | 否 | 空 | 原生 UDP 数据面监听地址；为空表示不监听 UDP，UDP 走 TCP 隧道（`udp_mode = tcp_tunnel`） |
+| `tls_cert` | 路径 | 否 | 空 | 隧道 TLS 证书；与 `tls_key` 成对。都为空则明文并 WARN |
+| `tls_key` | 路径 | 否 | 空 | 隧道 TLS 私钥；与 `tls_cert` 成对 |
+| `auth_token` | string | 建议 | 空 | agent/client 接入密钥；为空则 WARN 并放行（仅内网调试） |
+| `pair_timeout` | duration | 否 | `10s` | 待配对表占位超时 / 数据面报到读帧超时 |
+| `idle_timeout` | duration | 否 | `300s` | TCP 数据面空闲超时（无流量即断开） |
+| `heartbeat_timeout` | duration | 否 | `90s` | 控制面无心跳判死时间 |
+| `udp_session_timeout` | duration | 否 | `60s` | UDP 完整会话空闲超时 |
+| `token_ttl` | duration | 否 | `15s` | 一次性配对令牌有效期 |
+
+### 5.4 `[server]`（agent 模式）
+
+| 键 | 类型 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `relay_addr` | `host:port` | **是** | — | relay 隧道地址 |
+| `token` | string | **是** | — | 接入密钥，需与 relay 的 `auth_token` 一致 |
+| `protocol` | `tcp`/`udp` | 否 | `tcp` | **主服务**协议；配置了 `local` 而未写 `protocol` 时按 `tcp` |
+| `local` | `host:port` / 端口 | 否 | 空 | **主服务**的本地目标地址（缺 host 补 `127.0.0.1`） |
+| `service.<ID>` | `<proto>:<port>` 或 `<proto>:<host>:<port>` | 否 | — | 附加服务映射；见 §5.6 |
+| `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；为空且未开 `tls_insecure_skip_verify` 时走**明文**（见 §7.1） |
+| `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过 relay 证书校验（仅测试，启动 WARN） |
+| `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
+| `dial_timeout` | duration | 否 | `10s` | 连接 relay / 本地目标超时 |
+| `udp_session_timeout` | duration | 否 | `60s` | agent 侧本地 UDP 会话空闲清理 |
+
+### 5.5 `[client]`（client 模式）
+
+| 键 | 类型 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `relay_addr` | `host:port` | **是** | — | relay 隧道地址 |
+| `token` | string | **是** | — | 接入密钥 |
+| `service.<ID>` | `host:port` / 端口 | 否 | — | 本地监听地址（缺 host 补 `127.0.0.1`）；见 §5.6 |
+| `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；为空且未开 `tls_insecure_skip_verify` 时走**明文**（见 §7.1） |
+| `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过证书校验（仅测试，启动 WARN） |
+| `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
+| `subscribe` | bool | 否 | `true` | 是否订阅服务列表变更 |
+| `dial_timeout` | duration | 否 | `10s` | 连接 relay / 数据面超时 |
+| `pair_timeout` | duration | 否 | `10s` | 从发起接入请求到数据面绑定成功的超时 |
+| `udp_session_timeout` | duration | 否 | `60s` | client 侧本地 UDP 转发会话空闲清理（必须 > 0；阶段 4 新增） |
+
+### 5.6 `service.<ID>` 点号键语义
+
+**主服务（默认服务ID `default`）**
+
+- `[server]` 的 `protocol` + `local` 是主服务，服务ID 恒为 **`default`**（常量
+  `config.DefaultServiceID`），在服务列表中就是 `default`。
+- 不允许显式写 `service.default`（会直接报错，提示改用 `protocol` + `local`）。
+- `service.default` 保留给主服务，其它ID 均不可使用该名字。
+
+**附加服务（`[server]`）**
+
+```ini
+service.dsh  = tcp:18080          ; 等价于 tcp:127.0.0.1:18080
+service.rdp  = tcp:10.0.0.5:3389  ; 指定主机
+service.game = udp:19000          ; UDP，裸端口默认 127.0.0.1
+service.v6   = tcp:[::1]:19001    ; IPv6 需加方括号
+```
+
+- 服务ID 规则：`[a-z0-9-_]{1,64}`；`default` 保留；
+- 协议只允许 `tcp` / `udp`；
+- 条目按 ini 中出现顺序保留（管理页与日志顺序稳定）；重复ID 后者覆盖；
+- `local` 只是**本地目标**，relay/agent 不会把它暴露给 client。
+
+**本地监听（`[client]`）**
+
+```ini
+service.dsh = 127.0.0.1:8080   ; 完整地址
+service.rdp = 13389            ; 裸端口 → 127.0.0.1:13389
+service.ssh = :2222            ; 缺 host → 127.0.0.1:2222
+```
+
+- 每个条目会在 client 本机开一个监听端口，把本地连接映射到同名远端服务；
+- 同一 `host:port` 重复监听会**校验失败并退出**（启动即暴露端口冲突）；
+- 若 `service.<ID>` 在 relay 服务列表中不存在，client 仍会按 TCP 监听并 WARN，
+  第三方连接时收到 `service_not_found`。
+
+### 5.7 校验规则（启动时）
+
+- 地址必须能被 `net.SplitHostPort` 解析，端口 1..65535；
+- `[server] protocol` 只能是 `tcp`/`udp`；
+- `[client]` 本地监听地址不能重复；
+- `[relay]` 中**已配置**的监听地址不能重复（`udp_listen` 可省略）；
+- duration 必须带单位（`10s`/`5m`/`1h`）且 > 0；
+- `manage_listen` 监听 `0.0.0.0` 会 WARN（管理页无鉴权）；
+- 证书/CA 文件不存在只 WARN（允许先写配置后拷证书）。
+
+---
+
+## 6. 管理页
+
+三种模式都在 `[common] manage_listen` 上提供简单的只读 HTML 管理页：
+
+| 模式 | 页面内容 |
+| --- | --- |
+| relay | 服务注册表（服务ID、协议、在线状态、所属 agent）、在线 agent 列表、当前配对表、UDP 会话表、**踢出**操作 |
+| agent | 本机已注册服务列表、到 relay 的控制连接状态、当前活跃数据连接 |
+| client | relay 返回的可用服务列表、本地端口映射表、当前活跃配对 |
+
+- 顶栏显示模式、版本、运行时长；页面默认 **1 秒自动刷新**，可点右上角暂停/开启。
+- **第一版只读**：配置修改一律改 ini + 重启。唯一写操作是 relay 页面的"踢出"，
+  它通过一次性 CSRF 令牌 + POST 提交，禁止 GET 触发写操作。
+- `pprof = true` 时额外提供 `/debug/pprof/`；生产环境建议关闭，或只监听 `127.0.0.1`。
+- 管理页无登录鉴权：**不要暴露到公网**，用 SSH 隧道/内网访问。
+
+---
+
+## 7. 安全说明
+
+1. **隧道 TLS**：公网部署必须配置 `tls_cert`/`tls_key`。agent/client 的 TLS **触发规则**：
+   - `tls_ca` 非空 → 用 TLS，且只信任该 CA（`ServerName` 取 `relay_addr` 的主机名）；
+   - 只配 `tls_insecure_skip_verify = true` → 用 TLS 但跳过证书校验（仅测试）；
+   - 两者皆空 → **明文连接**（对应 relay 未配证书的部署）；不是"回退到系统根证书建 TLS"。
+   两侧配置不匹配时 TLS 握手直接失败并报可读错误，属预期行为（不会自动降级）。
+2. **接入密钥**：`[relay] auth_token` 是 agent/client 接入隧道的共享密钥，务必改成随机长串
+   并与两端一致；为空时 relay 会 WARN 并放行，仅限内网调试。
+3. **一次性配对令牌**：与配对键绑定、32 字节 `crypto/rand`、短有效期（默认 15s）、
+   用后即焚（Consume）、存储只保留 SHA-256、常量时间比较；TCP/UDP 数据面都强制校验。
+4. **数据面是明文哑管道**：HTTPS/SSH/RDP 等端到端加密由第三方客户端与真实服务完成，
+   relay 不解密也无法解密；但**明文协议（HTTP、裸 TCP）经过 relay 时是明文**，
+   不要把敏感明文协议直接暴露到公网而不加 TLS。
+5. **管理页无鉴权**：只监听 `127.0.0.1`；不要 `0.0.0.0:9000` 直接暴露。
+6. **日志**：不打印 `pairing_token` 明文；`auth_token` 也不打印。
+7. **最小暴露面**：agent 的本地目标地址只在 agent 本地；relay 只看到服务ID与协议。
+
+---
+
+## 8. 部署
+
+### 8.1 Linux
+
+```bash
+# 1) 放置二进制与配置
+install -m 0755 pairlink /usr/local/bin/pairlink
+mkdir -p /etc/pairlink
+install -m 0600 relay.ini /etc/pairlink/relay.ini
+
+# 2) 前台运行（调试）
+pairlink -relay -config /etc/pairlink/relay.ini
+
+# 3) systemd（示例）
+cat >/etc/systemd/system/pairlink-relay.service <<'EOF'
+[Unit]
+Description=PairLink relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/pairlink -relay -config /etc/pairlink/relay.ini
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now pairlink-relay
+```
+
+> 第一版 agent/client 控制连接断开后**不自动重连**，由 systemd `Restart=on-failure` 兜底。
+
+### 8.2 Windows
+
+```powershell
+# 前台运行（调试，日志输出到控制台）
+.\pairlink.exe -relay -config .\relay.ini
+
+# 安装为服务（需要管理员权限的 PowerShell）
+.\pairlink.exe -relay -config C:\PairLink\relay.ini -service install
+.\pairlink.exe -relay -config C:\PairLink\relay.ini -service start
+.\pairlink.exe -relay -config C:\PairLink\relay.ini -service stop
+.\pairlink.exe -relay -config C:\PairLink\relay.ini -service uninstall
+```
+
+- 服务名固定为 `pairlink-<mode>`：`pairlink-relay` / `pairlink-agent` / `pairlink-client`；
+- `install` 会把 `-config` 解析为**绝对路径**写入服务启动参数（SCM 启动时工作目录不是 exe 目录），
+  并追加 `-service run`；
+- 服务启动类型为"自动"；日志写到 **exe 同目录的 `pairlink-<mode>.log`**（Windows 服务没有控制台）；
+- 非 Windows 平台执行 `-service` 会提示"仅支持 Windows"并以退出码 1 结束。
+
+### 8.3 防火墙与网络
+
+| 位置 | 需要放行 | 说明 |
+| --- | --- | --- |
+| relay 服务器 | `7000/tcp`（隧道）、`7001/tcp`（数据面）；`7002/udp`（原生 UDP，可选）；可选 `9000/tcp`（管理页，仅内网） | 三个业务端口默认都需要公网可达；不配置 `udp_listen` 时只需 7000/7001 两个 TCP 端口 |
+| agent 侧 | 出站到 relay 的 7000/7001（原生模式下再加 7002/udp） | 一般无需入站 |
+| client 侧 | 本机本地监听端口（默认只 `127.0.0.1`） | 无需入站，第三方就在本机/同机 |
+| Windows | `New-NetFirewallRule -DisplayName PairLink -Direction Inbound -Protocol TCP -LocalPort 7000,7001 -Action Allow` 及 UDP 7002 | 记得同时放行 UDP |
+
+注意：
+- client 的 `service.<ID>` 默认监听 `127.0.0.1`，同局域网其它机器访问不到（这是有意的安全默认）；
+  若必须开放，显式写 `0.0.0.0:端口` 并自行评估风险。
+- 公网 relay 只暴露 7000/7001/7002，管理页不要映射到公网。
+- 云厂商安全组/防火墙与系统防火墙都要放行。
+
+---
+
+## 9. 日志
+
+- 使用 Go 标准库 `log/slog`，`[common] log_format = text|json`，`log_level` 控制级别。
+- 统一字段：`mode`、`agent_id`、`client_id`、`service_id`、`pairing_key`、`remote`、`event`、
+  `err`（详见 [`docs/architecture.md`](docs/architecture.md) §6）。
+- 关键事件：连接建立 `tunnel_accept`、接入 `hello_ok`、注册 `service_register`、
+  通知 `pair_issue`、报到 `bind_ok`/`bind_fail`、配对 `pair_complete`、断开 `data_close`、
+  超时清理 `pair_timeout`/`idle_timeout`/`udp_evict`、踢出 `kick`。
+- **Windows 服务模式**：日志文件为 exe 同目录的 `pairlink-<mode>.log`（追加写）；
+  标准输出/错误也重定向到该文件，保证所有日志落盘。
+- 前台模式：日志输出到标准错误（text）或标准输出 JSON，交给 systemd/容器收集。
+
+---
+
+## 10. 已知限制（第一版，诚实清单）
+
+1. **不自动重连**：agent/client 控制连接断开后 `Run` 返回错误、进程退出，由 systemd /
+   Windows 服务恢复策略重启；没有内置指数退避重连。订阅的 proto 变化也不热切换（重启生效）。
+2. **UDP over TCP 有队头阻塞**：未配置 `udp_listen` 时多个 UDP 会话复用一条 TCP 连接，
+   丢包/阻塞会拖慢同连接的所有会话；实时性敏感场景请配置原生 `udp_listen`。
+3. **UDP over TCP 承载连接不迁移**：承载 TCP 断开后该连接上的 UDP 会话即失效，
+   需要重新走控制面配对（第一版不做会话迁移/自动重建）。
+4. **UDP 源地址漂移不支持**：同一侧端点变化会被拒绝，只能等会话超时后重新接入。
+5. **UDP 报到依赖单次 BindOK（无重传）**：BindOK 丢包时本次配对会按 `pair_timeout` 放弃，
+   需要第三方重新发起。已知边界：若 BindOK 与随后转发的业务数据报乱序（同一 socket 顺序
+   写出，实际几乎不可能），迟到的 BindOK 会被 agent 当作业务数据转给本地目标；第一版不为
+   此解析每个数据报。同理，`Full` 之后 relay 不再解析数据报，同一端点重复发 `MsgBind`
+   会被当作载荷转发（本版 agent/client 从不重传 Bind，正常部署不触发）。
+6. **client 本地监听协议以 relay 服务列表为准**：列表中不存在的服务按 TCP 占位监听并 WARN；
+   订阅发现协议不一致时第一版不热切换（重启 client 生效）。订阅事件本身可能因推送队列满
+   而丢（relay 会改发全量 `ServiceList` 兜底，见 §3.2）。
+7. **管理页无鉴权、无配置写入**：只读页面 + 唯一写操作"踢出"；配置改 ini 后重启。
+   默认 1s 自动刷新且不可配置间隔。
+8. **relay 状态全在内存**：重启后服务注册与配对关系丢失，agent/client 需要重启恢复。
+9. **单 relay 进程**：没有集群/多活；relay 是单点。
+10. **数据面无 TLS**：relay 是明文哑管道，安全性依赖上层协议自身的端到端加密。
+11. **Linux 二进制只在交叉编译层面验证**：本机无 WSL/无 Linux 真机，`GOOS=linux` 只证明
+    编译与纯 Go 依赖（`CGO_ENABLED=0`）通过，未在真实 Linux 上跑三进程 echo。
+12. **Windows 服务未做完整生命周期验证**：本机非管理员，只验证了 `-service install` 的
+    "需要管理员权限"错误路径与服务命名 `pairlink-<mode>`；install→start→stop→uninstall
+    的实际 SCM 状态、`pairlink-<mode>.log` 落盘需管理员环境复核。
+13. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；广域网下的
+    TCP/UDP 行为（尤其 UDP over TCP 的队头阻塞）可能不同。
+14. **TLS 组合未覆盖公网 CA 场景**：e2e 覆盖了自签 CA（`tls_ca`）、`tls_insecure_skip_verify`
+    以及"明文连 TLS / TLS 连明文"的失败路径；未验证公网 CA 签发的证书 + 系统根证书路径。
+15. **未做长时间 soak**：goroutine/资源泄漏用 e2e 计数与 `pprof` 佐证（5 轮完整流量 +
+    多种异常路径），未做数小时稳定性压测。
+16. **端口分配**：e2e 使用"bind :0 → 关闭 → 重新绑定"策略，存在极小的 TOCTOU 窗口；
+    真实部署请固定端口。
+
+---
+
+## 11. 目录结构
+
+```
+pairlink/
+├── main.go                  # 命令行入口（模式选择 / 服务子命令 / signal）
+├── go.mod / go.sum          # module github.com/lsong98sh/pairlink
+├── LICENSE                  # Apache-2.0
+├── README.md                # 本文
+├── docs/
+│   ├── architecture.md      # 分层、对象图、并发与日志约定
+│   ├── protocol.md          # 线格式、消息、状态机、错误码、令牌生命周期
+│   └── contract.md          # 阶段 2 契约（签名 / 目录所有权）
+└── internal/
+    ├── config/              # ini 解析 + 默认值 + 按模式校验
+    ├── logx/                # slog 封装 + 文件日志
+    ├── protocol/            # 帧编解码 + 消息结构体
+    ├── token/               # 一次性配对令牌
+    ├── pairing/             # PairingKey + PairingTable
+    ├── registry/            # ServiceRegistry / AgentRegistry / UDPTable
+    ├── forward/             # Bidirectional / WithIdleTimeout / JoinContext
+    ├── admin/               # 管理页框架 + CSRF + pprof
+    ├── service/             # Windows 服务集成
+    ├── version/             # 唯一版本号常量（main 与三模式管理页共用）
+    ├── relay/               # relay 模式（阶段 2 实现）
+    ├── agent/               # agent 模式（阶段 2 实现）
+    └── client/              # client 模式（阶段 2 实现）
+```
+
+## 12. 开发与自检
+
+```bash
+gofmt -l .                       # 必须无输出
+go vet ./...                     # 必须通过
+go build ./...                   # 必须通过
+go test ./... -count=1           # 必须全绿
+go test -race ./... -count=1     # 全仓并发检查（不只 internal/）
+go test ./test/... -v -count=1   # 端到端明细（每个验收项一行 PASS）
+go test ./test/... -count=2      # 防 flake
+GOOS=linux   GOARCH=amd64 go build ./...
+GOOS=windows GOARCH=arm64 go build ./...
+```
+
+协议与状态机的细节以 [`docs/protocol.md`](docs/protocol.md) 为准；
+阶段 2 的 relay/agent/client 只能改各自的目录，其余包已冻结（见 [`docs/contract.md`](docs/contract.md)）。
+
+## 13. 端到端验证
+
+> 本节是阶段 3 的**实测版**：测试源码在 [`test/`](test/)，全部使用真实临时 ini
+> （`t.TempDir()`）、真实 loopback 端口、真实第三方 HTTP/TCP/UDP 服务；进程内直接调用
+> `relay.Run` / `agent.Run` / `client.Run`，另有真实二进制三子进程冒烟。
+> 启动/停止/配对的等待全部是“轮询 + 截止时间”，没有用固定 sleep 当同步。
+
+### 13.1 运行环境与一键复现
+
+| 项 | 实测值 |
+| --- | --- |
+| 操作系统 | Windows 10 专业版 10.0.19045（amd64） |
+| Go | `go1.24.4 windows/amd64` |
+| 权限 | **非管理员**（Windows 服务完整生命周期未执行，见 §13.10） |
+| WSL | **不可用**：`wsl -l -q` 退出码 1，无发行版；Linux 二进制只做了交叉编译 |
+| CGO | 构建与交叉编译均 `CGO_ENABLED=0`（纯 Go） |
+| 网络范围 | 全部为 `127.0.0.1` loopback，未做公网/NAT/防火墙验证 |
+
+```bash
+# 端到端明细（每个验收项都有独立 PASS 行）
+go test ./test/... -v -count=1
+
+# 重复两轮确认不 flake
+go test ./test/... -count=2
+
+# 端到端并发检查（含 relay 管理页并发访问）
+go test -race ./test/... -count=1
+
+# 整仓自检
+gofmt -l . && go vet ./... && go build ./...
+go test ./... -count=1
+go test -race ./... -count=1
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
+```
+
+实测（阶段 4 收尾）：`go test ./test/... -v -count=1` 为
+`ok github.com/lsong98sh/pairlink/test 21.805s`（33 个 `--- PASS`、0 个 `--- FAIL`）；
+`-count=2` 为 `ok ... 48.304s`；`go test -race ./test/...` 为 `ok ... 24.326s`。
+
+### 13.2 验收项总表
+
+| # | 验收项（task.md §9.3 / task2 / §10） | 测试函数 | 实测结果与关键数字 |
+| --- | --- | --- | --- |
+| 1 | 本地 HTTP 服务零改造，经 agent 注册、client 本地端口访问 | `TestE2EHTTPZeroChange` | **PASS**：真实 `net/http` 服务返回 `HTTP 200`，body=`pairlink-http-ok path=/index.html?x=1`，响应头 `X-PairLink-Test: zero-change`；客户端只连 `127.0.0.1:<本地端口>` |
+| 2 | TCP echo 注册→通知→回连→配对→转发→断开清理 | `TestE2ETCPPairingBothOrders`、`TestE2ETCPEchoConcurrent20` | **PASS**：两种报到顺序（client-first / agent-first）都完成双向回显；20 组并发 × 每组 2 轮全部一致；结束后 relay `当前配对表（0）`，agent/client 活跃配对均为空 |
+| 3 | UDP 报到、会话映射、转发、空闲超时清理 | `TestE2EUDPModeNative` | **PASS**：原生 UDP 回显 `echo:probe-native-1`；`udp_session_timeout=800ms` 后会话表 `1 → 0`；同一 socket 再发包被丢弃；新源端口重新配对成功（配对键 `default/bdcb… → default/da89…`） |
+| 4 | 同一 agent 多服务 + 并发多组配对互不干扰 | `TestE2EAgentMultiServiceConcurrent` | **PASS**：agent 同时注册 `default`/`web`/`echo` 三个 TCP 服务；3 个端口 × 5 轮并发访问，响应内容严格区分、无串流 |
+| 5a | 令牌错误 | `TestE2EFailureWrongToken` | **PASS**：假令牌报到连接被关闭，收到 **0 字节**，配对表保持 0 |
+| 5b | 令牌复用 | `TestE2EFailureTokenReuse` | **PASS**：首次配对成功后复用同一令牌，relay 日志 `token: 配对令牌已被使用`，连接被关闭且无字节 |
+| 5c | 令牌过期 | `TestE2EFailureTokenExpiry` | **PASS**：`token_ttl=300ms`，等待 706ms 后报到被拒（日志 `token: 配对令牌已过期`），两侧连接均被关闭 |
+| 5d | 配对超时（只一侧报到） | `TestE2EFailurePairTimeout` | **PASS**：`pair_timeout=400ms`，实测 402ms 后连接被关闭，配对表回落 0 |
+| 5e | 控制连接断开 | `TestE2EFailureControlDrop` | **PASS**：关闭 agent 控制连接后服务表/在线 agent/配对表全部归 0；重新 `ListServices` 返回空；新 `ConnectRequest` 收到 `service_not_found`；未完成配对连接被关闭 |
+| 5f | 管理页踢出 | `TestE2EFailureKick` | **PASS**：`GET /action/kick` → **405**，无 CSRF POST → **403**，合法 POST → **200**；agent `Run` 返回 `agent: 已被 relay 踢出（被管理页踢出）`；服务下线、client 访问被关闭 |
+| 5g | 空闲超时 | `TestE2EFailureIdleTimeout` | **PASS**：`idle_timeout=500ms`，实测 501ms 后本地连接收到 EOF，relay 配对表回落 0 |
+| 6 | task2：不配 `udp_listen` 时 UDP 走 TCP 隧道 | `TestE2EUDPModeTCPTunnel` | **PASS**：`udp_mode=tcp_tunnel`，2 个并发 UDP 会话 × 4 轮回声均正确；relay 会话表有 2 个配对键，但**只有 2 个不同承载对端地址**（agent/client 各 1 条 TCP 承载） |
+| 7 | task2：配置 `udp_listen` 时走原生 UDP | `TestE2EUDPModeNative` | **PASS**：relay 管理页显示 `UDP 承载模式 = native`，UDP 会话表为 `native`，数据不经过 TCP 承载 |
+| 8 | task2：`udp_mode` 在三处下发 | `TestE2EUDPModeNegotiation` | **PASS**：`HelloOK`、`ServiceRegistered`、`ServiceList` 的 `udp_mode` 在 native 与 tcp_tunnel 两种模式下都与 relay 判定一致；`tcp_data_port > 0`，native 的 `udp_data_port > 0`，tcp_tunnel 为 0 |
+| 9 | 三种模式管理页 + pprof | `TestE2EAdminPagesThreeModes` | **PASS**：relay/agent/client 页面均 200；标题分别为 `PairLink relay/agent/client 管理页`；关键表头齐全；无 `<script src=`；三个端口的 `/debug/pprof/goroutine?debug=1` 均返回 200 且含 `goroutine profile: total` |
+| 10 | 无僵尸配对 / 无 goroutine 泄漏 | `TestE2EGoroutineNoLeak` | **PASS**：5 次完整配对流量后运行中 pprof `total=30`，无 `internal/forward.Bidirectional` 残留；全部 `Run` 退出后 goroutine `2 → 3`（容差 +2），`runtime/pprof` 中无 `internal/{relay,agent,client,forward}` 栈帧；每个测试的看护基线均 `2 → 2` |
+| 11 | 单二进制：版本/参数/配置错误退出码 | `TestBinaryVersionUsageAndConfigErrors` | **PASS**：`-version` → `pairlink v0.1.0` 且退出码 0；无模式/多模式/未知 flag → 退出码 **2**；`-relay -config 不存在` / `-agent -config 非法 ini` → 退出码 **1** 且有中文错误 |
+| 12 | 真实二进制三子进程 TCP echo | `TestSubprocessTCPEcho` | **PASS**：`go build` 出的真实 `pairlink.exe` 分别以 relay/agent/client 三个子进程运行，未改造的第三方 TCP 客户端回显成功；`taskkill /PID` 收尾 |
+| 13 | 跨平台编译（纯 Go 无 CGO） | `TestCrossCompile` | **PASS**：`linux/amd64` 13,895,704 B；`windows/amd64` 14,444,032 B；`windows/arm64` 13,505,024 B；三个平台 `go build ./...` 均通过 |
+| 14 | Windows 服务 | `TestE2EWindowsService` | **PASS（非管理员分支）**：`pairlink-relay -service install` 退出码 1，输出可读错误 `service: 连接 SCM（需要管理员权限）: Access is denied.`，无 panic/静默成功；完整 install→start→stop→uninstall 需管理员，本机未执行（见 §13.10） |
+| 15 | 阶段4：TLS 隧道端到端（自签 CA） | `TestE2ETLSTCPEcho` | **PASS**：`crypto/x509` 生成 CA + 服务端证书（SAN 127.0.0.1），relay `tls_cert/tls_key`、agent/client `tls_ca`，TCP echo 回显 `tls-echo-1`，结束后配对表回落 |
+| 16 | 阶段4：只配 `tls_insecure_skip_verify` 可连 TLS relay | `TestE2ETLSInsecureSkipVerify` | **PASS**：client 无 `tls_ca`、只开 insecure，echo `tls-insecure-ok` 成功，日志有跳过校验 WARN |
+| 17 | 阶段4：TLS 配置不匹配必须明确失败 | `TestE2ETLSPlaintextAgentAgainstTLSRelay`、`TestE2ETLSPlaintextClientAgainstTLSRelay`、`TestE2ETLSAgentTLSAgainstPlaintextRelay` | **PASS**：明文 agent/client 连 TLS relay → `Run` 返回 `agent: 等待 MsgHelloOK: protocol: 读取帧头: EOF` / `client: 读取 hello 应答: ...`；TLS agent 连明文 relay → `agent: 连接 relay ...: TLS 握手: ...` |
+| 18 | 阶段4：订阅 revision 断档的全量重同步 | `TestSubscribeRevisionResync`（relay）、`TestServiceListFullResync`（client） | **PASS**：跳过 revision 2 后到达 3 → relay 改发全量 `ServiceList`（含 a/b/c）；旧事件被丢弃；client 收到主动 `ServiceList` 后整体替换视图 |
+| 19 | 阶段4：`MsgError.client_conn_id` 精确关联 | `TestConnectRequestErrorCarriesClientConnID`（relay）、`TestErrorMatchingByClientConnID`（client） | **PASS**：relay 在 ConnectRequest 相关错误里填 ID、无关错误不填；client 只关闭该 ID 对应连接，无 ID 时回退 FIFO |
+| 20 | 阶段4：`[client] udp_session_timeout` 可配置 | `TestClientUDPSessionTimeout`（config）、`TestNativeUDP`（client，300ms 清理） | **PASS**：默认 60s、显式 250ms 生效、`0s/-5s` 报错；client 侧 300ms 空闲即清理会话 |
+| 21 | 阶段4：`already_paired` 保留窗口 + 令牌重放防护 | `TestAlreadyPairedRetentionWindow`（relay）、`TestTCPBindRejections` | **PASS**：完成窗口内再报到关闭且 0 字节；窗口结束条目被 Sweep；窗口后重放返回 `ErrConsumed` |
+| 22 | 阶段4：idle 超时日志与半关闭 | `TestBidirectionalWithOutcomeIdleTimeout`、`TestBidirectionalHalfCloseThroughIdleWrapper`、`TestRelayIdleTimeoutLogsEvent` | **PASS**：Outcome 报告超时；relay 日志出现 `event=idle_timeout` + "数据面空闲超时"；`WithIdleTimeout` 包装后 `CloseWrite` 半关闭仍工作、反向数据不丢 |
+| 23 | 阶段4：日志不含令牌明文（含 debug） | `TestRelayLogsDoNotContainToken`（relay）、`TestLogsDoNotContainToken`（agent） | **PASS**：debug 级日志覆盖 pair_issue/bind_fail/pair_complete 等关键事件，但既无 `pairing_token` 也无 `auth_token` 明文 |
+
+### 13.3 本地 HTTP（零改造）
+
+`TestE2EHTTPZeroChange` 启动真实 `net/http` 服务，agent 侧主服务 `default` 与附加服务
+`http-svc` 都指向它；client 只配置 `service.http-svc = 127.0.0.1:<本地端口>`。第三方使用
+标准 `http.Client` 访问 client 本地端口，实测两次：
+
+```text
+HTTP 200: path=/ body="pairlink-http-ok path=/"
+HTTP 200: path=/index.html?x=1 body="pairlink-http-ok path=/index.html?x=1"
+```
+
+HTTP 层完全不知道 PairLink 存在，符合“第三方客户端零改造”的验收要求。
+
+### 13.4 TCP echo 与配对全流程
+
+- `TestE2ETCPPairingBothOrders` 使用 fake agent/fake client 控制面 + 原始数据面连接，
+  **直接操纵报到顺序**：`client-first`（client Bind 占位、agent 后到）与
+  `agent-first`（agent Bind 占位、client 后到）都完成三次双向回显并清理。
+  这样覆盖了 `PairingTable` 对“两侧到达顺序不确定”的处理。
+- `TestE2ETCPEchoConcurrent20` 使用完整真实栈（真实 agent/client）：20 个并发 TCP
+  连接，每个连接带序号做 2 轮回显。全部通过后 relay 管理页
+  `当前配对表（0）`，agent/client 管理页均显示“当前没有活跃配对”。
+
+### 13.5 UDP（原生 / UDP over TCP）
+
+**原生 UDP（`TestE2EUDPModeNative`）**
+
+- relay 配置 `udp_listen`，管理页显示 `UDP 承载模式 = native`；
+- 第三方 UDP 客户端收到带服务端前缀的回包 `echo:probe-native-1`，证明路由到了正确的
+  agent 本地 UDP 服务；
+- `udp_session_timeout=800ms` 后 relay 的 `UDP 会话表（native，1）` 变为 `0`；
+- 会话被清理后原 socket 再发包无回包（relay 按未知端点丢弃）；换一个新的第三方源端口
+  会重新走 `ConnectRequest`，配对键由 `default/bdcb797309f50f68` 变为
+  `default/da890c089dc3b981`。
+
+**UDP over TCP（`TestE2EUDPModeTCPTunnel`）**
+
+- relay 不配置 `udp_listen`，管理页显示 `UDP 承载模式 = tcp_tunnel` 与
+  `未监听（复用 tcp_listen 的 UDP over TCP）`；
+- 两个并发 UDP 会话各做 4 轮回显，回包内容互不串流；
+- relay 会话表有 2 个配对键，但只有 **2 个不同承载对端地址**
+  （`[127.0.0.1:3741 127.0.0.1:3740]`），即 agent 侧 1 条 + client 侧 1 条 TCP 承载，
+  不是“每会话一条”；
+- agent 管理页的 `udp-over-tcp` 行显示会话数 `2`。
+
+**`udp_mode` 下发（`TestE2EUDPModeNegotiation`）**
+
+对 native 与 tcp_tunnel 分别建立原始控制连接，断言 `HelloOK`、`ServiceRegistered`、
+`ServiceList` 三处的 `udp_mode` 一致；并校验 `tcp_data_port` / `udp_data_port`。
+
+### 13.6 多服务与并发
+
+`TestE2EAgentMultiServiceConcurrent`：同一 agent 注册 `default`（HTTP A）、`web`（HTTP B）、
+`echo`（TCP echo）三个服务；client 开三个本地端口。3 个端口 × 5 轮并发访问，
+断言 A 只返回 `service-default`、B 只返回 `service-web`、echo 只回显自己的序号，
+未出现跨服务串流。结束后 relay 配对表为 0。
+
+### 13.7 异常路径（逐条实测）
+
+| 路径 | 实测现象 |
+| --- | --- |
+| 令牌错误 | 数据连接被关闭，`Read` 收到 0 字节；relay 日志 `token: 配对令牌无效` |
+| 令牌复用 | 首次配对成功并 `Consume` 后，再次报到被关闭；日志 `token: 配对令牌已被使用` |
+| 令牌过期 | `token_ttl=300ms`，等待 706ms 后报到被拒；日志 `token: 配对令牌已过期` |
+| 配对超时 | 只一侧报到，`pair_timeout=400ms`，实测 402ms 关闭，表项清理 |
+| 控制连接断开 | 服务/agent/配对表归 0；重新 `ListServices` 为空；新请求 `service_not_found` |
+| 踢出 | GET 405、无 CSRF POST 403、合法 POST 200；agent `Run` 返回“已被 relay 踢出”；client 访问被关闭 |
+| 空闲超时 | `idle_timeout=500ms`，实测 501ms 后本地连接 EOF，relay 配对表 0 |
+
+### 13.8 管理页与 pprof
+
+`TestE2EAdminPagesThreeModes` 同时启动三种模式的 `manage_listen` 并开启 `pprof = true`：
+
+- relay 页：`服务注册表`、`在线 agent`、`当前配对表`、`UDP 会话表`；
+- agent 页：`本机已注册服务`、`控制连接`、`当前活跃数据连接`；
+- client 页：`relay 返回的可用服务列表`、`本地端口映射表`、`当前活跃配对`；
+- 三个页面均返回 200、`<html lang="zh-CN">`、中文标题，且不含任何 `<script src=`；
+- 三个端口的 `/debug/pprof/goroutine?debug=1` 与 `/debug/pprof/` 均可访问。
+
+### 13.9 无僵尸与 goroutine/pprof 佐证
+
+`TestE2EGoroutineNoLeak` 在测试开始时记录稳定基线，跑 5 次完整 TCP 配对流量后：
+
+```text
+运行中 pprof: relay goroutine total=30，无 internal/forward.Bidirectional 残留
+goroutine 实测: 基线=2 Run 全部退出后=3（容差 +2）
+pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|agent|client|forward 栈帧
+优雅关停：relay/agent/client 三个 Run 在 ctx 取消后均返回 nil
+```
+
+每个 e2e 测试还带一个 goroutine 看护：cleanup 末尾轮询回落到 `基线 +2` 以内，
+实测所有用例均为 `base=2 now=2`。
+
+### 13.10 真实二进制、子进程与跨平台
+
+- `TestBinaryVersionUsageAndConfigErrors`：`pairlink -version` 输出
+  `pairlink v0.1.0`；无模式/多模式/未知 flag 退出码 2；配置文件缺失/非法退出码 1，
+  错误信息为中文且可定位。
+- `TestSubprocessTCPEcho`：TestMain 在临时目录 `go build` 出真实 `pairlink.exe`，
+  启动 relay/agent/client 三个子进程，第三方 TCP echo 成功，最后 `taskkill /PID` 清理。
+- `TestCrossCompile`：`CGO_ENABLED=0` 下 `linux/amd64`、`windows/amd64`、
+  `windows/arm64` 的 `go build ./...` 与单二进制产物均通过。
+- `TestE2EWSLOrCrossCompileNote`：本机 `wsl -l -q` 失败（无 WSL），
+  因此 **Linux 二进制未在真机运行**，只证明了交叉编译通过。
+
+### 13.11 Windows 服务
+
+`TestE2EWindowsService` 先检测管理员权限（`windows.GetCurrentProcessToken().IsElevated()`）：
+
+- 本机**非管理员**：`pairlink.exe -relay -config <有效 ini> -service install` 退出码 1，
+  输出 `错误: service: 连接 SCM（需要管理员权限）: Access is denied.`，
+  未出现 panic，也未静默成功；服务名由 `service.Name(mode)` 生成 `pairlink-relay`。
+- 若以管理员运行，测试会执行完整 `install → start → sc query(RUNNING) →
+  pairlink-relay.log → stop → uninstall` 分支（本机未触发）。
+- 因此 **Windows 服务完整生命周期未在本机验证**，只验证了非管理员错误路径与服务命名约定。
+
+### 13.12 回归
+
+阶段 4 收尾时，仓库根实测（本轮为一次性串行执行）：
+
+```text
+gofmt -l .                     # 无输出
+go vet ./...                   # 通过（无输出）
+go build ./...                 # 通过（无输出）
+go test ./... -count=1         # 全绿（test 包 22.981s，relay 7.079s，其余 1.4~6.4s）
+go test -race ./... -count=1   # 全绿（test 包 24.326s，0 处 DATA RACE）
+go test ./test/... -v -count=1 # ok 21.805s，33 个 --- PASS、0 个 --- FAIL
+go test ./test/... -count=2    # ok 48.304s，无 flake
+GOOS=linux   GOARCH=amd64 go build ./...   # 通过（无输出）
+GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
+```
+
+补充：`go test -race ./...` 中 relay/client/agent 三个包的耗时分别为 10.8s / 9.1s / 9.2s，
+说明并发用例（订阅推送、踢出、并发配对、UDP 双承载）都在 race 检测下跑过。
+
+### 13.13 阶段 4：审查修复与对应回归证据
+
+本轮（阶段 4）是"审查 + 修复 + 回归"，不改动三模式的公共 `Run` 签名与包路径。
+每条修复都有对应的包内测试或 e2e 用例（下表），完整回归输出见 §13.12。
+
+| # | 问题 | 级别 | 修复 | 回归证据 |
+| --- | --- | --- | --- | --- |
+| 1 | 订阅推送在 revision 断档/乱序时**永久丢事件**，client 管理页视图可能一直停在旧版本 | P1 | relay：订阅后下发全量 `ServiceList` 基线；`revision` 严格连续才推单条事件，否则改发全量列表（`pushMu` 保证基线先于事件写出）。client：任意时刻接受主动 `ServiceList`，且 `revision` 更旧的快照整份忽略 | `TestSubscribeRevisionResync`、`TestServiceListFullResync`、`TestTunnelRegisterListSubscribe` |
+| 2 | `MsgError` 无关联 ID，client 用"最早等待连接"FIFO 近似匹配；并发接入时可能**关错本地连接** | P1 | `protocol.Error` 新增可选 `client_conn_id`（兼容、不升版本）；relay 在 ConnectRequest 相关错误里填；client 精确匹配，缺失时回退 FIFO | `TestConnectRequestErrorCarriesClientConnID`、`TestErrorMatchingByClientConnID` |
+| 3 | `already_paired` 保留窗口与令牌重放防护缺少端到端证明 | P1 | 补测试：完成窗口内再报到被关闭且 0 字节；窗口结束 `Sweep` 清条目；窗口后重放仍 `ErrConsumed` | `TestAlreadyPairedRetentionWindow`、`TestTCPBindRejections` |
+| 4 | idle 超时后只有笼统 `data_close` 日志，无法区分"空闲清理"与"正常关闭" | P1 | `forward` 新增 `BidirectionalWithOutcome`/`Outcome`（`Bidirectional` 行为不变）；relay 据此记 `event=idle_timeout` | `TestBidirectionalWithOutcomeIdleTimeout`、`TestBidirectionalHalfCloseThroughIdleWrapper`、`TestRelayIdleTimeoutLogsEvent` |
+| 5 | 管理页版本号三处不一致（relay 常量、agent 常量、client 空） | P2 | 新增 `internal/version`，`main.Version` 与三模式管理页统一引用 | `TestVersionFormat`、`TestE2EAdminPagesThreeModes`（断言页面含 `v0.1.0`） |
+| 6 | `[client]` 无 `udp_session_timeout`，client 侧 UDP 空闲清理写死 60s | P2 | config 新增字段（默认 60s、必须 > 0）+ client 使用 + 文档 | `TestClientUDPSessionTimeout`、`TestNativeUDP`（300ms 清理） |
+| 7 | 管理页"先 Start 后赋值"竞态只有 relay 修过 | P1 | agent/client 改为先发布 `adminSrv`/`admin` 再 `Start`，失败时回滚为 nil | 现有 `TestAdminPage`、`TestE2EAdminPagesThreeModes`（-race 通过） |
+| 8 | TLS 端到端（自签 CA / insecure / 配置不匹配）无 e2e | P2 | 新增 5 个 e2e 用例（CA 与服务端证书由 `crypto/x509` 在 `t.TempDir()` 生成） | `TestE2ETLSTCPEcho`、`TestE2ETLSInsecureSkipVerify`、`TestE2ETLSPlaintextAgentAgainstTLSRelay`、`TestE2ETLSPlaintextClientAgainstTLSRelay`、`TestE2ETLSAgentTLSAgainstPlaintextRelay` |
+| 9 | 日志可能打印令牌明文（需全仓确认） | P1 | 审计确认生产代码只记录 `pairing_key`；新增 relay 级日志泄漏测试（debug 级别） | `TestRelayLogsDoNotContainToken`、`TestLogsDoNotContainToken`（agent，已有） |
+| 10 | 文档与实现不一致（contract §4.5 数据面地址推导、TLS 触发规则、protocol §4.12/§5.2.1） | P2 | 同步 `docs/contract.md`、`docs/protocol.md`、`docs/architecture.md`、本 README | 见各文档对应小节 |
+
+未修（有明确理由，已写入 §10 / §13.14）：
+
+- **订阅事件乱序的根因**在冻结包 `registry` 的"锁外 dispatch"设计；本轮在 relay 侧用
+  "全量重同步"兜住可观测后果，不改冻结包的并发模型（改它会引入回调重入死锁风险）。
+- **UDP 原生重复 Bind / BindOK 乱序**属协议边界情形，修它需要解析每个数据报，
+  与"数据面不解析上层协议"冲突；已在 `docs/protocol.md` §5.2.1 写明真实行为。
+- **Linux 真机运行 / Windows 服务生命周期**需要管理员与 Linux 环境，本轮无法验证。
+
+### 13.14 已知限制与未验证项（诚实说明）
+
+1. **Linux 二进制未在真机/WSL 运行**：本机 `wsl -l -q` 退出码 1，无 WSL 发行版；
+   Linux 只验证了 `CGO_ENABLED=0` 交叉编译。真实 Linux 上的三进程 echo 未执行。
+2. **Windows 服务完整生命周期未验证**：本机非管理员。已验证非管理员错误路径、
+   `pairlink-<mode>` 命名（`internal/service` 单测 + 代码路径），但 install/start/stop/uninstall
+   的实际 RUNNING/STOPPED 状态与 `pairlink-<mode>.log` 落盘未在本机执行。
+3. **TLS e2e 只覆盖自签 CA 与 insecure 组合**（阶段 4 补充）：`TestE2ETLS*` 已覆盖
+   relay `tls.Listen` + agent/client `tls_ca`、`tls_insecure_skip_verify`，以及
+   "明文连 TLS / TLS 连明文"必须失败的路径；未覆盖公网 CA（系统根证书）、证书过期、
+   主机名不匹配。数据面按设计永远明文。
+4. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；
+   TCP/UDP 行为在真实广域网下可能不同。
+5. **UDP over TCP 首包可能丢失**：会话刚建立、对端尚未完成登记时，第一个数据帧可能被
+   relay 按半会话丢弃（UDP 语义允许丢包）。测试用有界重试消除该竞态；生产客户端应容忍
+   首包丢失或由业务层重试。
+6. **端口分配是“bind :0 → 关闭 → 重新绑定”**：极端情况下存在被其它进程抢占的
+   TOCTOU 窗口；测试用进程内端口去重 + 重试缓解，不保证 100% 无外部竞争。
+7. **阶段 4 已复核的薄弱点**：relay 管理页 `s.admin`「先 Start 后赋值」竞态（阶段 3 已修，
+   agent/client 同步改为先发布再 Start）；订阅事件乱序/丢弃（改为全量 `ServiceList` 重同步兜底）；
+   `already_paired` 保留窗口与令牌重放（新增测试 `TestAlreadyPairedRetentionWindow`）；
+   UDP 会话/令牌一致性（新会话必须重新 Issue，旧令牌 `ErrConsumed`）；
+   关停期间不再启动新 goroutine（三个模式分别由 `sync.WaitGroup` / `taskGroup` 约束）；
+   管理页所有用户可控字段（服务ID/地址/agent_id/配对键）均 `html` 转义；
+   全仓日志（含 debug/错误路径）无明文 `pairing_token`。
+   **仍需管理员/真机验证的只有：真实 Linux 运行、Windows 服务完整生命周期（本节第 1、2 条）。**
+8. **未做长时间 soak**：资源泄漏用 e2e goroutine 计数 + `pprof` 佐证，未做数小时压测。
+
+## 14. 版本与许可证
+
+- 版本：`v0.1.0`
+- 许可证：[Apache-2.0](LICENSE)
