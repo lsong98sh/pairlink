@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lsong98sh/pairlink/internal/version"
 )
 
 // TestE2EAdminPagesThreeModes 验收项（task.md §10）：三种模式的 manage_listen
@@ -107,8 +109,8 @@ func TestE2EAdminPagesThreeModes(t *testing.T) {
 				t.Fatalf("%s 页面引用了外部脚本（应全部内联）", tc.name)
 			}
 			// 阶段 4：三种模式的顶栏都必须显示统一版本号（internal/version）。
-			if !strings.Contains(body, "v0.1.0") {
-				t.Fatalf("%s 页面顶栏缺少版本号 v0.1.0", tc.name)
+			if !strings.Contains(body, version.Version) {
+				t.Fatalf("%s 页面顶栏缺少版本号 %s", tc.name, version.Version)
 			}
 			// 管理页首页也应可访问并列出页面入口。
 			idx := mustAdminGet(t, tc.addr, "/?refresh=0")

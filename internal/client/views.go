@@ -42,13 +42,22 @@ func (c *client) servicesView() (map[string]protocol.ServiceInfo, uint64) {
 //
 // revision 比本地已见版本更旧的快照**整份忽略**：relay 的订阅基线与并发事件可能短暂
 // 出现"全量列表比刚应用的事件更旧"的情形，用旧快照替换会丢掉刚应用的变更。
+// 例外见 applyServiceListForce（重连后的新基线必须强制接受）。
 func (c *client) applyServiceList(list *protocol.ServiceList) {
+	c.applyServiceListForce(list, false)
+}
+
+// applyServiceListForce 用全量列表替换本地视图；force=true 时无条件接受。
+//
+// force 用于「(重)连接后的首个全量列表」：relay 重启后 revision 会归零/变小，
+// 若仍按「忽略更旧 revision」处理，client 会永久停留在旧视图（服务消失或协议陈旧）。
+func (c *client) applyServiceListForce(list *protocol.ServiceList, force bool) {
 	if list == nil {
 		return
 	}
 	c.svcMu.Lock()
 	defer c.svcMu.Unlock()
-	if list.Revision < c.revision {
+	if !force && list.Revision < c.revision {
 		c.log.Debug("忽略旧的全量服务列表", "event", "service_list",
 			"detail", fmt.Sprintf("list_revision=%d seen=%d", list.Revision, c.revision))
 		return
@@ -58,6 +67,10 @@ func (c *client) applyServiceList(list *protocol.ServiceList) {
 		services[svc.ServiceID] = svc
 	}
 	c.services = services
+	if force {
+		c.revision = list.Revision
+		return
+	}
 	if list.Revision > c.revision {
 		c.revision = list.Revision
 	}
@@ -97,13 +110,9 @@ func (c *client) applyServiceEvent(ev *protocol.ServiceEvent) {
 		"detail", fmt.Sprintf("event=%s proto=%s online=%t revision=%d",
 			ev.Event, ev.Service.Proto, ev.Service.Online, ev.Revision))
 
-	// 第一版不热切换本地监听：订阅到 proto 变化只记 WARN。
+	// 阶段 6C：订阅到 proto 变化时热切换本地监听（TCP↔UDP），失败回滚到旧协议。
 	if ev.Event == protocol.EventAdded || ev.Event == protocol.EventUpdated {
-		if p := c.listenerProto(ev.Service.ServiceID); p != "" && p != ev.Service.Proto {
-			c.log.Warn("服务的协议与本地监听不一致（第一版不热切换，保持现状）", "event", "service_proto_mismatch",
-				"service_id", ev.Service.ServiceID,
-				"detail", fmt.Sprintf("listen_proto=%s relay_proto=%s", p, ev.Service.Proto))
-		}
+		c.hotSwitchProto(ev.Service.ServiceID, ev.Service.Proto)
 	}
 }
 

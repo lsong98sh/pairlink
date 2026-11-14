@@ -171,11 +171,18 @@ func (c *client) udpSessionByConnID(connID string) *udpSession {
 	return c.udpByConn[connID]
 }
 
+// udpBindResendInterval 是原生 UDP 报到帧的重发间隔（约 300ms）。
+const udpBindResendInterval = 300 * time.Millisecond
+
+// udpBindMaxResends 是 pair_timeout 内最多重发报到帧的次数。
+const udpBindMaxResends = 3
+
 // forwardUDP 建立 UDP 数据面（native 或 tcp_tunnel）并开始双向转发。
 func (c *client) forwardUDP(s *udpSession, key pairing.PairingKey, token string) {
+	neg := c.negotiated()
 
 	var err error
-	if c.udpMode == protocol.UDPModeTCPTunnel {
+	if neg.udpMode == protocol.UDPModeTCPTunnel {
 		err = c.attachUDPTunnel(s, key, token)
 	} else {
 		err = c.attachUDPNative(s, key, token)
@@ -187,7 +194,7 @@ func (c *client) forwardUDP(s *udpSession, key pairing.PairingKey, token string)
 		}
 		c.log.Warn("UDP 数据面绑定失败，关闭会话", "event", "bind",
 			"service_id", key.ServiceID, "pairing_key", key.String(),
-			"detail", "udp_mode="+c.udpMode, "err", err)
+			"detail", "udp_mode="+neg.udpMode, "err", err)
 		c.closeUDPSession(s, "bind_fail", err)
 		return
 	}
@@ -196,21 +203,22 @@ func (c *client) forwardUDP(s *udpSession, key pairing.PairingKey, token string)
 		return
 	}
 	c.log.Info("UDP 数据面已打开", "event", "data_open", "service_id", key.ServiceID,
-		"pairing_key", key.String(), "detail", "proto=udp udp_mode="+c.udpMode)
+		"pairing_key", key.String(), "detail", "proto=udp udp_mode="+neg.udpMode)
 	c.flushUDPFirstPacket(s)
 }
 
-// attachUDPNative 走原生 UDP 数据面：DialUDP → Bind 数据报 → 等 BindOK。
+// attachUDPNative 走原生 UDP 数据面：DialUDP → Bind 数据报 → 等 BindOK（丢包重发）。
 func (c *client) attachUDPNative(s *udpSession, key pairing.PairingKey, token string) error {
-	if c.udpDataErr != nil {
-		return c.udpDataErr
+	neg := c.negotiated()
+	if neg.udpDataErr != nil {
+		return neg.udpDataErr
 	}
-	if c.udpDataUDPAddr == nil {
+	if neg.udpDataUDPAddr == nil {
 		return errors.New("client: 原生 UDP 数据面地址未解析")
 	}
-	conn, err := net.DialUDP("udp", nil, c.udpDataUDPAddr)
+	conn, err := net.DialUDP("udp", nil, neg.udpDataUDPAddr)
 	if err != nil {
-		return fmt.Errorf("client: 连接 relay UDP 数据面 %s: %w", c.udpDataAddr, err)
+		return fmt.Errorf("client: 连接 relay UDP 数据面 %s: %w", neg.udpDataAddr, err)
 	}
 	if !s.setNativeConn(conn) {
 		_ = conn.Close()
@@ -234,38 +242,87 @@ func (c *client) attachUDPNative(s *udpSession, key pairing.PairingKey, token st
 	_ = conn.SetWriteDeadline(time.Time{})
 	c.log.Info("已发送原生 UDP 报到数据报", "event", "bind",
 		"service_id", key.ServiceID, "pairing_key", key.String(),
-		"remote", c.udpDataAddr, "detail", "udp_mode=native carrier=")
+		"remote", neg.udpDataAddr, "detail", "udp_mode=native carrier=")
 
-	timeout := c.pairTimeout()
-	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	buf := make([]byte, protocol.MaxUDPDatagram+1)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return fmt.Errorf("client: 等待 relay UDP 报到应答（%s）: %w", timeout, err)
+	if err := c.awaitBindOKNative(s, key, conn, frame); err != nil {
+		return err
 	}
-	_ = conn.SetReadDeadline(time.Time{})
-
-	typ, payload, err := protocol.ParseFrame(buf[:n])
-	if err != nil {
-		return fmt.Errorf("client: 解析 relay UDP 报到应答: %w", err)
-	}
-	switch typ {
-	case protocol.MsgBindOK:
-		// 报到成功。
-	case protocol.MsgError:
-		msg, decErr := protocol.Decode(typ, payload)
-		if decErr == nil {
-			if e, ok := msg.(*protocol.Error); ok {
-				return fmt.Errorf("relay 拒绝 UDP 报到: %w", e)
-			}
-		}
-		return errors.New("client: relay 拒绝 UDP 报到")
-	default:
-		return fmt.Errorf("client: 期望 bind_ok，收到 %s", typ)
-	}
-
 	c.tasks.Go(func() { c.readNativeUDP(s, conn) })
 	return nil
+}
+
+// awaitBindOKNative 在 pair_timeout 内等待 relay 的 MsgBindOK 数据报。
+//
+// 丢包处理（阶段 6C，docs/protocol.md §5.2.1）：每约 300ms 未收到应答就重发报到帧，
+// 最多重发 udpBindMaxResends 次；收到 MsgBindOK 或**首个业务数据报**即视为就绪
+// （relay 半开会重复回 BindOK，因此重发是幂等的）。
+func (c *client) awaitBindOKNative(s *udpSession, key pairing.PairingKey, conn *net.UDPConn, frame []byte) error {
+	timeout := c.pairTimeout()
+	deadline := time.Now().Add(timeout)
+	buf := make([]byte, protocol.MaxUDPDatagram+1)
+	resends := 0
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("client: 等待 relay UDP 报到应答（%s）: 超时", timeout)
+		}
+		wait := remaining
+		if resends < udpBindMaxResends && wait > udpBindResendInterval {
+			wait = udpBindResendInterval
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(wait)); err != nil {
+			return err
+		}
+		n, rerr := conn.Read(buf)
+		if rerr != nil {
+			if !isTimeoutErr(rerr) {
+				return fmt.Errorf("client: 等待 relay UDP 报到应答（%s）: %w", timeout, rerr)
+			}
+			if resends < udpBindMaxResends {
+				resends++
+				if _, werr := conn.Write(frame); werr != nil {
+					return fmt.Errorf("client: 重发 UDP 报到数据报: %w", werr)
+				}
+				c.log.Debug("未收到 UDP 报到应答，重发报到数据报", "event", "bind",
+					"service_id", key.ServiceID, "pairing_key", key.String(), "attempt", resends)
+			}
+			continue
+		}
+		typ, payload, perr := protocol.ParseFrame(buf[:n])
+		if perr != nil {
+			// 不像 PairLink 帧的数据报：视为业务数据，交给本地目标。
+			c.deliverUDPToLocal(s, buf[:n])
+			_ = conn.SetReadDeadline(time.Time{})
+			return nil
+		}
+		switch typ {
+		case protocol.MsgBindOK:
+			_ = conn.SetReadDeadline(time.Time{})
+			return nil
+		case protocol.MsgError:
+			msg, decErr := protocol.Decode(typ, payload)
+			if decErr == nil {
+				if e, ok := msg.(*protocol.Error); ok {
+					return fmt.Errorf("relay 拒绝 UDP 报到: %w", e)
+				}
+			}
+			return errors.New("client: relay 拒绝 UDP 报到")
+		default:
+			// 业务数据先到：按就绪处理并回写本地。
+			c.deliverUDPToLocal(s, buf[:n])
+			_ = conn.SetReadDeadline(time.Time{})
+			return nil
+		}
+	}
+}
+
+// isTimeoutErr 判断 err 是否是网络超时。
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // readNativeUDP 读取原生 UDP 数据面回包并回写到本地第三方源地址。
@@ -307,10 +364,14 @@ func (c *client) sendUDPToRelay(s *udpSession, data []byte) {
 		if key == "" {
 			return
 		}
-		err = carrier.writeFrame(key, data)
-		if err == nil {
-			s.toRelay.Add(int64(len(data)))
+		if !carrier.writeFrame(key, data) {
+			if carrier.isClosed() {
+				return
+			}
+			// 队列满导致丢弃：UDP 允许丢包，不关闭会话。
+			return
 		}
+		s.toRelay.Add(int64(len(data)))
 	default:
 		return
 	}
@@ -396,7 +457,7 @@ func (c *client) closeUDPSession(s *udpSession, reason string, cause error) {
 		"pairing_key", key,
 		"remote", s.srcKey,
 		"detail", fmt.Sprintf("reason=%s proto=%s udp_mode=%s to_relay=%d to_local=%d",
-			reason, proto, c.udpMode, s.toRelay.Load(), s.toLocal.Load()),
+			reason, proto, c.negotiated().udpMode, s.toRelay.Load(), s.toLocal.Load()),
 	}
 	if cause != nil {
 		attrs = append(attrs, "err", cause)

@@ -38,6 +38,8 @@ var knownKeys = map[string]map[string]bool{
 		"heartbeat":                true,
 		"dial_timeout":             true,
 		"udp_session_timeout":      true,
+		"reconnect":                true,
+		"reconnect_max_backoff":    true,
 	},
 	"client": {
 		"relay_addr":               true,
@@ -49,6 +51,8 @@ var knownKeys = map[string]map[string]bool{
 		"dial_timeout":             true,
 		"pair_timeout":             true,
 		"udp_session_timeout":      true,
+		"reconnect":                true,
+		"reconnect_max_backoff":    true,
 	},
 }
 
@@ -236,6 +240,10 @@ func (c *Config) validateServer() error {
 	if s.TLSInsecureSkipVerify {
 		c.addWarning("[server] tls_insecure_skip_verify = true，将跳过 relay 证书校验（仅建议测试环境）")
 	}
+	// duration 解析阶段已拒绝 <= 0；这里兜住「绕过 ini 直接构造 Config」的情形。
+	if s.ReconnectMaxBackoff < 0 {
+		return fmt.Errorf("[server] reconnect_max_backoff = %s 必须大于 0", s.ReconnectMaxBackoff)
+	}
 	return nil
 }
 
@@ -300,6 +308,9 @@ func (c *Config) validateClient() error {
 	// 保证 client 侧 UDP 空闲清理不会退化成"立刻清理"或"永不清理"。
 	if cl.UDPSessionTimeout < 0 {
 		return fmt.Errorf("[client] udp_session_timeout = %s 必须大于 0", cl.UDPSessionTimeout)
+	}
+	if cl.ReconnectMaxBackoff < 0 {
+		return fmt.Errorf("[client] reconnect_max_backoff = %s 必须大于 0", cl.ReconnectMaxBackoff)
 	}
 	return nil
 }

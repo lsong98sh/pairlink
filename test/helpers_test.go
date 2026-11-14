@@ -143,6 +143,10 @@ type agentSpec struct {
 	LogLevel                 string
 	Heartbeat                time.Duration
 	UDPSessionTimeout        time.Duration
+	// NoReconnect 写 reconnect = false（阶段 6C 之前的行为：控制连接断开即退出）。
+	NoReconnect bool
+	// ReconnectMaxBackoff 覆盖 reconnect_max_backoff。
+	ReconnectMaxBackoff time.Duration
 }
 
 type clientService struct {
@@ -161,6 +165,10 @@ type clientSpec struct {
 	PairTimeout              time.Duration
 	UDPSessionTimeout        time.Duration
 	NoSubscribe              bool
+	// NoReconnect 写 reconnect = false（阶段 6C 之前的行为：控制连接断开即退出）。
+	NoReconnect bool
+	// ReconnectMaxBackoff 覆盖 reconnect_max_backoff。
+	ReconnectMaxBackoff time.Duration
 }
 
 func writeRelayINI(t *testing.T, s relaySpec) (*config.Config, string) {
@@ -228,6 +236,10 @@ func writeAgentINI(t *testing.T, s agentSpec) (*config.Config, string) {
 	}
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
+	if s.NoReconnect {
+		b.WriteString("reconnect = false\n")
+	}
+	writeDuration(&b, "reconnect_max_backoff", s.ReconnectMaxBackoff)
 	return loadConfig(t, writeINI(t, "server.ini", b.String()), config.ModeAgent)
 }
 
@@ -262,6 +274,10 @@ func writeClientINI(t *testing.T, s clientSpec) (*config.Config, string) {
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "pair_timeout", s.PairTimeout)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
+	if s.NoReconnect {
+		b.WriteString("reconnect = false\n")
+	}
+	writeDuration(&b, "reconnect_max_backoff", s.ReconnectMaxBackoff)
 	return loadConfig(t, writeINI(t, "client.ini", b.String()), config.ModeClient)
 }
 

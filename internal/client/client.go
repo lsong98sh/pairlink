@@ -9,9 +9,15 @@
 // 本包由阶段 2 client 子代理独占（docs/contract.md §1），不 import relay/agent，
 // 也不修改任何冻结包。
 //
-// 已知限制（README 层面）：
-//   - 控制连接断开后不自动重连，Run 返回错误，由外部守护重启；
-//   - 订阅到 proto 变化的服务事件时第一版不热切换本地监听，只记 WARN；
+// 阶段 6C 起（docs/contract.md §2.5）：
+//   - 控制连接意外断开（非踢出/非 relay 停机）后**默认自动重连**（[client] reconnect，
+//     默认 true）：指数退避 base 1s / ×2 / cap reconnect_max_backoff（默认 60s）/ ±20%
+//     抖动；重连成功后重新 Hello、重新 ListServices、重新 Subscribe，刷新本地服务视图
+//     与 udp_mode，并**强制接受 relay 的新 revision 基线**（relay 重启后 revision 会归零）；
+//     本地监听不重建，第三方无感；
+//   - 重连期间关闭全部在途本地会话（reason=reconnect），不做迁移；
+//   - 订阅到 proto 变化时热切换本地监听（TCP↔UDP），失败回滚到旧协议（见 listener.go）；
+//   - reconnect = false 时保持旧行为（断开即返回错误，由外部守护重启）；
 //   - UDP 本地会话空闲超时由 [client] udp_session_timeout 控制（默认 60s）；
 //   - TLS 当且仅当配置了 tls_ca 或 tls_insecure_skip_verify 时启用；两者皆空走明文，
 //     与 relay 的 tls_cert/tls_key 配置必须匹配，不匹配时握手失败并报清晰错误；
@@ -34,6 +40,7 @@ import (
 	"github.com/lsong98sh/pairlink/internal/config"
 	"github.com/lsong98sh/pairlink/internal/logx"
 	"github.com/lsong98sh/pairlink/internal/protocol"
+	"github.com/lsong98sh/pairlink/internal/reconnect"
 )
 
 const (
@@ -66,10 +73,15 @@ var (
 
 // Run 启动 client 模式，直到 ctx 取消、relay 停机或遇到不可恢复错误后返回。
 //
-// 返回语义（docs/contract.md §2.1）：
+// 返回语义（docs/contract.md §2.1 / §2.5）：
 //   - ctx 取消且清理完成 → nil；
 //   - relay 发 MsgServerShutdown → nil；
-//   - 启动失败（拨号/握手/本地端口占用）或控制连接断开 / 被踢出 → 非 nil。
+//   - 本地监听失败（端口占用）、配置非法、relay 明确拒绝（MsgError）或协议版本不匹配
+//     → 非 nil（不重试）；
+//   - 启用 [client] reconnect（默认）时：拨号/握手阶段的可重试失败与控制连接意外断开
+//     不会结束进程，而是按指数退避重连；重连期间进程存活、本地监听保持不变；
+//   - 被踢出（MsgKicked）→ 清理后返回非 nil；
+//   - reconnect = false 时控制连接断开 → 返回非 nil（旧行为）。
 func Run(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil {
 		return errors.New("client: 配置为 nil")
@@ -113,7 +125,6 @@ func newClientWithLogger(ctx context.Context, cfg *config.Config, log *slog.Logg
 		startedAt:   time.Now(),
 		ctrlLog:     logx.Component(log, "control"),
 		host:        host,
-		heartbeat:   cfg.Client.Heartbeat,
 		services:    make(map[string]protocol.ServiceInfo),
 		tcpSessions: make(map[string]*tcpSession),
 		udpSessions: make(map[udpSessionKey]*udpSession),
@@ -121,13 +132,31 @@ func newClientWithLogger(ctx context.Context, cfg *config.Config, log *slog.Logg
 	}
 }
 
+// negotiated 是每次（重）握手协商出的只读状态快照。
+//
+// 重连会整体替换它，因此所有读取都必须走 negotiated() 拿快照，不能直接读字段
+// （数据面 goroutine 和控制面并发访问）。
+type negotiated struct {
+	clientID       string
+	udpMode        string
+	heartbeat      time.Duration
+	tcpPort        int
+	udpPort        int
+	tcpDataAddr    string
+	tcpDataErr     error
+	udpDataAddr    string
+	udpDataUDPAddr *net.UDPAddr
+	udpDataErr     error
+}
+
 // client 是 client 模式的全部运行状态。
 //
 // 并发约定：
-//   - ctrl / ctrlMu 保护控制连接上的写（帧必须串行）；
+//   - ctrl / ctrlMu 保护控制连接指针与写（帧必须串行；重连整体替换 ctrl）；
+//   - negMu 保护每次握手协商出的状态快照（重连时整体替换）；
 //   - svcMu 保护服务列表视图（控制面写，管理页读）；
 //   - tcpMu / udpMu 分别保护本地 TCP 连接表与本地 UDP 会话表；
-//   - listenerMu 保护本地监听器列表；
+//   - listenerMu 保护本地监听器列表，listenSwitchMu 串行化热切换；
 //   - carrierMu 保护 UDP over TCP 承载连接指针，carrierDialMu 串行化承载连接的创建；
 //   - 所有 IO（Close/Write/Dial）都在锁外进行，避免锁内阻塞。
 type client struct {
@@ -147,26 +176,21 @@ type client struct {
 	ctrlMu  sync.Mutex
 	ctrlLog *slog.Logger
 
-	// 握手与数据面协商结果（握手阶段写一次，之后只读）。
-	host      string
-	clientID  string
-	udpMode   string
-	heartbeat time.Duration
-	tcpPort   int
-	udpPort   int
-
-	tcpDataAddr    string
-	tcpDataErr     error
-	udpDataAddr    string
-	udpDataUDPAddr *net.UDPAddr
-	udpDataErr     error
+	// 握手与数据面协商结果（每次（重）连接整体替换）。
+	host     string
+	negMu    sync.RWMutex
+	negState negotiated
 
 	svcMu    sync.RWMutex
 	services map[string]protocol.ServiceInfo
 	revision uint64
 
-	listenerMu sync.Mutex
-	listeners  []*localListener
+	listenerMu     sync.Mutex
+	listenSwitchMu sync.Mutex
+	listeners      []*localListener
+
+	// listenFn 打开本地监听（测试可注入以模拟端口占用/失败）。
+	listenFn func(proto, addr string) (*localListener, error)
 
 	tcpMu       sync.Mutex
 	tcpSessions map[string]*tcpSession
@@ -179,46 +203,36 @@ type client struct {
 	carrierDialMu sync.Mutex
 	carrier       *udpTunnelCarrier
 
+	// reconnectBase 是重连退避的基准等待（默认 1s，测试可缩短）。
+	reconnectBase time.Duration
+	backoffOnce   sync.Once
+	backoffSeq    *reconnect.Backoff
+
 	admin     *admin.Server
 	adminAddr string
 }
 
-// run 是 Run 的主体：握手 → 读循环/心跳/清理 → 本地监听 → 管理页 → 等待 → 关停。
+// run 是 Run 的主体：管理页 → 超时清理 ticker → 连接监督（含本地监听）→ 关停。
+//
+// 本地监听只在**首次**接入成功后启动，重连不重建（避免端口占用与第三方连接中断）。
 func (c *client) run() error {
 	defer c.cancel()
 
 	c.log.Info("client 启动", "event", "start",
-		"detail", fmt.Sprintf("relay=%s services=%d", c.cfg.Client.RelayAddr, len(c.cfg.Client.Services)))
+		"detail", fmt.Sprintf("relay=%s services=%d reconnect=%t",
+			c.cfg.Client.RelayAddr, len(c.cfg.Client.Services), c.reconnectEnabled()))
 
-	if err := c.connect(); err != nil {
-		c.shutdown()
-		return err
-	}
-
-	// 控制面读循环、心跳、超时清理都必须先于本地监听启动：
-	// 本地接入随时可能发 ConnectRequest，读循环必须已经就绪来承接 PairResult。
-	c.tasks.Go(c.controlLoop)
-	c.tasks.Go(c.heartbeatLoop)
-	c.tasks.Go(c.sweepLoop)
-
-	if err := c.startListeners(); err != nil {
-		c.shutdown()
-		return err
-	}
 	if err := c.startAdmin(); err != nil {
 		c.shutdown()
 		return err
 	}
 
-	var runErr error
-	select {
-	case <-c.stopSig.done:
-		runErr = c.stopSig.Err()
-	case <-c.parent.Done():
-	}
+	// 超时清理 ticker 与连接无关，整个进程只启动一次。
+	c.tasks.Go(c.sweepLoop)
 
+	err := c.supervise()
 	c.shutdown()
-	return runErr
+	return err
 }
 
 // shutdown 执行统一关停：先取消内部 ctx 并停止接收新任务，再按
@@ -233,13 +247,9 @@ func (c *client) shutdown() {
 
 		c.closeListeners()
 
-		c.ctrlMu.Lock()
-		if c.ctrl != nil {
-			_ = c.ctrl.Close()
-		}
-		c.ctrlMu.Unlock()
+		c.closeControl()
 
-		c.closeAllSessions()
+		c.closeSessions("shutdown")
 		c.tasks.Wait()
 
 		if c.admin != nil {
@@ -253,14 +263,16 @@ func (c *client) shutdown() {
 	})
 }
 
-// closeAllSessions 关闭承载连接与全部本地 TCP/UDP 会话（幂等，可在锁外调用）。
-func (c *client) closeAllSessions() {
+// closeSessions 关闭承载连接与全部本地 TCP/UDP 会话（幂等，可在锁外调用）。
+//
+// reason 用于日志：关停为 shutdown，重连前为 reconnect。本地监听不在此关闭。
+func (c *client) closeSessions(reason string) {
 	c.carrierMu.Lock()
 	cc := c.carrier
 	c.carrier = nil
 	c.carrierMu.Unlock()
 	if cc != nil {
-		cc.close("shutdown", nil)
+		cc.close(reason, nil)
 	}
 
 	var tcpList []*tcpSession
@@ -270,7 +282,7 @@ func (c *client) closeAllSessions() {
 	}
 	c.tcpMu.Unlock()
 	for _, s := range tcpList {
-		c.closeTCPSession(s, "shutdown", nil)
+		c.closeTCPSession(s, reason, nil)
 	}
 
 	var udpList []*udpSession
@@ -280,7 +292,7 @@ func (c *client) closeAllSessions() {
 	}
 	c.udpMu.Unlock()
 	for _, s := range udpList {
-		c.closeUDPSession(s, "shutdown", nil)
+		c.closeUDPSession(s, reason, nil)
 	}
 }
 

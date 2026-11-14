@@ -149,6 +149,13 @@ type ServerConfig struct {
 	DialTimeout time.Duration
 	// UDPSessionTimeout 是客户端侧 UDP 本地会话空闲清理时间，默认 60s。
 	UDPSessionTimeout time.Duration
+	// Reconnect 表示控制连接断开后是否自动重连，默认 true。
+	//
+	// 注意：默认值只在 Load（ini）路径填充；直接构造 Config 时零值为 false，
+	// 即保持阶段 6C 之前的「断开即退出」旧行为。
+	Reconnect bool
+	// ReconnectMaxBackoff 是自动重连指数退避的上限，默认 60s，必须 > 0。
+	ReconnectMaxBackoff time.Duration
 }
 
 // All 返回主服务（ID 恒为 default，排在最前）与附加服务组成的完整列表。
@@ -199,6 +206,12 @@ type ClientConfig struct {
 	//
 	// 与 [server] udp_session_timeout 对应；第一版曾用包内常量，阶段 4 起可配置。
 	UDPSessionTimeout time.Duration
+	// Reconnect 表示控制连接断开后是否自动重连，默认 true。
+	//
+	// 注意：默认值只在 Load（ini）路径填充；直接构造 Config 时零值为 false。
+	Reconnect bool
+	// ReconnectMaxBackoff 是自动重连指数退避的上限，默认 60s，必须 > 0。
+	ReconnectMaxBackoff time.Duration
 }
 
 // newDefault 返回填好全部默认值的 Config。
@@ -216,16 +229,20 @@ func newDefault() *Config {
 			TokenTTL:          15 * time.Second,
 		},
 		Server: ServerConfig{
-			Heartbeat:         30 * time.Second,
-			DialTimeout:       10 * time.Second,
-			UDPSessionTimeout: 60 * time.Second,
+			Heartbeat:           30 * time.Second,
+			DialTimeout:         10 * time.Second,
+			UDPSessionTimeout:   60 * time.Second,
+			Reconnect:           true,
+			ReconnectMaxBackoff: 60 * time.Second,
 		},
 		Client: ClientConfig{
-			Heartbeat:         30 * time.Second,
-			Subscribe:         true,
-			DialTimeout:       10 * time.Second,
-			PairTimeout:       10 * time.Second,
-			UDPSessionTimeout: 60 * time.Second,
+			Heartbeat:           30 * time.Second,
+			Subscribe:           true,
+			DialTimeout:         10 * time.Second,
+			PairTimeout:         10 * time.Second,
+			UDPSessionTimeout:   60 * time.Second,
+			Reconnect:           true,
+			ReconnectMaxBackoff: 60 * time.Second,
 		},
 	}
 }
@@ -419,6 +436,12 @@ func (b *builder) loadServer() error {
 	if s.UDPSessionTimeout, err = b.duration("server", "udp_session_timeout", s.UDPSessionTimeout); err != nil {
 		return err
 	}
+	if s.Reconnect, err = b.boolean("server", "reconnect", s.Reconnect); err != nil {
+		return err
+	}
+	if s.ReconnectMaxBackoff, err = b.duration("server", "reconnect_max_backoff", s.ReconnectMaxBackoff); err != nil {
+		return err
+	}
 	if s.Protocol == "" && s.Local != "" {
 		s.Protocol = "tcp"
 	}
@@ -472,6 +495,12 @@ func (b *builder) loadClient() error {
 		return err
 	}
 	if c.UDPSessionTimeout, err = b.duration("client", "udp_session_timeout", c.UDPSessionTimeout); err != nil {
+		return err
+	}
+	if c.Reconnect, err = b.boolean("client", "reconnect", c.Reconnect); err != nil {
+		return err
+	}
+	if c.ReconnectMaxBackoff, err = b.duration("client", "reconnect_max_backoff", c.ReconnectMaxBackoff); err != nil {
 		return err
 	}
 

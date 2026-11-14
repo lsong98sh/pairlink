@@ -218,10 +218,15 @@ func TestE2ETLSPlaintextAgentAgainstTLSRelay(t *testing.T) {
 	relayH := startRelay(t, relayCfg)
 
 	// 明文 agent：不配 tls_ca / tls_insecure_skip_verify。
+	//
+	// 阶段 6C 起 agent 默认自动重连，而"对端要求 TLS 但本端是明文"只能表现为
+	// 读 HelloOK 时 EOF（无法与瞬时断链区分），因此本用例固定 reconnect=false，
+	// 继续断言"配置不匹配必须明确失败、进程退出"。
 	agentCfg, _ := writeAgentINI(t, agentSpec{
-		RelayAddr: relayCfg.Relay.TunnelListen,
-		Protocol:  "tcp",
-		Local:     echoAddr,
+		RelayAddr:   relayCfg.Relay.TunnelListen,
+		Protocol:    "tcp",
+		Local:       echoAddr,
+		NoReconnect: true,
 	})
 	agentH := startAgent(t, agentCfg)
 
@@ -266,9 +271,11 @@ func TestE2ETLSPlaintextClientAgainstTLSRelay(t *testing.T) {
 	})
 	agentH := startAgent(t, agentCfg)
 
+	// 明文 client（同 agent 侧理由：这里固定 reconnect=false 以断言明确失败）。
 	clientCfg, _ := writeClientINI(t, clientSpec{
-		RelayAddr: relayCfg.Relay.TunnelListen,
-		Services:  []clientService{{ID: "default", Listen: hostPort(freeTCPPort(t))}},
+		RelayAddr:   relayCfg.Relay.TunnelListen,
+		Services:    []clientService{{ID: "default", Listen: hostPort(freeTCPPort(t))}},
+		NoReconnect: true,
 	})
 	clientH := startClient(t, clientCfg)
 

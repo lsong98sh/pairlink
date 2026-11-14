@@ -261,10 +261,13 @@ func TestServerShutdown(t *testing.T) {
 	tc.logContains(t, "server_shutdown")
 }
 
-// TestControlConnClosedReturnsError 覆盖控制连接意外断开：Run 返回错误。
+// TestControlConnClosedReturnsError 覆盖控制连接意外断开 + reconnect=false（旧行为）：
+// Run 返回错误。reconnect=true 的自愈语义见 reconnect_test.go。
 func TestControlConnClosedReturnsError(t *testing.T) {
 	r := newFakeRelay(t, fakeRelayOptions{revision: 1})
 	cfg := testConfig(r.addr())
+	// 直接构造 Config 时 Reconnect 零值为 false（= 阶段 6C 之前的旧行为）。
+	cfg.Client.Reconnect = false
 	tc := startTestClient(t, cfg)
 
 	r.waitReady(t)

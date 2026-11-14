@@ -15,18 +15,25 @@ import (
 	"github.com/lsong98sh/pairlink/internal/protocol"
 )
 
-// connect 建立控制连接并完成 Hello / ListServices / Subscribe 握手。
+// connectOnce 建立控制连接并完成 Hello / ListServices / Subscribe 握手，返回后
+// 本连接可用于读写控制面。
 //
 // 顺序固定（docs/contract.md §2.5）：HelloOK → ServiceList →（可选）Subscribe。
-// 数据面地址在拿到 HelloOK 的端口后立刻推导，本地监听要等本函数成功返回才启动。
-func (c *client) connect() error {
+// 每次（重）连接都整体刷新协商状态（clientID / udp_mode / 心跳 / 数据面地址），
+// 并用 relay 下发的全量服务列表**强制**重建本地视图基线（relay 重启后 revision
+// 会归零，若沿用「忽略更旧 revision」的规则，视图会永久卡死）。
+func (c *client) connectOnce() error {
 	conn, isTLS, err := c.dialControl()
 	if err != nil {
 		return err
 	}
-	c.ctrl = conn
+	c.setControl(conn)
 	c.ctrlLog.Info("控制连接已建立", "event", "control_connect",
 		"remote", conn.RemoteAddr().String(), "detail", fmt.Sprintf("tls=%t", isTLS))
+
+	// 握手阶段允许 ctx 取消立即打断阻塞读（不必等 dial_timeout）。
+	stopWatch := c.watchCancel(conn)
+	defer stopWatch()
 
 	// 握手阶段用读 deadline 兜底，结束后必须清除（读循环依赖阻塞读 + ctx 取消）。
 	defer func() {
@@ -43,92 +50,143 @@ func (c *client) connect() error {
 		Version:    protocol.ProtocolVersion,
 		ClientName: hostname,
 	}
-	if err := c.writeControl(protocol.MsgHello, hello); err != nil {
+	if err := c.writeControlTo(conn, protocol.MsgHello, hello); err != nil {
+		c.closeControl()
 		return fmt.Errorf("client: 发送 hello: %w", err)
 	}
-	msg, err := c.readControlFrame(timeout)
+	msg, err := c.readControlFrame(conn, timeout)
 	if err != nil {
+		c.closeControl()
 		return fmt.Errorf("client: 读取 hello 应答: %w", err)
 	}
 	helloOK, ok := msg.(*protocol.HelloOK)
 	if !ok {
+		c.closeControl()
 		if e, isErr := msg.(*protocol.Error); isErr {
-			return fmt.Errorf("client: relay 拒绝接入: %w", e)
+			// relay 明确拒绝（auth_failed 等）：重连没有意义。
+			return permanent(fmt.Errorf("client: relay 拒绝接入: %w", e))
 		}
 		return fmt.Errorf("client: 期望 hello_ok，收到 %T", msg)
 	}
 	if err := protocol.CheckVersion(helloOK.Version); err != nil {
-		return fmt.Errorf("client: relay 协议版本不匹配: %w", err)
+		c.closeControl()
+		return permanent(fmt.Errorf("client: relay 协议版本不匹配: %w", err))
 	}
 
-	c.clientID = helloOK.ClientID
-	c.udpMode = c.resolveUDPMode(helloOK.UDPMode, "hello_ok")
-	c.heartbeat = negotiateHeartbeat(c.cfg.Client.Heartbeat, helloOK.HeartbeatSeconds)
-	c.tcpPort = helloOK.TCPDataPort
-	c.udpPort = helloOK.UDPDataPort
-	c.ctrlLog.Info("接入成功", "event", "hello_ok", "client_id", c.clientID,
+	neg := negotiated{
+		clientID:  helloOK.ClientID,
+		udpMode:   c.resolveUDPMode(helloOK.UDPMode, "hello_ok"),
+		heartbeat: negotiateHeartbeat(c.cfg.Client.Heartbeat, helloOK.HeartbeatSeconds),
+		tcpPort:   helloOK.TCPDataPort,
+		udpPort:   helloOK.UDPDataPort,
+	}
+	c.ctrlLog.Info("接入成功", "event", "hello_ok", "client_id", neg.clientID,
 		"detail", fmt.Sprintf("udp_mode=%s tcp_data_port=%d udp_data_port=%d heartbeat=%s",
-			c.udpMode, c.tcpPort, c.udpPort, c.heartbeat))
+			neg.udpMode, neg.tcpPort, neg.udpPort, neg.heartbeat))
 
 	// 2) 服务列表（既是管理页数据，也是本地监听协议的唯一依据）
-	if err := c.writeControl(protocol.MsgListServices, &protocol.ListServices{}); err != nil {
+	if err := c.writeControlTo(conn, protocol.MsgListServices, &protocol.ListServices{}); err != nil {
+		c.closeControl()
 		return fmt.Errorf("client: 发送 list_services: %w", err)
 	}
-	msg, err = c.readControlFrame(timeout)
+	msg, err = c.readControlFrame(conn, timeout)
 	if err != nil {
+		c.closeControl()
 		return fmt.Errorf("client: 读取服务列表: %w", err)
 	}
 	list, ok := msg.(*protocol.ServiceList)
 	if !ok {
+		c.closeControl()
 		if e, isErr := msg.(*protocol.Error); isErr {
-			return fmt.Errorf("client: 拉取服务列表被拒绝: %w", e)
+			return permanent(fmt.Errorf("client: 拉取服务列表被拒绝: %w", e))
 		}
 		return fmt.Errorf("client: 期望 service_list，收到 %T", msg)
 	}
 	if list.UDPMode != "" {
-		c.udpMode = c.resolveUDPMode(list.UDPMode, "service_list")
+		neg.udpMode = c.resolveUDPMode(list.UDPMode, "service_list")
 	}
-	c.applyServiceList(list)
+	c.applyServiceListForce(list, true)
 	c.ctrlLog.Info("服务列表已获取", "event", "service_list",
 		"detail", fmt.Sprintf("services=%d revision=%d udp_mode=%s",
-			len(list.Services), list.Revision, c.udpMode))
+			len(list.Services), list.Revision, neg.udpMode))
 
 	// 3) 数据面拨号地址（§4.5）
 	//
-	// 推导失败不再让 Run 退出（阶段 2 三模式对齐后的约定）：只在握手阶段 WARN，
-	// 等到真正需要数据面时放弃该次配对并关闭本地连接/会话。
-	c.tcpDataAddr, c.tcpDataErr = dataAddr(c.host, c.tcpPort, c.cfg.Relay.TCPListen)
-	if c.tcpDataErr != nil {
+	// 推导失败不再让 Run 退出：只在握手阶段 WARN，等到真正需要数据面时放弃该次
+	// 配对并关闭本地连接/会话。
+	neg.tcpDataAddr, neg.tcpDataErr = dataAddr(c.host, neg.tcpPort, c.cfg.Relay.TCPListen)
+	if neg.tcpDataErr != nil {
 		c.ctrlLog.Warn("无法推导 relay TCP 数据面地址，TCP 接入将在配对阶段失败（Run 继续运行）",
-			"event", "hello_ok", "detail", "tcp_data_addr_unavailable", "err", c.tcpDataErr)
+			"event", "hello_ok", "detail", "tcp_data_addr_unavailable", "err", neg.tcpDataErr)
 	}
-	if c.udpMode == protocol.UDPModeNative {
-		addr, addrErr := dataAddr(c.host, c.udpPort, c.cfg.Relay.UDPListen)
+	if neg.udpMode == protocol.UDPModeNative {
+		addr, addrErr := dataAddr(c.host, neg.udpPort, c.cfg.Relay.UDPListen)
 		if addrErr != nil {
-			c.udpDataErr = addrErr
+			neg.udpDataErr = addrErr
 		} else {
-			c.udpDataAddr = addr
+			neg.udpDataAddr = addr
 			udpAddr, resolveErr := net.ResolveUDPAddr("udp", addr)
 			if resolveErr != nil {
-				c.udpDataErr = fmt.Errorf("client: 解析 UDP 数据面地址 %s: %w", addr, resolveErr)
+				neg.udpDataErr = fmt.Errorf("client: 解析 UDP 数据面地址 %s: %w", addr, resolveErr)
 			} else {
-				c.udpDataUDPAddr = udpAddr
+				neg.udpDataUDPAddr = udpAddr
 			}
 		}
-		if c.udpDataErr != nil {
+		if neg.udpDataErr != nil {
 			c.ctrlLog.Warn("无法推导 relay 原生 UDP 数据面地址，UDP 接入将在配对阶段失败（Run 继续运行）",
-				"event", "hello_ok", "detail", "udp_data_addr_unavailable", "err", c.udpDataErr)
+				"event", "hello_ok", "detail", "udp_data_addr_unavailable", "err", neg.udpDataErr)
 		}
 	}
+	c.setNegotiated(neg)
 
-	// 4) 订阅（可选）
+	// 4) 订阅（可选）：重连后必须重新订阅，否则不再收到服务变更推送。
 	if c.cfg.Client.Subscribe {
-		if err := c.writeControl(protocol.MsgSubscribe, &protocol.Subscribe{Enable: true}); err != nil {
+		if err := c.writeControlTo(conn, protocol.MsgSubscribe, &protocol.Subscribe{Enable: true}); err != nil {
+			c.closeControl()
 			return fmt.Errorf("client: 发送 subscribe: %w", err)
 		}
 		c.ctrlLog.Info("已订阅服务列表变更", "event", "subscribe")
 	}
 	return nil
+}
+
+// setNegotiated 发布本次连接的协商状态快照。
+func (c *client) setNegotiated(n negotiated) {
+	c.negMu.Lock()
+	c.negState = n
+	c.negMu.Unlock()
+}
+
+// negotiated 返回当前协商状态快照（未连接时为零值）。
+func (c *client) negotiated() negotiated {
+	c.negMu.RLock()
+	defer c.negMu.RUnlock()
+	return c.negState
+}
+
+// setControl 发布当前控制连接。
+func (c *client) setControl(conn net.Conn) {
+	c.ctrlMu.Lock()
+	c.ctrl = conn
+	c.ctrlMu.Unlock()
+}
+
+// controlConn 返回当前控制连接（nil 表示未连接/重连等待中）。
+func (c *client) controlConn() net.Conn {
+	c.ctrlMu.Lock()
+	defer c.ctrlMu.Unlock()
+	return c.ctrl
+}
+
+// closeControl 关闭并清空当前控制连接（幂等）。
+func (c *client) closeControl() {
+	c.ctrlMu.Lock()
+	conn := c.ctrl
+	c.ctrl = nil
+	c.ctrlMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // dialControl 建立到 relay 隧道端口的连接，返回连接与是否使用了 TLS。
@@ -178,11 +236,11 @@ func (c *client) tlsConfig() (*tls.Config, error) {
 	if ca := strings.TrimSpace(c.cfg.Client.TLSCA); ca != "" {
 		pem, err := os.ReadFile(ca)
 		if err != nil {
-			return nil, fmt.Errorf("client: 读取 tls_ca %q: %w", ca, err)
+			return nil, permanent(fmt.Errorf("client: 读取 tls_ca %q: %w", ca, err))
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("client: tls_ca %q 中没有可用证书", ca)
+			return nil, permanent(fmt.Errorf("client: tls_ca %q 中没有可用证书", ca))
 		}
 		// 只信任该 CA（不使用系统根）。
 		cfg.RootCAs = pool
@@ -201,17 +259,34 @@ func (c *client) dialTLS(dialer *net.Dialer, tlsCfg *tls.Config) (net.Conn, erro
 	defer cancel()
 	if err := tlsConn.HandshakeContext(hctx); err != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("client: TLS 握手失败（relay 可能未启用 TLS，或本端 tls_ca 与 relay 证书不匹配）: %w", err)
+		// TLS 握手失败几乎总是配置不匹配（relay 没开 TLS / CA 不对），重连无意义。
+		return nil, permanent(fmt.Errorf(
+			"client: TLS 握手失败（relay 可能未启用 TLS，或本端 tls_ca 与 relay 证书不匹配）: %w", err))
 	}
 	return tlsConn, nil
 }
 
-// writeControl 串行写一帧控制面消息（带写超时，避免对端不读导致永久阻塞）。
+// writeControl 向当前控制连接串行写一帧（带写超时，避免对端不读导致永久阻塞）。
 func (c *client) writeControl(typ protocol.MessageType, payload any) error {
+	conn := c.controlConn()
+	if conn == nil {
+		return errControlClosed
+	}
+	return c.writeControlTo(conn, typ, payload)
+}
+
+// writeControlTo 向指定控制连接串行写一帧。
+//
+// 串行化使用 ctrlMu：同一条连接上的帧必须串行写；不同连接（重连前后）不会并发写，
+// 因为旧连接的心跳在重连前已停止。
+func (c *client) writeControlTo(conn net.Conn, typ protocol.MessageType, payload any) error {
+	if conn == nil {
+		return errControlClosed
+	}
 	c.ctrlMu.Lock()
 	defer c.ctrlMu.Unlock()
-	conn := c.ctrl
-	if conn == nil {
+	if c.ctrl != conn {
+		// 连接已被替换/关闭：拒绝写到旧连接上。
 		return errControlClosed
 	}
 	if d := c.dialTimeout(); d > 0 {
@@ -224,14 +299,14 @@ func (c *client) writeControl(typ protocol.MessageType, payload any) error {
 	return err
 }
 
-// readControlFrame 在握手阶段按 deadline 读取一帧并解码。
-func (c *client) readControlFrame(d time.Duration) (any, error) {
+// readControlFrame 在握手阶段按 deadline 从指定连接读取一帧并解码。
+func (c *client) readControlFrame(conn net.Conn, d time.Duration) (any, error) {
 	if d > 0 {
-		_ = c.ctrl.SetReadDeadline(time.Now().Add(d))
+		_ = conn.SetReadDeadline(time.Now().Add(d))
 	} else {
-		_ = c.ctrl.SetReadDeadline(time.Time{})
+		_ = conn.SetReadDeadline(time.Time{})
 	}
-	typ, payload, err := protocol.ReadFrame(c.ctrl)
+	typ, payload, err := protocol.ReadFrame(conn)
 	if err != nil {
 		return nil, err
 	}
@@ -239,16 +314,18 @@ func (c *client) readControlFrame(d time.Duration) (any, error) {
 }
 
 // controlLoop 是控制面读循环：唯一读控制连接的 goroutine，按消息类型分发。
-func (c *client) controlLoop() {
+//
+// 返回 nil 表示 relay 停机（MsgServerShutdown）或本端主动关闭；返回 errKicked
+// （包装后）表示被踢出；其它错误代表连接断开，由 supervise 决定是否重连。
+func (c *client) controlLoop(conn net.Conn) error {
 	for {
-		typ, payload, err := protocol.ReadFrame(c.ctrl)
+		typ, payload, err := protocol.ReadFrame(conn)
 		if err != nil {
-			if c.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return
+			if c.ctx.Err() != nil || errors.Is(err, net.ErrClosed) || c.controlConn() != conn {
+				return nil
 			}
-			c.ctrlLog.Warn("控制连接已断开，client 退出（不自动重连）", "event", "control_close", "err", err)
-			c.stopSig.trigger(fmt.Errorf("client: 控制连接断开: %w", err))
-			return
+			c.ctrlLog.Warn("控制连接已断开", "event", "control_close", "err", err)
+			return fmt.Errorf("client: 控制连接断开: %w", err)
 		}
 		msg, err := protocol.Decode(typ, payload)
 		if err != nil {
@@ -275,15 +352,13 @@ func (c *client) controlLoop() {
 				"detail", fmt.Sprintf("before=%d after=%d revision=%d udp_mode=%s",
 					len(before), len(m.Services), m.Revision, m.UDPMode))
 		case *protocol.Kicked:
-			c.ctrlLog.Warn("被 relay 踢出，client 退出", "event", "kicked", "detail", m.Reason)
-			c.stopSig.trigger(fmt.Errorf("%w: %s", errKicked, m.Reason))
-			return
+			c.ctrlLog.Warn("被 relay 踢出，client 退出（不重连）", "event", "kicked", "detail", m.Reason)
+			return fmt.Errorf("%w: %s", errKicked, m.Reason)
 		case *protocol.ServerShutdown:
 			c.ctrlLog.Info("relay 即将停机，client 退出", "event", "server_shutdown", "detail", m.Reason)
-			c.stopSig.trigger(nil)
-			return
+			return nil
 		case *protocol.Heartbeat:
-			if err := c.writeControl(protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil && c.ctx.Err() == nil {
+			if err := c.writeControlTo(conn, protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil && c.ctx.Err() == nil {
 				c.ctrlLog.Debug("回复心跳失败", "event", "heartbeat", "err", err)
 			}
 		case *protocol.HeartbeatAck:
@@ -296,20 +371,23 @@ func (c *client) controlLoop() {
 	}
 }
 
-// heartbeatLoop 按协商后的间隔发送 MsgHeartbeat。
-func (c *client) heartbeatLoop() {
-	if c.heartbeat <= 0 {
+// heartbeatLoop 在给定控制连接上按协商间隔发送 MsgHeartbeat，ctx 取消即退出。
+//
+// 心跳与连接同生命周期：重连后由 serveControl 为新连接重建心跳。
+func (c *client) heartbeatLoop(ctx context.Context, conn net.Conn) {
+	interval := c.negotiated().heartbeat
+	if interval <= 0 {
 		return
 	}
-	t := time.NewTicker(c.heartbeat)
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := c.writeControl(protocol.MsgHeartbeat, &protocol.Heartbeat{}); err != nil {
-				if c.ctx.Err() != nil {
+			if err := c.writeControlTo(conn, protocol.MsgHeartbeat, &protocol.Heartbeat{}); err != nil {
+				if c.ctx.Err() != nil || ctx.Err() != nil {
 					return
 				}
 				c.ctrlLog.Warn("发送心跳失败", "event", "heartbeat", "err", err)

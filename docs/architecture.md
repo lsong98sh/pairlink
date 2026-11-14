@@ -29,7 +29,7 @@
 | `internal/relay` | 阶段2（独占） | relay 全部实现 |
 | `internal/agent` | 阶段2（独占） | agent 全部实现 |
 | `internal/client` | 阶段2（独占） | client 全部实现 |
-| `internal/version` | 阶段4（新增） | 唯一版本号常量（`Version = "v0.1.0"`），main 与三模式管理页共用 |
+| `internal/version` | 阶段4（新增） | 唯一版本号常量（`Version = "v0.2.0"`），main 与三模式管理页共用 |
 | `docs/`、`README.md` | 阶段1（冻结，阶段3 追加验证结果） | 规范与使用说明 |
 
 依赖方向（箭头表示 import）：
@@ -240,14 +240,15 @@ type carrierSession struct {
 }
 type carrier struct {
     conn     net.Conn
-    writeMu  sync.Mutex      // 同一连接的帧写串行化
+    out      *tunnelqueue.Queue // 阶段 6C：单 writer goroutine + 有界发送队列
 }
 // session -> carrierSession、carrier -> 该连接上的 session 集合
 ```
 
-- 每 accept 一条 `carrier=udp-over-tcp` 的 TCP 连接，起一个读循环 goroutine；
+- 每 accept 一条 `carrier=udp-over-tcp` 的 TCP 连接，起一个读循环 goroutine + 一个 writer goroutine；
 - 每收到一帧：`session` 为空 → 控制帧（`MsgError`/`MsgBindOK`）；非空 → 查会话表转发；
-- 写对端承载连接必须加 `writeMu`（或用单写 goroutine），避免帧交错；
+- 写对端承载连接**只入队**（`internal/tunnelqueue`）：读循环绝不因慢对端阻塞；整帧单次
+  `Write`；控制帧走独立优先队列；队列满时丢弃并计数（`event=tunnel_drop`，限速 WARN）；
 - 承载连接断开时删除其上所有会话登记，对端数据帧因查不到会话被丢弃；
 - 会话半开超时用 `pair_timeout`，完整会话空闲用 `udp_session_timeout`。
 
@@ -261,10 +262,11 @@ type carrier struct {
 | 待配对清理 | 1 个 ticker（进程级） | ctx 取消 | 停止 ticker，`Sweep` 收尾 |
 | 令牌清理 | 1 个 ticker（进程级，建议 1s） | ctx 取消 | 停止 ticker |
 | UDP 数据面（原生） | 1 个读循环 + 1 个清理 ticker | ctx 取消 / 监听关闭 | 停止循环，`UDPTable.Sweep` |
-| UDP over TCP 承载 | 每连接 1 个读循环 | 连接关闭 / 帧非法 / ctx 取消 | 删除该连接全部会话登记 |
+| UDP over TCP 承载 | 每连接 1 个读循环 + 1 个 writer（`tunnelqueue`） | 连接关闭 / 帧非法 / ctx 取消 / 队列关闭 | `Queue.Close()` 先停止入队、排空（上限 2s）后关连接；删除该连接全部会话登记 |
 | UDP over TCP 会话 | 不单独起 goroutine（仅表项） | 半开 `pair_timeout` / 空闲 `udp_session_timeout` | 删除表项、通知对端（可选） |
 | 管理页 | `net/http` 内部 goroutine | `admin.Server.Shutdown` | `ctx` 取消即 Shutdown（框架已实现） |
-| agent/client 心跳 | 1 个 ticker | ctx 取消 | 停止 ticker |
+| agent/client 心跳 | 每条控制连接 1 个 ticker（重连即重建） | 该连接结束 / ctx 取消 | `serveControl` 等它退出后再换连接（不泄漏） |
+| agent/client 重连监督 | 1 个（`Run` 所在 goroutine） | ctx 取消 / 踢出 / 永久错误 | 退避等待可被 ctx 取消；返回即 `Run` 返回 |
 | agent 本地 UDP | 每会话 1 个读循环 | 本端/对端关闭 / 空闲超时 | 删除本地会话表项、关闭 socket |
 
 硬性规则：
@@ -369,6 +371,19 @@ type carrier struct {
 - 阶段 2 的 relay 在启动时派生模式：
   `if cfg.Relay.UDPListen != "" → native else tcp_tunnel`。
 - `UDPTable` 只用于 `native`；`tcp_tunnel` 的会话表由 relay 自己维护（见 §4.6）。
+
+### 7.8 运行期健壮性（阶段 6C）
+
+| 机制 | 位置 | 要点 |
+| --- | --- | --- |
+| 控制连接自动重连 | `internal/agent/reconnect.go`、`internal/client/reconnect.go`、`internal/reconnect` | `[server]/[client] reconnect`（默认 true）；base 1s ×2、cap `reconnect_max_backoff`（默认 60s）、±20% 抖动；等待可被 ctx 取消；重连后重新 Hello + 重注册/重拉列表 + 重建心跳；重连期间关闭在途会话（`reason=reconnect`），不做迁移；踢出/停机/鉴权失败/版本不匹配/TLS 握手失败不重连 |
+| 订阅 proto 热切换 | `internal/client/listener.go` | 关旧监听 → 原地址按新协议重开；失败则回滚旧协议（本地服务不消失）；在途连接不受影响；`service_missing` 的 TCP 占位在服务出现后被热切换纠正 |
+| 承载连接发送队列 | `internal/tunnelqueue` | 单 writer goroutine + 有界队列（数据 1024 帧 / 8 MiB，控制 256 帧且优先）；读循环只入队；整帧单次 Write；入队即复制 payload；满则丢弃并限速 WARN（`event=tunnel_drop`）；关闭时先停止入队再排空（上限 2s）后关连接 |
+| 原生 UDP 报到重传 | `internal/agent/data.go`、`internal/client/session_udp.go`、`internal/relay/udp_data.go` | 每 ~300ms 重发 Bind（最多 3 次）；relay 半开幂等重复回 BindOK；Full 后丢弃同一配对键的重复 Bind 帧（帧头嗅探，其余数据报不解析） |
+
+重连的退出语义：只有 ctx 取消（返回 nil）、`MsgServerShutdown`（nil）、`MsgKicked` /
+鉴权失败 / 版本不匹配 / TLS 握手失败 / `reconnect=false` 下的断开（返回错误）会结束 `Run`；
+其余断开都进入退避重连，进程保持存活。
 
 ## 8. 可观测性
 

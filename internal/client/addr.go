@@ -35,16 +35,17 @@ func dataAddr(host string, port int, fallbackListen string) (string, error) {
 
 // dialTCPData 连接 relay 的 TCP 数据面（明文哑管道，永远不包 TLS）。
 func (c *client) dialTCPData() (net.Conn, error) {
-	if c.tcpDataErr != nil {
-		return nil, c.tcpDataErr
+	neg := c.negotiated()
+	if neg.tcpDataErr != nil {
+		return nil, neg.tcpDataErr
 	}
-	if c.tcpDataAddr == "" {
+	if neg.tcpDataAddr == "" {
 		return nil, errors.New("client: TCP 数据面地址未解析")
 	}
 	d := &net.Dialer{Timeout: c.dialTimeout()}
-	conn, err := d.DialContext(c.ctx, "tcp", c.tcpDataAddr)
+	conn, err := d.DialContext(c.ctx, "tcp", neg.tcpDataAddr)
 	if err != nil {
-		return nil, fmt.Errorf("client: 连接 relay TCP 数据面 %s: %w", c.tcpDataAddr, err)
+		return nil, fmt.Errorf("client: 连接 relay TCP 数据面 %s: %w", neg.tcpDataAddr, err)
 	}
 	return conn, nil
 }

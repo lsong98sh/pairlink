@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +49,8 @@ type relayOptions struct {
 	enableTCPData bool
 	// enableUDPData 为 true 时监听原生 UDP 数据面。
 	enableUDPData bool
+	// dropBindOK 为 N 时，原生 UDP 数据面前 N 个 Bind 不回应 BindOK（模拟丢包）。
+	dropBindOK int
 }
 
 // tunnelBind 是承载连接上收到的 MsgBind（首帧或会话帧）。
@@ -108,6 +111,13 @@ type fakeRelay struct {
 	udpBinds chan udpBind
 	// udpData 记录原生 UDP 数据报（agent 写回的数据）。
 	udpData chan []byte
+
+	// tunnels 统计接受过的隧道（控制面）连接数（重连测试用）。
+	tunnels atomic.Int32
+	// heartbeats 统计收到的 MsgHeartbeat 数量（重连后心跳重建用）。
+	heartbeats atomic.Int32
+	// dropBindOK 剩余需要丢弃的 BindOK 数量（模拟丢包）。
+	dropBindOK atomic.Int32
 }
 
 // newFakeRelay 启动一个假 relay 并注册清理函数。
@@ -126,6 +136,7 @@ func newFakeRelay(t *testing.T, opts relayOptions) *fakeRelay {
 		udpBinds:      make(chan udpBind, 16),
 		udpData:       make(chan []byte, 32),
 	}
+	f.dropBindOK.Store(int32(opts.dropBindOK))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -338,10 +349,14 @@ func (f *fakeRelay) serveTunnel() {
 		if err != nil {
 			return
 		}
+		f.tunnels.Add(1)
 		f.track(conn)
 		go f.handleTunnel(conn)
 	}
 }
+
+// tunnelConns 返回已接受的隧道（控制面）连接总数。
+func (f *fakeRelay) tunnelConns() int { return int(f.tunnels.Load()) }
 
 // handleTunnel 处理一条隧道（控制面）连接。
 func (f *fakeRelay) handleTunnel(conn net.Conn) {
@@ -409,6 +424,7 @@ func (f *fakeRelay) handleTunnel(conn net.Conn) {
 			default:
 			}
 		case protocol.MsgHeartbeat:
+			f.heartbeats.Add(1)
 			_ = protocol.WriteFrame(conn, protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{})
 		}
 	}
@@ -538,6 +554,10 @@ func (f *fakeRelay) serveUDPData() {
 					case f.udpBinds <- udpBind{Bind: bind, From: from}:
 					default:
 					}
+					if f.dropBindOK.Add(-1) >= 0 {
+						// 模拟 BindOK 丢包：不回应，等 agent 重发。
+						continue
+					}
 					okFrame, eerr := protocol.EncodeFrame(protocol.MsgBindOK, &protocol.BindOK{PairingKey: bind.PairingKey})
 					if eerr == nil {
 						_, _ = f.udpConn.WriteToUDP(okFrame, from)
@@ -657,10 +677,14 @@ func startAgent(t *testing.T, cfg *config.Config) *agentRun {
 }
 
 // startAgentWithLogger 用指定 logger 在后台启动 agent.Run。
+//
+// 重连退避的基准等待被缩短到 10ms（默认 1s），让重连相关用例快速收敛；
+// 不启用重连的用例不受影响。
 func startAgentWithLogger(t *testing.T, cfg *config.Config, log *slog.Logger) *agentRun {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	a := newAgent(ctx, cfg, log)
+	a.reconnectBase = 10 * time.Millisecond
 	r := &agentRun{
 		a:      a,
 		cancel: cancel,

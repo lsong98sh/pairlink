@@ -1,0 +1,58 @@
+# PairLink client（访问侧）systemd unit。
+#
+# 安装：
+#   sudo install -m 0644 pairlink-client.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pairlink-client
+#
+# 注意：client 会在本机监听配置中的 service.<ID> 端口（示例为 127.0.0.1:18080+），
+# 这些端口只对本机开放；需要同网段访问时显式改监听地址并自行评估风险。
+# 不要加 -service（-service 只用于 Windows SCM）。
+[Unit]
+Description=PairLink client
+Documentation=https://github.com/lsong98sh/pairlink
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# 可选：以非 root 用户运行（推荐），启用方式见 pairlink-relay.service 顶部注释。
+# 若把 service.<ID> 监听到 1024 以下端口，需要保留 CAP_NET_BIND_SERVICE。
+#User=pairlink
+#Group=pairlink
+ExecStart=/usr/local/bin/pairlink -client -config /etc/pairlink/client.ini
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+LimitNOFILE=65535
+UMask=0077
+# 不要在 Environment= 中放 token；统一放 ini。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pairlink-client
+
+# ---- 适度加固 ----
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

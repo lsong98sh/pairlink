@@ -1,0 +1,89 @@
+# PairLink 单机演示编排：relay + agent（转发 demo-http）+ client。
+#
+# 用法（在 deploy/ 目录）：
+#   docker compose up -d
+#   curl http://127.0.0.1:18080/          # 经 client 访问 agent 背后的 nginx
+#   curl http://127.0.0.1:17090/          # relay 管理页
+#   docker compose logs -f relay agent client
+#   docker compose down
+#
+# 说明：
+#   - 三个 PairLink 容器共用一个镜像（anchor x-pairlink），只读根文件系统、
+#     丢弃全部 Linux capabilities，以 distroless 的 nonroot（uid 65532）运行。
+#   - 配置从 examples/docker/*.ini 只读挂载；容器内 manage_listen 必须绑 0.0.0.0，
+#     再用下面的 "127.0.0.1:宿主端口:容器端口" 把管理页限制为仅本机访问。
+#   - 只发布演示必需端口：三个管理页 + client 的 18080。
+#     要让宿主机外的 agent/client 接入 relay，再放开 17000/17001/17002。
+#   - 镜像未在本仓库开发机验证（无 Docker/Podman），详见 deploy/README.md。
+
+name: pairlink
+
+x-pairlink: &pairlink
+  image: pairlink:v0.2.0
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  read_only: true
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  restart: unless-stopped
+  stop_grace_period: 15s
+
+services:
+  relay:
+    <<: *pairlink
+    container_name: pairlink-relay
+    command: ['-relay', '-config', '/etc/pairlink/relay.ini']
+    volumes:
+      - ../examples/docker/relay.ini:/etc/pairlink/relay.ini:ro
+      # 生产启用 TLS 时挂载证书，并确保容器用户 uid 65532 可读（建议 0644）：
+      # - ../certs:/etc/pairlink/tls:ro
+    ports:
+      # 管理页：宿主机仅 127.0.0.1 可访问（容器内监听 0.0.0.0）。
+      - '127.0.0.1:17090:17090'
+      # 需要让容器外的 agent/client 接入时再放开：
+      # - '17000:17000'      # 隧道（控制面）
+      # - '17001:17001'      # TCP 数据面
+      # - '17002:17002/udp'  # 原生 UDP 数据面（可选）
+
+  demo-http:
+    image: nginx:1.27-alpine
+    container_name: pairlink-demo-http
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+      - /var/cache/nginx
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  agent:
+    <<: *pairlink
+    container_name: pairlink-agent
+    command: ['-agent', '-config', '/etc/pairlink/agent.ini']
+    volumes:
+      - ../examples/docker/agent.ini:/etc/pairlink/agent.ini:ro
+    ports:
+      - '127.0.0.1:17091:17091'
+    depends_on:
+      - relay
+      - demo-http
+
+  client:
+    <<: *pairlink
+    container_name: pairlink-client
+    command: ['-client', '-config', '/etc/pairlink/client.ini']
+    volumes:
+      - ../examples/docker/client.ini:/etc/pairlink/client.ini:ro
+    ports:
+      # 管理页
+      - '127.0.0.1:17092:17092'
+      # 第三方客户端访问入口：curl http://127.0.0.1:18080/
+      - '127.0.0.1:18080:18080'
+    depends_on:
+      - relay
+      - agent

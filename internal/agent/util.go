@@ -71,7 +71,8 @@ func (a *agent) dialRelay(tcfg *tls.Config) (net.Conn, error) {
 	}
 	if err := tconn.HandshakeContext(a.ctx); err != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("TLS 握手: %w", err)
+		// TLS 握手失败几乎总是配置不匹配（relay 没开 TLS / CA 不对），重连无意义。
+		return nil, permanent(fmt.Errorf("TLS 握手: %w", err))
 	}
 	if err := tconn.SetDeadline(time.Time{}); err != nil {
 		_ = tconn.Close()

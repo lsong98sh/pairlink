@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -69,26 +70,28 @@ func (c *controlConn) remoteAddr() string {
 	return ""
 }
 
-// handshake 发送 MsgHello 并处理 MsgHelloOK。
-func (a *agent) handshake() error {
+// handshake 在给定控制连接上发送 MsgHello 并处理 MsgHelloOK。
+//
+// relay 明确拒绝（MsgError）与版本不兼容属于不可重试错误，返回 permanentErr。
+func (a *agent) handshake(ctrl *controlConn) error {
 	hello := &protocol.Hello{
 		Role:       protocol.RoleAgent,
 		Token:      a.cfg.Server.Token,
 		Version:    protocol.ProtocolVersion,
 		ClientName: hostname(),
 	}
-	if err := a.ctrl.write(protocol.MsgHello, hello); err != nil {
+	if err := ctrl.write(protocol.MsgHello, hello); err != nil {
 		return fmt.Errorf("agent: 发送 MsgHello: %w", err)
 	}
 	timeout := a.dialTimeout()
-	typ, payload, err := a.ctrl.readFrame(timeout)
+	typ, payload, err := ctrl.readFrame(timeout)
 	if err != nil {
 		return fmt.Errorf("agent: 等待 MsgHelloOK: %w", err)
 	}
 	switch typ {
 	case protocol.MsgHelloOK:
 	case protocol.MsgError:
-		return fmt.Errorf("agent: relay 拒绝接入: %s", protocolErrText(payload))
+		return permanent(fmt.Errorf("agent: relay 拒绝接入: %s", protocolErrText(payload)))
 	default:
 		return fmt.Errorf("agent: 期望 MsgHelloOK，收到 %s", typ)
 	}
@@ -102,7 +105,7 @@ func (a *agent) handshake() error {
 		return fmt.Errorf("agent: MsgHelloOK 负载类型异常 %T", decoded)
 	}
 	if err := protocol.CheckVersion(ok.Version); err != nil {
-		return fmt.Errorf("agent: relay 协议版本不兼容: %w", err)
+		return permanent(fmt.Errorf("agent: relay 协议版本不兼容: %w", err))
 	}
 
 	mode := normalizeUDPMode(ok.UDPMode, a.log, "hello_ok")
@@ -126,7 +129,11 @@ func (a *agent) handshake() error {
 }
 
 // registerServices 依次注册 cfg.Server.All() 的全部服务。
-func (a *agent) registerServices() error {
+//
+// 每次（重）连接都要重新注册：relay 在旧控制连接断开时会注销该 agent 的全部服务，
+// 重连后必须重建注册表，否则服务列表里看不到本机服务。
+func (a *agent) registerServices(ctrl *controlConn) error {
+	a.resetRegisteredServices()
 	timeout := a.dialTimeout()
 	for _, svc := range a.cfg.Server.All() {
 		req := &protocol.RegisterService{
@@ -134,10 +141,10 @@ func (a *agent) registerServices() error {
 			Proto:     svc.Proto,
 			LocalHint: svc.Addr,
 		}
-		if err := a.ctrl.write(protocol.MsgRegisterService, req); err != nil {
+		if err := ctrl.write(protocol.MsgRegisterService, req); err != nil {
 			return fmt.Errorf("agent: 注册服务 %s: %w", svc.ID, err)
 		}
-		mode, err := a.awaitRegistered(svc, timeout)
+		mode, err := a.awaitRegistered(ctrl, svc, timeout)
 		if err != nil {
 			return err
 		}
@@ -157,9 +164,10 @@ func (a *agent) registerServices() error {
 // awaitRegistered 等待指定服务的 MsgServiceRegistered，返回响应里的 udp_mode。
 //
 // 期间收到的其它控制面消息（如心跳）按协议处理而不是报错。
-func (a *agent) awaitRegistered(svc config.ServerService, timeout time.Duration) (string, error) {
+// relay 明确拒绝（MsgError）不可重试，返回 permanentErr。
+func (a *agent) awaitRegistered(ctrl *controlConn, svc config.ServerService, timeout time.Duration) (string, error) {
 	for {
-		typ, payload, err := a.ctrl.readFrame(timeout)
+		typ, payload, err := ctrl.readFrame(timeout)
 		if err != nil {
 			return "", fmt.Errorf("agent: 等待服务 %s 的注册确认: %w", svc.ID, err)
 		}
@@ -182,9 +190,9 @@ func (a *agent) awaitRegistered(svc config.ServerService, timeout time.Duration)
 			}
 			return normalizeUDPMode(reg.UDPMode, a.log, "service_registered"), nil
 		case protocol.MsgError:
-			return "", fmt.Errorf("agent: relay 拒绝注册服务 %s: %s", svc.ID, protocolErrText(payload))
+			return "", permanent(fmt.Errorf("agent: relay 拒绝注册服务 %s: %s", svc.ID, protocolErrText(payload)))
 		case protocol.MsgHeartbeat:
-			if err := a.ctrl.write(protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil {
+			if err := ctrl.write(protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil {
 				return "", fmt.Errorf("agent: 回复心跳: %w", err)
 			}
 		default:
@@ -198,7 +206,11 @@ func (a *agent) awaitRegistered(svc config.ServerService, timeout time.Duration)
 // TCP 数据面始终推导；UDP 数据面只在 udp_mode=native 时推导（tcp_tunnel 复用
 // TCP 数据面）。端口优先取 HelloOK 下发的值，旧 relay 未下发时回退本 ini 的
 // [relay] 段；仍取不到只告警（该协议的配对会被放弃），不影响 Run 继续服务其它服务。
+//
+// 每次（重）连接都重新推导：relay 重启后端口可能变化，旧地址不能沿用。
 func (a *agent) resolveDataAddrs() {
+	var tcpAddr, udpAddr string
+
 	tcpPort := a.tcpDataPortSnapshot()
 	if tcpPort <= 0 {
 		tcpPort = listenPort(a.cfg.Relay.TCPListen)
@@ -207,11 +219,11 @@ func (a *agent) resolveDataAddrs() {
 		a.log.Warn("无法推导 TCP 数据面地址，TCP 服务配对将被放弃", "event", "data_addr",
 			"detail", "tcp_data_port/relay.tcp_listen 均不可用", "err", err)
 	} else {
-		a.tcpDataAddr = addr
+		tcpAddr = addr
 	}
 
 	// 只有 native 模式才需要推导原生 UDP 数据面地址；tcp_tunnel 复用
-	// tcpDataAddr，不应因为 relay 未下发 udp_data_port 而告警。
+	// tcpAddr，不应因为 relay 未下发 udp_data_port 而告警。
 	mode := a.udpModeSnapshot()
 	if mode == protocol.UDPModeNative {
 		udpPort := a.udpDataPortSnapshot()
@@ -222,24 +234,27 @@ func (a *agent) resolveDataAddrs() {
 			a.log.Warn("无法推导 UDP 数据面地址，原生 UDP 配对将被放弃", "event", "data_addr",
 				"detail", "udp_data_port/relay.udp_listen 均不可用", "err", err)
 		} else {
-			a.udpDataAddr = addr
+			udpAddr = addr
 		}
 	}
 
-	if mode == protocol.UDPModeTCPTunnel && a.tcpDataAddr == "" {
+	a.setDataAddrs(tcpAddr, udpAddr)
+
+	if mode == protocol.UDPModeTCPTunnel && tcpAddr == "" {
 		a.log.Warn("udp_mode=tcp_tunnel 但 TCP 数据面地址不可用，UDP 服务无法建立数据面", "event", "data_addr")
 	}
 }
 
 // controlLoop 是控制面唯一的读循环；返回即代表控制面终止。
 //
-// MsgIncoming 必须转交独立 goroutine，绝不阻塞读循环。
-func (a *agent) controlLoop() error {
+// MsgIncoming 必须转交独立 goroutine，绝不阻塞读循环。返回 nil 表示收到
+// MsgServerShutdown，返回 errKicked（包装后）表示被踢出。
+func (a *agent) controlLoop(ctrl *controlConn) error {
 	for {
-		typ, payload, err := protocol.ReadFrame(a.ctrl.conn)
+		typ, payload, err := protocol.ReadFrame(ctrl.conn)
 		if err != nil {
-			// 只有「我们自己关停」才算正常结束；对端关闭连接属于运行中不可恢复错误。
-			if a.ctx.Err() != nil {
+			// 只有「我们自己关停」才算正常结束；对端关闭连接属于运行中可恢复错误。
+			if a.ctx.Err() != nil || a.controlConn() != ctrl {
 				return nil
 			}
 			return fmt.Errorf("agent: 控制连接已断开: %w", err)
@@ -262,7 +277,7 @@ func (a *agent) controlLoop() error {
 				a.handleIncoming(msg)
 			}()
 		case protocol.MsgHeartbeat:
-			if err := a.ctrl.write(protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil {
+			if err := ctrl.write(protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil {
 				a.log.Warn("回复 relay 心跳失败", "event", "heartbeat", "err", err)
 			}
 		case protocol.MsgHeartbeatAck:
@@ -274,7 +289,7 @@ func (a *agent) controlLoop() error {
 		case protocol.MsgKicked:
 			reason := decodeReason(protocol.MsgKicked, payload)
 			a.log.Warn("已被 relay 踢出，不自动重连", "event", "kicked", "detail", reason)
-			return fmt.Errorf("agent: 已被 relay 踢出（%s）", reason)
+			return fmt.Errorf("%w（%s）", errKicked, reason)
 		case protocol.MsgServerShutdown:
 			reason := decodeReason(protocol.MsgServerShutdown, payload)
 			a.log.Info("relay 即将停机，agent 主动退出", "event", "server_shutdown", "detail", reason)
@@ -285,17 +300,19 @@ func (a *agent) controlLoop() error {
 	}
 }
 
-// heartbeatLoop 周期性发送 MsgHeartbeat。
-func (a *agent) heartbeatLoop() {
-	interval := positiveDuration(a.heartbeat, defaultHeartbeat)
+// heartbeatLoop 在给定控制连接上周期性发送 MsgHeartbeat，ctx 取消即退出。
+//
+// 心跳与连接同生命周期：重连后由 serveControl 为新连接重建心跳。
+func (a *agent) heartbeatLoop(ctx context.Context, ctrl *controlConn) {
+	interval := positiveDuration(a.heartbeatSnapshot(), defaultHeartbeat)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-a.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := a.ctrl.write(protocol.MsgHeartbeat, &protocol.Heartbeat{}); err != nil {
+			if err := ctrl.write(protocol.MsgHeartbeat, &protocol.Heartbeat{}); err != nil {
 				a.log.Warn("发送心跳失败", "event", "heartbeat", "err", err)
 				continue
 			}
@@ -304,13 +321,15 @@ func (a *agent) heartbeatLoop() {
 	}
 }
 
-// startBackground 启动心跳与本地 UDP 会话清理 ticker。
+// heartbeatSnapshot 返回协商后的心跳间隔。
+func (a *agent) heartbeatSnapshot() time.Duration {
+	a.ctrlMu.Lock()
+	defer a.ctrlMu.Unlock()
+	return a.heartbeat
+}
+
+// startBackground 启动本地 UDP 会话清理 ticker（心跳按连接创建，见 serveControl）。
 func (a *agent) startBackground() {
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		a.heartbeatLoop()
-	}()
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()

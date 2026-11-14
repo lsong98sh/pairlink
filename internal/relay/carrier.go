@@ -2,19 +2,25 @@ package relay
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/logx"
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
+	"github.com/lsong98sh/pairlink/internal/tunnelqueue"
 )
 
 // errCarrierSideTaken 表示该配对键的某一侧已经由其它承载连接登记。
 var errCarrierSideTaken = errors.New("relay: 该会话侧已由其它承载连接登记")
+
+// errCarrierQueueClosed 表示承载连接的发送队列已关闭（连接正在收尾）。
+var errCarrierQueueClosed = errors.New("relay: 承载连接发送队列已关闭")
 
 // carrierTable 是 UDP over TCP 的会话表（冻结包不提供，由 relay 维护）。
 //
@@ -48,6 +54,9 @@ type carrierEntry struct {
 }
 
 // carrierConn 是一条 UDP over TCP 承载 TCP 连接。
+//
+// 写侧是单 writer goroutine + 有界队列（tunnelqueue）：转发路径（对端读循环）
+// 只入队、绝不因慢对端阻塞；控制帧走优先队列，不会被数据洪泛饿死。
 type carrierConn struct {
 	srv    *server
 	conn   net.Conn
@@ -55,7 +64,7 @@ type carrierConn struct {
 	role   string
 	remote string
 
-	writeMu   sync.Mutex
+	out       atomic.Pointer[tunnelqueue.Queue]
 	closeOnce sync.Once
 	closed    chan struct{}
 }
@@ -90,6 +99,9 @@ func (s *server) handleCarrierBind(conn net.Conn, bind *protocol.Bind, log *slog
 		remote: conn.RemoteAddr().String(),
 		closed: make(chan struct{}),
 	}
+	// 先建发送队列再登记：登记后对端读循环可能立刻向本连接写帧，
+	// out 必须在此前就绪（且 out 本身是 atomic.Pointer，读写无竞争）。
+	c.startWriter()
 	if _, err := s.carriers.register(c, key, side, bind.PairingToken); err != nil {
 		c.log.Warn("承载连接首帧鉴权失败",
 			"event", "bind_fail",
@@ -97,16 +109,19 @@ func (s *server) handleCarrierBind(conn net.Conn, bind *protocol.Bind, log *slog
 			"role", bind.Role,
 			"err", err,
 		)
+		c.close()
 		return
 	}
 
 	bindOK, err := protocol.EncodeFrame(protocol.MsgBindOK, &protocol.BindOK{PairingKey: key.String()})
 	if err != nil {
 		c.log.Warn("编码 MsgBindOK 失败", "event", "internal", "err", err)
+		c.close()
 		return
 	}
-	if err := c.writeFrame("", bindOK); err != nil {
-		c.log.Warn("写承载连接就绪帧失败", "event", "bind_fail", "err", err)
+	if !c.writeFrame("", bindOK) {
+		c.log.Warn("写承载连接就绪帧失败", "event", "bind_fail", "err", errCarrierQueueClosed)
+		c.close()
 		return
 	}
 
@@ -260,25 +275,37 @@ func (s *server) deliverCarrierData(from *carrierConn, key pairing.PairingKey, p
 	if target == nil || target == from {
 		return
 	}
-	if err := target.writeFrame(key.String(), payload); err != nil {
-		// 对端写失败：关闭对端承载连接，由既有清理路径删除其会话。
-		target.log.Warn("写对端承载连接失败",
-			"event", "data_close",
-			"pairing_key", key.String(),
-			"err", err,
-		)
-		target.close()
+	if !target.writeFrame(key.String(), payload) {
+		// 队列满导致丢弃（慢对端）：计数 + 限速 WARN 已由队列回调完成，
+		// 读循环绝不因对端慢而阻塞，也不因此关闭承载连接。
+		if target.isClosed() {
+			return
+		}
+		target.log.Debug("对端承载连接发送队列已满，丢弃数据帧",
+			"event", "tunnel_drop", "pairing_key", key.String())
 	}
 }
 
-// writeFrame 串行写一个 UDP 隧道帧。
-func (c *carrierConn) writeFrame(session string, payload []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.isClosed() {
-		return net.ErrClosed
+// startWriter 为该承载连接创建发送队列（单 writer goroutine）。
+func (c *carrierConn) startWriter() {
+	c.out.Store(tunnelqueue.New(c.conn, tunnelqueue.Options{
+		OnDrop: func(kind string, dropped int64, queued int) {
+			c.log.Warn("承载连接发送队列已满，按策略丢弃", "event", "tunnel_drop",
+				"detail", fmt.Sprintf("kind=%s dropped=%d queued=%d", kind, dropped, queued))
+		},
+	}))
+}
+
+// writeFrame 把一帧放入发送队列；返回是否成功入队（非阻塞）。
+func (c *carrierConn) writeFrame(session string, payload []byte) bool {
+	q := c.out.Load()
+	if q == nil {
+		return false
 	}
-	return protocol.WriteUDPTunnelFrame(c.conn, session, payload)
+	if session == "" {
+		return q.SendControl(payload)
+	}
+	return q.SendData(session, payload)
 }
 
 // writeControlError 用 session="" + MsgError 控制帧报告单会话错误。
@@ -293,16 +320,22 @@ func (c *carrierConn) writeControlError(code, message, pairingKey string) {
 	if err != nil {
 		return
 	}
-	if err := c.writeFrame("", frame); err != nil {
-		c.log.Warn("写承载控制帧失败", "event", "data_close", "err", err)
+	if !c.writeFrame("", frame) {
+		c.log.Warn("写承载控制帧失败", "event", "data_close", "detail", "队列已关闭或已满")
 	}
 }
 
 // close 关闭承载连接并删除其上的全部会话（幂等）。
+//
+// 关闭顺序：停止入队 → 关闭发送队列（writer 排空后退出并关闭连接）→ 删除会话表项。
 func (c *carrierConn) close() {
 	c.closeOnce.Do(func() {
 		close(c.closed)
-		_ = c.conn.Close()
+		if q := c.out.Load(); q != nil {
+			_ = q.Close()
+		} else {
+			_ = c.conn.Close()
+		}
 		for _, key := range c.srv.carriers.removeCarrier(c) {
 			c.log.Info("承载连接断开，移除会话",
 				"event", "udp_session_close",

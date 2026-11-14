@@ -7,10 +7,12 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
+	"github.com/lsong98sh/pairlink/internal/tunnelqueue"
 )
 
 // udpTunnelCarrier 是一条到 relay tcp_listen 的 UDP over TCP 承载连接
@@ -22,12 +24,14 @@ import (
 //   - 数据帧 session=<配对键> + 数据报原始字节；
 //   - 控制帧 session="" 的 payload 是完整 PairLink 帧（MsgBindOK / MsgError）。
 //
-// 写必须串行（writeMu）；读循环只有一条 goroutine（ReadUDPTunnelFrame）。
+// 写侧由单 writer goroutine + 有界队列承担（tunnelqueue）：业务 goroutine 只入队、
+// 绝不阻塞；读循环只有一条 goroutine（ReadUDPTunnelFrame）。
 type udpTunnelCarrier struct {
 	owner *client
 	conn  net.Conn
 
-	writeMu sync.Mutex
+	// out 是发送队列（start 之后非 nil）。
+	out atomic.Pointer[tunnelqueue.Queue]
 
 	mu       sync.Mutex
 	sessions map[string]*udpSession
@@ -40,7 +44,7 @@ type udpTunnelCarrier struct {
 	readyErr  error
 }
 
-// newUDPTunnelCarrier 构造承载连接（尚未开始读循环）。
+// newUDPTunnelCarrier 构造承载连接（尚未开始读循环与发送队列）。
 func newUDPTunnelCarrier(owner *client, conn net.Conn) *udpTunnelCarrier {
 	return &udpTunnelCarrier{
 		owner:    owner,
@@ -51,8 +55,16 @@ func newUDPTunnelCarrier(owner *client, conn net.Conn) *udpTunnelCarrier {
 	}
 }
 
-// start 启动读循环。
+// start 启动发送队列与读循环。
 func (cc *udpTunnelCarrier) start() {
+	q := tunnelqueue.New(cc.conn, tunnelqueue.Options{
+		OnDrop: func(kind string, dropped int64, queued int) {
+			cc.owner.log.Warn("UDP 隧道发送队列已满，按策略丢弃", "event", "tunnel_drop",
+				"remote", cc.conn.RemoteAddr().String(),
+				"detail", fmt.Sprintf("kind=%s dropped=%d queued=%d", kind, dropped, queued))
+		},
+	})
+	cc.out.Store(q)
 	cc.owner.tasks.Go(cc.readLoop)
 }
 
@@ -128,18 +140,15 @@ func (cc *udpTunnelCarrier) waitReady(ctx context.Context, timeout time.Duration
 	}
 }
 
-// writeFrame 串行写一个隧道帧。
-func (cc *udpTunnelCarrier) writeFrame(session string, payload []byte) error {
-	cc.writeMu.Lock()
-	defer cc.writeMu.Unlock()
-	if cc.isClosed() {
-		return errCarrierClosed
+// writeFrame 把一帧隧道数据放入发送队列；返回是否成功入队。
+//
+// 非阻塞：队列满时按丢弃策略处理（计数 + 限速 WARN）。
+func (cc *udpTunnelCarrier) writeFrame(session string, payload []byte) bool {
+	q := cc.out.Load()
+	if q == nil {
+		return false
 	}
-	if err := protocol.WriteUDPTunnelFrame(cc.conn, session, payload); err != nil {
-		cc.close("write_error", err)
-		return err
-	}
-	return nil
+	return q.SendData(session, payload)
 }
 
 // sendSessionBind 为一个复用会话发送 MsgBind 隧道帧（承载连接已就绪时使用）。
@@ -153,7 +162,13 @@ func (cc *udpTunnelCarrier) sendSessionBind(key, token string) error {
 	if err != nil {
 		return err
 	}
-	return cc.writeFrame(key, frame)
+	if !cc.writeFrame(key, frame) {
+		if cc.isClosed() {
+			return errCarrierClosed
+		}
+		return errors.New("client: UDP 承载连接发送队列已满，会话登记被丢弃")
+	}
+	return nil
 }
 
 // attachSession 在既有承载连接上登记并报到一个新会话。
@@ -266,7 +281,11 @@ func (cc *udpTunnelCarrier) close(reason string, cause error) {
 	cc.mu.Unlock()
 
 	cc.readyOnce.Do(func() { close(cc.ready) })
-	_ = cc.conn.Close()
+	if q := cc.out.Load(); q != nil {
+		_ = q.Close()
+	} else {
+		_ = cc.conn.Close()
+	}
 	cc.owner.dropCarrier(cc)
 
 	if len(sessions) > 0 {
@@ -340,7 +359,7 @@ func (c *client) acquireCarrier(s *udpSession, token string) (*udpTunnelCarrier,
 	}
 	carrier := newUDPTunnelCarrier(c, conn)
 	if err := carrier.register(s); err != nil {
-		_ = conn.Close()
+		carrier.close("register_failed", err)
 		return nil, false, err
 	}
 	// 首帧是普通 PairLink 帧（不是隧道帧），用于把连接切换到帧解析模式。
@@ -354,7 +373,7 @@ func (c *client) acquireCarrier(s *udpSession, token string) (*udpTunnelCarrier,
 		_ = conn.SetWriteDeadline(time.Now().Add(d))
 	}
 	if err := protocol.WriteFrame(conn, protocol.MsgBind, bind); err != nil {
-		_ = conn.Close()
+		carrier.close("first_frame_failed", err)
 		return nil, false, fmt.Errorf("client: 发送 UDP 承载首帧: %w", err)
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
@@ -362,9 +381,11 @@ func (c *client) acquireCarrier(s *udpSession, token string) (*udpTunnelCarrier,
 		"service_id", s.svcID, "pairing_key", key,
 		"remote", conn.RemoteAddr().String(), "detail", "carrier=udp-over-tcp")
 
+	// 先启动发送队列/读循环，再发布指针：并发会话通过 c.carrier 拿到它时，
+	// 队列必然已就绪（不会因为 out 为 nil 导致登记帧被丢弃）。
+	carrier.start()
 	c.carrierMu.Lock()
 	c.carrier = carrier
 	c.carrierMu.Unlock()
-	carrier.start()
 	return carrier, true, nil
 }

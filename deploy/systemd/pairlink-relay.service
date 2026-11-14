@@ -1,0 +1,66 @@
+# PairLink relay（公网中继）systemd unit。
+#
+# 安装：
+#   sudo install -m 0644 pairlink-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pairlink-relay
+#
+# 注意：Linux 用普通前台进程 + systemd 托管，不要加 -service（-service 只用于 Windows SCM）。
+# 配置、证书都放在 /etc/pairlink，权限建议 root:pairlink 0750 目录 / 0640 文件；
+# 启用下方 User=pairlink 后，pairlink 用户必须对配置与证书有读权限。
+[Unit]
+Description=PairLink relay server
+Documentation=https://github.com/lsong98sh/pairlink
+After=network-online.target
+Wants=network-online.target
+# 连续重启保护：60 秒内最多 5 次；配置错误时避免无限重启拖垮机器（systemd >= 236）。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# 可选：以非 root 用户运行（推荐）。先创建系统用户，并让 /etc/pairlink 对该用户可读：
+#   sudo groupadd --system pairlink
+#   sudo useradd --system --gid pairlink --no-create-home --shell /usr/sbin/nologin pairlink
+#   sudo chown -R root:pairlink /etc/pairlink && sudo chmod 0750 /etc/pairlink
+#   sudo chmod 0640 /etc/pairlink/*.ini /etc/pairlink/tls/* 2>/dev/null || true
+# 然后取消下面两行注释。relay 端口 7000/7001/7002 均 > 1024，普通用户可直接绑定。
+#User=pairlink
+#Group=pairlink
+ExecStart=/usr/local/bin/pairlink -relay -config /etc/pairlink/relay.ini
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+LimitNOFILE=65535
+UMask=0077
+# 不要用 Environment= 放 auth_token 等敏感值：token 只写在 /etc/pairlink/relay.ini 中，
+# Environment 会出现在 systemctl show / /proc/<pid>/environ 里。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pairlink-relay
+
+# ---- 适度加固（如需排障可临时 systemctl edit 覆盖）----
+NoNewPrivileges=true
+# 整个文件系统只读；/etc/pairlink 依然可读，证书无需额外放行。
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+# 只保留绑定低端口的能力（默认端口 > 1024；若把监听改到 443 等端口则需要它）。
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

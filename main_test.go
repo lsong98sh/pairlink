@@ -2,10 +2,12 @@ package main
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/lsong98sh/pairlink/internal/config"
+	"github.com/lsong98sh/pairlink/internal/version"
 )
 
 func TestSelectMode(t *testing.T) {
@@ -75,10 +77,18 @@ func TestModeTitle(t *testing.T) {
 }
 
 func TestVersionConstant(t *testing.T) {
-	if Version != "v0.1.0" {
-		t.Fatalf("Version = %q, want v0.1.0", Version)
+	// 单一来源是 internal/version.Version；这里只断言别名一致、格式正确且用法说明引用了它，
+	// 避免每次升版本都要改测试里的字面量。
+	if Version != version.Version {
+		t.Fatalf("main.Version = %q，internal/version.Version = %q", Version, version.Version)
+	}
+	if !regexp.MustCompile(`^v\d+\.\d+\.\d+$`).MatchString(Version) {
+		t.Fatalf("Version = %q，不是 vX.Y.Z 形式", Version)
 	}
 	if !strings.Contains(usageText(), "-relay") {
 		t.Fatal("用法说明缺少 -relay")
+	}
+	if !strings.Contains(usageText(), Version) {
+		t.Fatalf("用法说明未引用版本号 %q", Version)
 	}
 }

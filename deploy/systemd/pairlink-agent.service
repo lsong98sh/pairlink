@@ -1,0 +1,58 @@
+# PairLink agent（服务提供者侧）systemd unit。
+#
+# 安装：
+#   sudo install -m 0644 pairlink-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pairlink-agent
+#
+# 注意：agent 控制连接断开后进程会退出，由 Restart=on-failure 拉起（第一版无内置重连）；
+# 连续失败 5 次/60 秒后 systemd 会停止重试，排障见 deploy/systemd/README.md。
+# 不要加 -service（-service 只用于 Windows SCM）。
+[Unit]
+Description=PairLink agent
+Documentation=https://github.com/lsong98sh/pairlink
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# 可选：以非 root 用户运行（推荐），启用方式见 pairlink-relay.service 顶部注释。
+# agent 只需要读 /etc/pairlink/agent.ini 与证书；本地目标服务由第三方自己监听。
+#User=pairlink
+#Group=pairlink
+ExecStart=/usr/local/bin/pairlink -agent -config /etc/pairlink/agent.ini
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+LimitNOFILE=65535
+UMask=0077
+# 不要在 Environment= 中放 token；统一放 ini。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pairlink-agent
+
+# ---- 适度加固 ----
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

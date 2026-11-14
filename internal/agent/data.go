@@ -53,22 +53,23 @@ func (c *countingRW) CloseWrite() error {
 func (a *agent) handleTCP(sess *localSession, key pairing.PairingKey, svc config.ServerService, token string) {
 	defer a.endSession(sess)
 
-	if a.tcpDataAddr == "" {
+	tcpDataAddr := a.tcpDataAddrSnapshot()
+	if tcpDataAddr == "" {
 		a.log.Warn("缺少 TCP 数据面地址，放弃本次配对", "event", "data_open",
 			"pairing_key", key.String(), "detail", "tcp_data_addr 不可用")
 		return
 	}
-	dataConn, err := a.dialTCP(a.ctx, a.tcpDataAddr, a.dialTimeout())
+	dataConn, err := a.dialTCP(a.ctx, tcpDataAddr, a.dialTimeout())
 	if err != nil {
 		a.log.Warn("连接 relay TCP 数据面失败，放弃本次配对", "event", "data_open",
-			"pairing_key", key.String(), "remote", a.tcpDataAddr, "err", err)
+			"pairing_key", key.String(), "remote", tcpDataAddr, "err", err)
 		return
 	}
 	if !sess.track(dataConn) {
 		return
 	}
 	sess.setCarrier(carrierTCP)
-	sess.setRemote(remoteString(dataConn, a.tcpDataAddr))
+	sess.setRemote(remoteString(dataConn, tcpDataAddr))
 
 	bind := &protocol.Bind{
 		PairingKey:   key.String(),
@@ -100,7 +101,7 @@ func (a *agent) handleTCP(sess *localSession, key pairing.PairingKey, svc config
 		"pairing_key", key.String(),
 		"service_id", svc.ID,
 		"proto", "tcp",
-		"remote", remoteString(dataConn, a.tcpDataAddr),
+		"remote", remoteString(dataConn, tcpDataAddr),
 		"detail", "local="+svc.Addr,
 	)
 
@@ -109,29 +110,37 @@ func (a *agent) handleTCP(sess *localSession, key pairing.PairingKey, svc config
 	forward.Bidirectional(a.ctx, relaySide, upstream)
 }
 
+// udpBindResendInterval 是原生 UDP 报到帧的重发间隔（约 300ms）。
+const udpBindResendInterval = 300 * time.Millisecond
+
+// udpBindMaxResends 是 pair_timeout 内最多重发报到帧的次数。
+const udpBindMaxResends = 3
+
 // handleUDPNative 处理 udp_mode=native 的配对：
-// 向 relay 的 udp_listen 发 MsgBind 数据报、等 MsgBindOK，然后与本地 UDP 目标双向转发。
+// 向 relay 的 udp_listen 发 MsgBind 数据报、等 MsgBindOK（丢包时重发），
+// 然后与本地 UDP 目标双向转发。
 //
 // 每个配对键一个本地 UDP 会话（两个 connected socket：一个到 relay、一个到本地目标）。
 func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc config.ServerService, token string) {
 	defer a.endSession(sess)
 
-	if a.udpDataAddr == "" {
+	udpDataAddr := a.udpDataAddrSnapshot()
+	if udpDataAddr == "" {
 		a.log.Warn("缺少 UDP 数据面地址，放弃本次 UDP 配对", "event", "data_open",
 			"pairing_key", key.String(), "detail", "udp_data_addr 不可用")
 		return
 	}
-	relayConn, err := a.dialUDP(a.udpDataAddr)
+	relayConn, err := a.dialUDP(udpDataAddr)
 	if err != nil {
 		a.log.Warn("连接 relay UDP 数据面失败，放弃本次配对", "event", "data_open",
-			"pairing_key", key.String(), "remote", a.udpDataAddr, "err", err)
+			"pairing_key", key.String(), "remote", udpDataAddr, "err", err)
 		return
 	}
 	if !sess.track(relayConn) {
 		return
 	}
 	sess.setCarrier(carrierNative)
-	sess.setRemote(remoteString(relayConn, a.udpDataAddr))
+	sess.setRemote(remoteString(relayConn, udpDataAddr))
 
 	localConn, err := a.dialUDP(svc.Addr)
 	if err != nil {
@@ -159,9 +168,9 @@ func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc 
 	}
 	sess.touch()
 
-	if err := a.awaitBindOK(sess, key, relayConn, localConn); err != nil {
+	if err := a.awaitBindOK(sess, key, relayConn, localConn, frame); err != nil {
 		a.log.Warn("UDP 报到未被确认，放弃本次配对", "event", "bind",
-			"pairing_key", key.String(), "remote", a.udpDataAddr, "err", err)
+			"pairing_key", key.String(), "remote", udpDataAddr, "err", err)
 		return
 	}
 	sess.markReady()
@@ -171,7 +180,7 @@ func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc 
 		"service_id", svc.ID,
 		"proto", "udp",
 		"carrier", carrierNative,
-		"remote", a.udpDataAddr,
+		"remote", udpDataAddr,
 		"detail", "local="+svc.Addr,
 	)
 
@@ -185,21 +194,41 @@ func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc 
 
 // awaitBindOK 在 pair_timeout 内等待 relay 的 MsgBindOK 数据报。
 //
-// 若先收到业务数据（BindOK 丢失或先到），直接把该数据报转给本地目标并视为已就绪：
-// UDP 允许丢包，第一版不做可靠重传（docs/protocol.md §5.2.1）。
-func (a *agent) awaitBindOK(sess *localSession, key pairing.PairingKey, relayConn, localConn *net.UDPConn) error {
+// 丢包处理（阶段 6C，docs/protocol.md §5.2.1）：每约 300ms 未收到应答就重发报到帧，
+// 最多重发 udpBindMaxResends 次（重发只在 pair_timeout 内进行）；
+// 收到 MsgBindOK 或**首个业务数据报**即视为就绪（relay 半开会重复回 BindOK，
+// 因此重发是幂等的）。若先收到业务数据，先把该数据报转给本地目标。
+func (a *agent) awaitBindOK(sess *localSession, key pairing.PairingKey, relayConn, localConn *net.UDPConn, frame []byte) error {
 	timeout := a.pairTimeout()
-	if err := relayConn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return err
-	}
+	deadline := time.Now().Add(timeout)
 	buf := make([]byte, udpDatagramSize)
+	resends := 0
 	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errWaitBindOK{timeout: timeout}
+		}
+		wait := remaining
+		if resends < udpBindMaxResends && wait > udpBindResendInterval {
+			wait = udpBindResendInterval
+		}
+		if err := relayConn.SetReadDeadline(time.Now().Add(wait)); err != nil {
+			return err
+		}
 		n, err := relayConn.Read(buf)
 		if err != nil {
-			if isTimeout(err) {
-				return errWaitBindOK{timeout: timeout}
+			if !isTimeout(err) {
+				return err
 			}
-			return err
+			if resends < udpBindMaxResends {
+				resends++
+				if _, werr := relayConn.Write(frame); werr != nil {
+					return werr
+				}
+				a.log.Debug("未收到 UDP 报到应答，重发报到帧", "event", "bind",
+					"pairing_key", key.String(), "attempt", resends)
+			}
+			continue
 		}
 		sess.touch()
 		if typ, payload, perr := protocol.ParseFrame(buf[:n]); perr == nil {

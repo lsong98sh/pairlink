@@ -55,10 +55,15 @@ func Run(ctx context.Context, cfg *config.Config) error
    读取 ini 文件**，也不得修改 `cfg` 的字段（只读；需要派生值请复制到本地变量）。
 2. `Run` **不得调用 `os.Exit`、不得 `log.Fatal`、不得启动自己的 signal 处理**；
    进程信号由 `main.go` 的 `signal.NotifyContext` 负责，`ctx` 取消即要求全部退出。
-3. `Run` 返回语义：
+3. `Run` 返回语义（阶段 6C 起 agent/client 增加自动重连，见 §2.4 第 7 条 / §2.5 第 9 条）：
    - `ctx` 取消且清理完成 → 返回 `nil`（返回 `context.Canceled` 也可，`main` 视为正常退出）；
-   - 启动失败（端口占用、TLS 证书错误、拨号失败等）→ 返回非 nil 错误，`main` 记日志并退出码 1；
-   - 运行中不可恢复错误（控制连接断开、监听异常）→ 返回非 nil 错误。
+   - 启动失败（端口占用、TLS 证书/CA 错误、配置非法、relay 明确拒绝等**不可重试**错误）
+     → 返回非 nil 错误，`main` 记日志并退出码 1；
+   - 运行中不可恢复错误（本地监听异常、被踢出）→ 返回非 nil 错误；
+   - **例外（阶段 6C）**：启用 `[server]/[client] reconnect`（默认 `true`）时，
+     agent/client 的**可重试**失败（拨号失败、握手读超时、连接被对端关闭/重置）与
+     运行期控制连接意外断开**不结束进程**，而是按指数退避重连；重连期间 `Run` 不返回。
+     `reconnect = false` 时保持阶段 6C 之前的语义（上述失败直接返回错误）。
 4. `Run` 负责在 `cfg.Common.ManageListen != ""` 时启动管理页（`admin.New` + `admin.AddPage` +
    `admin.Start(ctx)`），并在退出时 `Shutdown`。`manage_listen` 为空表示不启动管理页。
 5. `Run` 负责**自己构造 logger**：`logx.New(logx.Config{Level: cfg.Common.LogLevel,
@@ -154,9 +159,21 @@ TLS：`cfg.Relay.TLSCert`/`TLSKey` 均非空时隧道 `tls.Listen`（`tls.Config
    - `udp`：按 §4.6 选择承载方式（`native` / `tcp_tunnel`），完成报到后与本地目标做 UDP
      转发（维护本地 UDP 会话表，空闲超时 `cfg.Server.UDPSessionTimeout`）。
 6. 收到 `MsgKicked`/`MsgServerShutdown`：关闭对应数据连接；`MsgKicked` 时 `Run` 返回错误
-   （不重连），`MsgServerShutdown` 时返回 `nil`（由外部守护重启）。
-7. 控制连接意外断开：第一版**不自动重连**，`Run` 返回错误，进程退出（由 systemd/Windows
-   服务恢复策略重启）。这一点必须写进 relay/agent 各自的测试与 README 说明。
+   （**不重连**），`MsgServerShutdown` 时返回 `nil`（由外部守护重启）。
+7. 控制连接意外断开（阶段 6C 起）：`[server] reconnect`（默认 `true`）时**自动重连**，
+   `reconnect = false` 时保持旧行为（`Run` 返回错误，进程退出，由 systemd/Windows
+   服务恢复策略重启）。
+   - 退避：base **1s**、每次 ×2、上限 `[server] reconnect_max_backoff`（默认 **60s**，
+     必须 > 0）、±20% 抖动；等待必须可被 `ctx` 取消（取消即 `Run` 返回 `nil`）；
+   - 每次重连成功后**重新 `MsgHello`、重新注册 `cfg.Server.All()` 的全部服务、重建心跳**；
+     relay 在旧控制连接断开时已注销本 agent 的服务，因此重注册是必需的；
+   - 重连期间关闭全部在途数据连接与本地 UDP 会话（日志 `reason=reconnect`），
+     **不做 UDP/TCP 会话迁移**：重连后的新接入照常走完整配对；
+   - 可观测：`event=reconnect_scheduled`（含 attempt/delay）、`event=reconnect_ok`
+     （含 attempt/elapsed）、`event=reconnect_failed`（含 err）；日志不得含令牌；
+   - **不重连的情况**：`MsgKicked`（清理后返回错误）、`MsgServerShutdown`（返回 `nil`）、
+     鉴权失败 `auth_failed` / 版本不兼容 `unsupported_version` / 注册被 relay 明确拒绝
+     （均返回错误，重试无意义）、TLS 握手失败（配置不匹配）、`ctx` 取消（返回 `nil`）。
 8. 本地目标连接失败只影响本次配对（关数据连接 + 日志），不得让整个 `Run` 退出。
 
 ### 2.5 client.Run 的职责
@@ -170,8 +187,8 @@ TLS：`cfg.Relay.TLSCert`/`TLSKey` 均非空时隧道 `tls.Listen`（`tls.Config
    - `Run` 先完成 `MsgHelloOK` 与 `MsgListServices`，再开监听；
    - 列表中存在该 `service_id` → 按 `proto` 开 TCP/UDP 监听；不存在 → 按 **TCP** 开监听并
      记 WARN（`event=service_missing`），`ConnectRequest` 失败时关闭本地连接；
-   - 订阅开启时，收到 `added` 事件且 proto 与当前监听不一致：允许保持现状（第一版不热切换），
-     记 WARN 并写进 README 已知限制。
+   - 订阅开启时，收到 `added`/`updated` 事件且 proto 与当前监听不一致：**热切换**
+     （见第 10 条），不再只是 WARN。
 5. 本地连接建立后生成 `client_conn_id`（8 字节 `crypto/rand` hex），登记到本地表，
    发 `MsgConnectRequest`；启动 `cfg.Client.PairTimeout` 定时器，超时则关闭本地连接。
 6. 收到 `MsgPairResult`：按 `proto` 选择数据面（§4.5/§4.6）：
@@ -181,8 +198,29 @@ TLS：`cfg.Relay.TLSCert`/`TLSKey` 均非空时隧道 `tls.Listen`（`tls.Config
    转发结束删除本地表项。
 7. 收到 `MsgError`（`service_not_found`/`no_agent_online`/`pair_timeout`/`too_many_pending`）：
    关闭对应本地连接、记 WARN，不影响其它连接。
-8. 本地监听失败 → `Run` 返回错误（端口冲突必须暴露，不能静默）。
-9. 控制连接断开 → `Run` 返回错误（不自动重连，与 agent 一致）。
+8. 本地监听失败 → `Run` 返回错误（端口冲突必须暴露，不能静默）；热切换时新监听打开失败
+   则**回滚**旧监听（见第 9 条第 3 点），不结束 `Run`。
+9. 控制连接（阶段 6C 起，与 agent 对称）：
+   - `[client] reconnect`（默认 `true`）时自动重连：base 1s、×2、
+     上限 `[client] reconnect_max_backoff`（默认 60s，必须 > 0）、±20% 抖动，
+     等待可被 `ctx` 取消；
+   - 重连成功后重新 `MsgHello`、重新 `MsgListServices`、重新 `MsgSubscribe`（若启用），
+     刷新本地服务视图与 `udp_mode`；**本地监听不重建**（端口不变、第三方无感），
+     只按新列表校对协议（必要时热切换）；
+   - 重连后必须**强制接受** relay 下发的全量服务列表作为新基线（relay 重启会导致
+     `revision` 归零；沿用"忽略更旧 revision"会让视图永久卡死）；
+   - 重连期间关闭全部在途本地 TCP 连接/UDP 会话（`reason=reconnect`），不做迁移；
+   - 不重连：`MsgKicked`（返回错误）、`MsgServerShutdown`（返回 `nil`）、
+     鉴权失败/版本不兼容/`tls_ca` 读取失败（永久错误）、`ctx` 取消（返回 `nil`）；
+   - `reconnect = false` 时控制连接断开 → `Run` 返回错误（旧行为）。
+10. 订阅到服务 `proto` 变化时**热切换本地监听**（阶段 6C）：
+    - 关旧监听 → 在**原地址**按新协议重开（配置为 `:0` 时用旧监听的实际端口）；
+      成功则替换映射并记 `event=listen_hot_switch`；
+    - 新监听打开失败 → **回滚**：按旧协议在原地址重开，保留旧映射并 WARN，
+      继续用旧协议（绝不让本地服务消失）；只有回滚也失败才移除映射并 WARN；
+    - 切换只关监听 socket，已建立的会话各自持有连接，允许自然结束；新连接走新协议；
+    - 服务不在列表里时保留当前监听协议（`service_missing` 的 TCP 占位只用于首次启动），
+      服务重新出现且 proto 不同则再次热切换。
 
 ## 3. 冻结包的可用 API（阶段 2 只允许用这些）
 
@@ -568,7 +606,11 @@ func IsWindowsService() bool
   - 仅 `tls_insecure_skip_verify=true`（`tls_ca` 为空）→ 使用 TLS 但跳过证书校验（WARN）；
   - 两者皆空 → **明文连接**（对应 relay 未配置证书的部署），而不是"用系统根证书建 TLS"。
 - 两侧配置不匹配（relay 有证书而 agent/client 明文，或反之）时 TLS 握手失败，属**预期**行为：
-  不做协议探测、不自动降级，错误信息需可读（agent/client 返回 `Run` 错误并退出）。
+  不做协议探测、不自动降级，错误信息需可读。
+  阶段 6C 起：本端 TLS **握手**失败（`tls_ca` 与 relay 证书不匹配、relay 没开 TLS）按**永久
+  错误**处理，立即返回 `Run` 错误（不重试）；而"relay 要求 TLS、本端明文"只能表现为读
+  HelloOK 时 EOF，与瞬时断链不可区分，因此按可重试断开处理（`reconnect=false` 时仍立即
+  失败退出，见 §2.5 第 9 条）。
 - 数据面**永远明文**（哑管道），不得包 TLS。
 
 ### 4.4 超时使用
@@ -618,6 +660,12 @@ relay 启动时确定模式并在 `HelloOK`、`ServiceRegistered`（agent）、`
 **relay**：
 
 1. `native`：按 §2.3 的 UDPDataListener 流程处理（`UDPTable` + Bind 数据报 + `MsgBindOK`）。
+   阶段 6C 补充的丢包语义（详见 `docs/protocol.md` §5.2.1）：
+   - 半开状态收到**同一端点**重复的 `MsgBind` → 幂等，**再次回** `MsgBindOK`
+     （令牌只校验不消费），让 BindOK 丢包的 agent/client 能靠重发完成报到；
+   - `Full` 之后，来自已知端点、且能解析为**同一配对键** `MsgBind` 帧的数据报 → **丢弃**
+     （不得转发，否则会污染对端数据流），只记 debug 日志；实现上只嗅探 5 字节帧头，
+     其它数据报仍按源地址原样转发、不做内容解析。
 2. `tcp_tunnel`：`tcp_listen` 的 accept 循环读到 `MsgBind.Carrier == "udp-over-tcp"` 后，
    校验该首帧 role/令牌，然后把连接转为 UDP 隧道帧解析（`protocol.ReadUDPTunnelFrame`）：
    - 首帧对应"第一个会话"，校验通过后登记并回控制帧（`session=""` + `MsgBindOK`）；
@@ -627,19 +675,28 @@ relay 启动时确定模式并在 `HelloOK`、`ServiceRegistered`（agent）、`
      原样转发到对端承载连接；
    - 单会话错误用控制帧（`session=""` + `MsgError`）回报，不关闭承载连接；
    - 承载连接断开 → 删除其上全部会话；半开用 `pair_timeout`、空闲用 `udp_session_timeout`；
-   - 写对端承载连接必须**串行**（单写 goroutine 或 `sync.Mutex`），避免帧交错。
+   - 写侧必须用**单 writer goroutine + 有界发送队列**（阶段 6C，`internal/tunnelqueue`）：
+     读循环只入队、绝不因慢对端阻塞；整帧单次 `Write` 写出；数据帧队列上限 1024 帧 /
+     8 MiB、控制帧（`MsgBindOK`/`MsgError`）走独立的优先队列（上限 256 帧），保证会话级
+     控制帧不被数据洪泛饿死；队列满时丢弃并计数（`event=tunnel_drop`，限速 WARN）；
+     关闭顺序：停止入队 → 关闭队列 → writer 排空（上限 2s）→ 关连接。
 3. 同一配对键同时只归一个会话；重复 `MsgBind` 视为幂等（已完成会话不改变状态）。
 
 **agent / client**：
 
 1. 从 `HelloOK`/`ServiceRegistered`/`ServiceList` 读取 `udp_mode`（缺失/未知回退 `native` + WARN）。
 2. `native`：为每个 UDP 配对 `net.DialUDP` 到 `udp_listen`（host 来自 relay_addr，端口来自
-   `HelloOK.UDPDataPort`），发 `MsgBind` 数据报，`pair_timeout` 内等 `MsgBindOK`。
+   `HelloOK.UDPDataPort`），发 `MsgBind` 数据报，`pair_timeout` 内等 `MsgBindOK`；
+   阶段 6C 起做丢包重传：每约 **300ms** 未收到应答就重发报到帧，最多重发 **3** 次；
+   收到 `MsgBindOK` **或首个业务数据报**即视为就绪；`pair_timeout` 到期后放弃该会话并清理。
 3. `tcp_tunnel`：维护**一条**到 `tcp_listen` 的承载连接（建议懒创建、按需重建）：
    - 该连接的第一个 UDP 会话：首帧 `MsgBind{carrier:"udp-over-tcp", key, token, role}`；
    - 之后的会话：发 `session=<配对键>` + payload 为 `MsgBind` 帧的隧道帧；
    - 数据：`WriteUDPTunnelFrame(session=key, payload=数据报)`；读循环按 `session` 分发到
      本地 UDP 会话（`ReadUDPTunnelFrame`）；
+   - 写侧同样是**单 writer goroutine + 有界发送队列**（`internal/tunnelqueue`）：业务
+     goroutine 只入队、不因慢 relay 阻塞；控制帧优先；队列满时丢弃并计数
+     （`event=tunnel_drop`）；**入队即复制 payload**，调用方可复用读缓冲；
    - 等待 `MsgBindOK` 控制帧（`session=""`）确认承载连接就绪，超时 `pair_timeout`；
    - 收到 `session=""` + `MsgError` 时只关闭对应会话，不关闭承载连接。
 4. 两种模式下本地 UDP 会话表都要清理：agent 用 `cfg.Server.UDPSessionTimeout`；

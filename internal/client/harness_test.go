@@ -59,10 +59,21 @@ func testConfig(relayAddr string) *config.Config {
 // startTestClient 在后台启动 client.run，并在测试结束时确保退出。
 func startTestClient(t *testing.T, cfg *config.Config) *testClient {
 	t.Helper()
+	return startTestClientWith(t, cfg, nil)
+}
+
+// startTestClientWith 在启动前对 client 做一次注入（缩短重连退避、注入 listenFn 等）。
+func startTestClientWith(t *testing.T, cfg *config.Config, mutate func(*client)) *testClient {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := &lockedBuffer{}
 	log := logx.New(logx.Config{Level: "debug", Format: "text", Mode: "client", Output: logs})
 	c := newClientWithLogger(ctx, cfg, log)
+	// 重连退避的基准等待缩短到 10ms，让重连类用例快速收敛。
+	c.reconnectBase = 10 * time.Millisecond
+	if mutate != nil {
+		mutate(c)
+	}
 
 	tc := &testClient{t: t, c: c, cancel: cancel, logs: logs, done: make(chan struct{})}
 	go func() {

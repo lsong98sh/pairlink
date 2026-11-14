@@ -1,9 +1,10 @@
-# 需求追踪矩阵（v0.1.0 现状）
+# 需求追踪矩阵（v0.2.0 现状）
 
 > **生成方式**：逐条对照 `task.md`（150 行，§1–§12）与 `task2.txt`（11 行）到当前实现与测试；
 > 所有「实现位置」均来自本轮 `grep`/读码取证（非凭印象），行号为**当前工作区**真实行号。
-> 取证基线：`git log -1` = `65f7064`（tag `v0.1.0`，工作区 `git status` 干净）、
-> `go1.24.4 windows/amd64`。本轮**不改任何生产代码/测试/README**，只新增本文件。
+> 取证基线：v0.2.0 发布提交（tag `v0.2.0`，工作区含阶段 6B/6C/6D/6E 成果）、
+> `go1.24.4 windows/amd64`。阶段 6E 只更新 §5 工程增强状态、版本号与 §6 复核结论，
+> 不改需求侧判定；§5.2 新增条目全部使用 v0.2.0 真实行号（阶段 6C 重构过的文件已逐条复核）。
 >
 > **定位约定**：`文件:行` 写成可点击链接（相对 `docs/`），如 `../internal/relay/tcp_data.go#L131`；
 > 测试写作 `包/文件:TestName`（链接指向该测试函数起始行）。
@@ -25,13 +26,15 @@
 | task.md §9（交付物与 e2e） | 7 | 7 | 0 | 0 | 0 | 源码/README/e2e 五类验收项齐全 |
 | task.md §10（验收标准） | 6 | 5 | 0 | 0 | 1 | 唯一受限项是 Windows 服务完整生命周期（需管理员） |
 | task.md §11（五个自由度说明） | 5 | 3 | 2 | 0 | 0 | ①client_conn_id 生成方、②管理页 HTML 组织=README 未写 |
-| task.md §12（版本/许可） | 2 | 2 | 0 | 0 | 0 | tag `v0.1.0` 存在；Apache-2.0 |
+| task.md §12（版本/许可） | 2 | 2 | 0 | 0 | 0 | tag `v0.1.0` 与 `v0.2.0` 均存在；Apache-2.0 |
 | task2.txt（UDP 承载模式改造） | 6 | 6 | 0 | 0 | 0 | `udp_mode` 三处下发、`carrier`、隧道帧、README 取舍全部落地 |
 | **合计** | **85** | **82** | **2** | **0** | **1** | 需求缺口 = 0；未了项 = 2 处 README 说明 + 1 处环境验证 |
+| 工程增强（§5.2，不计入需求统计） | 8 | 7 | 0 | 1 | 0 | E1–E6 已落地（阶段 6C/6D）；E8 文档时点已标注；E7（TLS 强制开关）仍未做 |
 
-**一句话结论**：v0.1.0 对 `task.md` + `task2.txt` 的**功能需求已全部实现且可验证**；
+**一句话结论**：v0.2.0 对 `task.md` + `task2.txt` 的**功能需求已全部实现且可验证**；
 剩下的不是「功能缺失」，而是 **2 处 README 应有说明缺失**（§11 的两个自由度）+
-**1 处必须管理员环境才能验证的 Windows 服务生命周期**，以及一批**任务书没要求的工程增强**（§5 E 系列）。
+**1 处必须管理员环境才能验证的 Windows 服务生命周期**；v0.1.0 时点的 6 项工程增强
+（自动重连、热切换、发送队列、UDP 重传、soak、部署件）已在阶段 6C/6D 全部落地（§5.2）。
 
 ---
 
@@ -56,7 +59,7 @@
 | task.md §2.4 | UDP 通信端口按配对键维护会话映射转发数据报，同样校验令牌 | [internal/relay/udp_data.go:45-140](../internal/relay/udp_data.go#L45-L140)（:53 反查、:98 校验、:108 登记）；[internal/registry/udp_table.go:155](../internal/registry/udp_table.go#L155)、[:224](../internal/registry/udp_table.go#L224) | [TestNativeUDPForwardAndTimeout](../internal/relay/udp_data_test.go#L93)、[TestE2EUDPModeNative](../test/e2e_udp_test.go#L18) | ✅ 已实现 | 该端口现为可选（task2），能力本身完整 |
 | task.md §2.5 | 维护连接注册表：服务ID→server 控制连接、配对键→两侧数据连接、待配对表、UDP 会话表；并发安全 | [internal/registry/service_registry.go:51](../internal/registry/service_registry.go#L51)；[internal/registry/agent_registry.go:10](../internal/registry/agent_registry.go#L10)；[internal/pairing/pairing.go:155](../internal/pairing/pairing.go#L155)；[internal/registry/udp_table.go:120](../internal/registry/udp_table.go#L120)；[internal/relay/carrier.go:23](../internal/relay/carrier.go#L23)（over-TCP 会话表）；[internal/relay/tcp_data.go:373-398](../internal/relay/tcp_data.go#L373-L398)（活动配对） | [TestServiceRegistryConcurrent](../internal/registry/registry_test.go#L177)、[TestUDPTableConcurrent](../internal/registry/registry_test.go#L484)、[TestConcurrentPairings](../internal/pairing/pairing_test.go#L267)、全仓 `-race` 见 README §13.15.2 | ✅ 已实现 | 服务→控制连接经 `agent_id` 间接索引（[:735](../internal/relay/tunnel.go#L735)），功能等价 |
 | task.md §2.6 | agent 连 relay 隧道，声明服务ID、协议类型（tcp/udp）、本地目标地址 | [internal/agent/control.go:73-128](../internal/agent/control.go#L73-L128)（Hello）、[:129-159](../internal/agent/control.go#L129-L159)（逐个 RegisterService）；[internal/config/config.go:157-168](../internal/config/config.go#L157-L168) | [TestHelloAndRegisterAllServices](../internal/agent/agent_test.go#L13)、[TestRegisterServiceError](../internal/agent/agent_test.go#L110) | ✅ 已实现 | — |
-| task.md §2.7 | 维持控制长连接，等待接入通知 | [internal/agent/control.go:237-286](../internal/agent/control.go#L237-L286)（唯一读循环）、[:289-305](../internal/agent/control.go#L289-L305)（心跳） | [TestControlConnectionLost](../internal/agent/agent_test.go#L219)、[TestIncomingWithoutTokenIgnored](../internal/agent/tunnel_test.go#L212) | ✅ 已实现 | 断开后**不重连**（README §10 #1）；属工程增强 E1，非本行缺口 |
+| task.md §2.7 | 维持控制长连接，等待接入通知 | [internal/agent/reconnect.go:138](../internal/agent/reconnect.go#L138)（`serveControl`：唯一读循环 + 自动重连）、[internal/agent/control.go:306](../internal/agent/control.go#L306)（心跳） | [TestControlConnectionLost](../internal/agent/agent_test.go#L220)、[TestReconnectAfterControlDrop](../internal/agent/reconnect_test.go#L52)、[TestHeartbeatRebuiltAfterReconnect](../internal/agent/reconnect_test.go#L244) | ✅ 已实现 | 阶段 6C 起断开后**自动重连**（E1）；`reconnect=false` 可回退"断开即退出" |
 | task.md §2.8 | 配置维护多组 `服务ID → tcp/udp:本地端口` 映射，本地第三方服务零改造 | [internal/config/config.go:400-449](../internal/config/config.go#L400-L449)（service.<ID> 解析）、[:157-168](../internal/config/config.go#L157-L168)（主服务 default 在前）；[README.md:350-362](../README.md#L350-L362) | [TestLoadValidAgent](../internal/config/config_test.go#L116)、[TestHelloAndRegisterAllServices](../internal/agent/agent_test.go#L13)、[TestE2EAgentMultiServiceConcurrent](../test/e2e_basic_test.go#L278) | ✅ 已实现 | 支持 `proto:port`、`proto:host:port`、IPv6 方括号 |
 | task.md §2.9 | 收到通知后携带配对键+令牌**新建连接**到对应协议通信端口完成绑定 | [internal/agent/agent.go:388-449](../internal/agent/agent.go#L388-L449)（handleIncoming 按 proto 分派）、[internal/agent/data.go:53-115](../internal/agent/data.go#L53-L115)（TCP 报到） | [TestTCPIncomingBindAndForward](../internal/agent/data_test.go#L18) | ✅ 已实现 | — |
 | task.md §2.10 | 绑定后在回连 relay 的数据连接与到本地目标的连接之间双向转发 | [internal/agent/data.go:53-114](../internal/agent/data.go#L53-L114)；[internal/forward/forward.go:83-145](../internal/forward/forward.go#L83-L145) | [TestTCPIncomingBindAndForward](../internal/agent/data_test.go#L18)、[TestE2ETCPEchoConcurrent20](../test/e2e_basic_test.go#L184) | ✅ 已实现 | — |
@@ -70,7 +73,7 @@
 | 需求ID | 需求原文摘要 | 实现位置 | 测试证据 | 状态 | 差距说明 |
 | --- | --- | --- | --- | --- | --- |
 | task.md §3.1 | agent 注册服务，relay 记录 `服务ID → 控制连接` | [internal/relay/tunnel.go:324-375](../internal/relay/tunnel.go#L324-L375)（写 ServiceRegistry + SetServices） | [TestTunnelRegisterListSubscribe](../internal/relay/tunnel_test.go#L90) | ✅ 已实现 | — |
-| task.md §3.2 | client 请求访问；relay 生成 `客户端连接ID`、`配对键 = (服务ID, 客户端连接ID)`、一次性令牌 | [internal/relay/tunnel.go:396-502](../internal/relay/tunnel.go#L396-L502)（:460 Issue 令牌、:474/:486 下发）；[internal/client/client.go:383-390](../internal/client/client.go#L383-L390)（conn_id 生成方） | [TestTunnelConnectRequest](../internal/relay/tunnel_test.go#L183)、[TestNewConnID](../internal/client/addr_test.go#L72) | ✅ 已实现 | **§11 自由度覆盖 §3.2 措辞**：ID 实为 client 生成（8B crypto/rand hex），relay 只按 key 组键并签发令牌；docs 已记录（[architecture.md:315-320](architecture.md#L315-L320)）。本行按 §11 判 ✅，README 说明缺失见 §11.1 |
+| task.md §3.2 | client 请求访问；relay 生成 `客户端连接ID`、`配对键 = (服务ID, 客户端连接ID)`、一次性令牌 | [internal/relay/tunnel.go:396-502](../internal/relay/tunnel.go#L396-L502)（:460 Issue 令牌、:474/:486 下发）；[internal/client/client.go:396](../internal/client/client.go#L396)（conn_id 生成方） | [TestTunnelConnectRequest](../internal/relay/tunnel_test.go#L183)、[TestNewConnID](../internal/client/addr_test.go#L72) | ✅ 已实现 | **§11 自由度覆盖 §3.2 措辞**：ID 实为 client 生成（8B crypto/rand hex），relay 只按 key 组键并签发令牌；docs 已记录（[architecture.md:315-320](architecture.md#L315-L320)）。本行按 §11 判 ✅，README 说明缺失见 §11.1 |
 | task.md §3.3 | relay 向 agent 控制连接下发接入通知（键+令牌），同时向 client 回复配对信息 | [internal/relay/tunnel.go:474-500](../internal/relay/tunnel.go#L474-L500)（MsgIncoming + MsgPairResult） | [TestTunnelConnectRequest](../internal/relay/tunnel_test.go#L183)、[TestE2ETCPPairingBothOrders](../test/e2e_basic_test.go#L104) | ✅ 已实现 | — |
 | task.md §3.4 | agent 新建 TCP 连接首条消息带键+令牌；client 同样新建连接报到 | [internal/relay/tcp_data.go:106-157](../internal/relay/tcp_data.go#L106-L157)；[internal/agent/data.go:53-115](../internal/agent/data.go#L53-L115)；[internal/client/session_tcp.go:171-229](../internal/client/session_tcp.go#L171-L229) | [TestTCPPairAgentFirst](../internal/relay/tcp_data_test.go#L48)、[TestTCPPairClientFirst](../internal/relay/tcp_data_test.go#L72) | ✅ 已实现 | — |
 | task.md §3.5 | **待配对表**处理两侧到达顺序不确定：先到者占位等待，另一侧到达且令牌有效即绑定；超时未凑齐则关闭已到连接并清理 | [internal/pairing/pairing.go:201-255](../internal/pairing/pairing.go#L201-L255)（Claim/ErrWaiting）；[internal/relay/tcp_data.go:202-259](../internal/relay/tcp_data.go#L202-L259)（:217-246 静默等待、:242-245 超时清理）；[internal/relay/relay.go:99-108](../internal/relay/relay.go#L99-L108)（OnExpire 关连接） | [TestClaimBothOrders](../internal/pairing/pairing_test.go#L73)、[TestTCPPairAgentFirst](../internal/relay/tcp_data_test.go#L48)、[TestTCPPairClientFirst](../internal/relay/tcp_data_test.go#L72)、[TestTCPPairTimeout](../internal/relay/tcp_data_test.go#L170)、[TestE2ETCPPairingBothOrders](../test/e2e_basic_test.go#L104) | ✅ 已实现 | 顶部另有 `pairWait` 引用计数（[:32-76](../internal/relay/tcp_data.go#L32-L76)）保证「先到者不写任何字节」 |
@@ -168,14 +171,14 @@
 | task.md §11.2 | README 说明**管理页 HTML 组织方式** | 实现：统一布局/内联 CSS/无外部资源 [internal/admin/layout.go:1-140](../internal/admin/layout.go#L1-L140)、各模式只写 `<section>`（[relay/admin.go:17](../internal/relay/admin.go#L17)、[agent/adminpage.go:50-57](../internal/agent/adminpage.go#L50-L57)、[client/admin.go:47](../internal/client/admin.go#L47)）；文档：[docs/architecture.md:326-330](architecture.md#L326-L330) | [TestE2EAdminPagesThreeModes](../test/e2e_admin_test.go#L11)（断言 `html lang="zh-CN"`、无 `<script src=`） | 🟡 部分实现 | README §6 只描述**页面内容**，未说明 HTML 如何组织（统一布局/内联样式/各模式只写 section）。§5 G2 |
 | task.md §11.3 | README 说明**令牌有效期策略** | [README.md:416-417](../README.md#L416-L417)（默认 15s、用后即焚、只存 SHA-256、常量时间比较）；[README.md:309](../README.md#L309)（`token_ttl`）；[config.go:216](../internal/config/config.go#L216) | [TestDefaultTTL](../internal/token/token_test.go#L173)、[TestExpiry](../internal/token/token_test.go#L117)、[TestE2EFailureTokenExpiry](../test/e2e_failure_test.go#L77) | ✅ 已实现 | 策略已说明（短 TTL + Consume + 摘要存储） |
 | task.md §11.4 | README 说明 **UDP 会话超时阈值** | [README.md:308](../README.md#L308)（relay 60s）、[:324](../README.md#L324)（agent 60s）、[:339](../README.md#L339)（client 60s）；[config.go:215](../internal/config/config.go#L215)/[:221](../internal/config/config.go#L221)/[:228](../internal/config/config.go#L228) | [TestClientUDPSessionTimeout](../internal/config/client_timeout_test.go#L13)、[TestNativeUDP](../internal/client/udp_test.go#L81)（300ms 清理生效） | ✅ 已实现 | 三处默认值均已写明；**选择理由**未写（P3 可选补充，不算缺口） |
-| task.md §11.5 | README 说明**日志格式** | [README.md:498-508](../README.md#L498-L508)（slog、text/json、字段、事件、Windows 落盘）；[internal/logx/logx.go](../internal/logx/logx.go) | [TestNewText](../internal/logx/logx_test.go#L13)、[TestNewJSON](../internal/logx/logx_test.go#L29)、[TestNewFileLogger](../internal/logx/logx_test.go#L78) | ✅ 已实现 | — |
+| task.md §11.5 | README 说明**日志格式** | [README.md:534-541](../README.md#L534-L541)（slog、text/json、字段、事件、Windows 落盘）；[internal/logx/logx.go](../internal/logx/logx.go) | [TestNewText](../internal/logx/logx_test.go#L13)、[TestNewJSON](../internal/logx/logx_test.go#L29)、[TestNewFileLogger](../internal/logx/logx_test.go#L78) | ✅ 已实现 | — |
 | **小计** | | | | **3 ✅ / 2 🟡** | |
 
 ### 1.12 §12 版本与许可证（2 条）
 
 | 需求ID | 需求原文摘要 | 实现位置 | 测试证据 | 状态 | 差距说明 |
 | --- | --- | --- | --- | --- | --- |
-| task.md §12.1 | 第一版打 `v0.1.0` 标签 | [internal/version/version.go:12](../internal/version/version.go#L12)（`Version = "v0.1.0"`）；`git tag -l` 实测有 `v0.1.0`，HEAD 提交 `65f7064` | [TestVersionConstant](../main_test.go#L77)、[TestVersionFormat](../internal/version/version_test.go#L9)、[TestBinaryVersionUsageAndConfigErrors](../test/binary_test.go#L82)（`pairlink v0.1.0`） | ✅ 已实现 | 版本号单一来源，三模式管理页共用 |
+| task.md §12.1 | 第一版打 `v0.1.0` 标签 | [internal/version/version.go:12](../internal/version/version.go#L12)（v0.2.0 为 `Version = "v0.2.0"`；v0.1.0 时点为 `Version = "v0.1.0"`）；`git tag -l` 实测有 `v0.1.0` 与 `v0.2.0` | [TestVersionConstant](../main_test.go#L79)、[TestVersionFormat](../internal/version/version_test.go#L9)、[TestBinaryVersionUsageAndConfigErrors](../test/binary_test.go#L84)（`pairlink v0.2.0`） | ✅ 已实现 | 版本号单一来源，三模式管理页共用 |
 | task.md §12.2 | 许可证选 Apache-2.0 | [LICENSE:1-3](../LICENSE#L1-L3)（Apache License 2.0 正文）；[README.md:11](../README.md#L11) | 文档核对（无自动化测试，属交付物） | ✅ 已实现 | — |
 
 ---
@@ -201,10 +204,10 @@
 | 交付要求 | 现状证据 | 结论 |
 | --- | --- | --- |
 | README 内容（架构/协议/ini/部署/管理页/首句） | 六项在 [README.md:3](../README.md#L3)、[:31-57](../README.md#L31-L57)、[:88-145](../README.md#L88-L145)、[:272-386](../README.md#L272-L386)、[:389-403](../README.md#L389-L403)、[:427-495](../README.md#L427-L495)；`Config` 结构体字段 100% 覆盖 | ✅ 满足 |
-| e2e 覆盖（HTTP/TCP/UDP/多服务/异常） | `test` 包 27 个顶层用例（Windows，含 1 个 `//go:build windows`）/26 个（Linux）；五类验收项各有独立用例，见 §1.9 五行 | ✅ 满足 |
+| e2e 覆盖（HTTP/TCP/UDP/多服务/异常） | `test` 包 29 个顶层用例（Windows，含 1 个 `//go:build windows`）/28 个（Linux）；五类验收项各有独立用例，见 §1.9 五行 | ✅ 满足 |
 | 双平台 | 交叉编译 3 目标通过（[TestCrossCompile](../test/binary_test.go#L492)）；Windows 真实三子进程（[TestSubprocessTCPEcho](../test/binary_test.go#L285)）；WSL2 Ubuntu 真实 Linux 三进程 116 条断言（[README.md:928-972](../README.md#L928-L972)）+ 跨 OS 联调 13 条（[:974-1001](../README.md#L974-L1001)） | ✅ 满足 |
 | Windows 服务（4 子命令 + `pairlink-<mode>`） | 代码与命名单测齐全；真实 SCM 生命周期未执行（非管理员） | 🔒 环境受限（§5 G3） |
-| `v0.1.0` 标签 | `git tag -l` → `v0.1.0`；`git log` → `65f7064`；`-version` 输出 `pairlink v0.1.0` | ✅ 满足 |
+| `v0.1.0` / `v0.2.0` 标签 | `git tag -l` → `v0.1.0`、`v0.2.0`；`-version` 输出 `pairlink v0.2.0` | ✅ 满足 |
 | Apache-2.0 | `LICENSE` 正文 + README §14 | ✅ 满足 |
 
 ---
@@ -229,11 +232,11 @@
 
 | # | 自由度 | README 是否说明 | 具体位置 / 缺口 |
 | --- | --- | --- | --- |
-| 1 | 客户端连接ID 的生成方 | **否（🟡）** | 实现在 [client.go:383-390](../internal/client/client.go#L383-L390)，说明只在 [architecture.md:315-320](architecture.md#L315-L320) 与 [protocol.md:190](protocol.md#L190)；README 零提及 → G1 |
+| 1 | 客户端连接ID 的生成方 | **否（🟡）** | 实现在 [client.go:396](../internal/client/client.go#L396)，说明只在 [architecture.md:315-320](architecture.md#L315-L320) 与 [protocol.md:190](protocol.md#L190)；README 零提及 → G1 |
 | 2 | 管理页 HTML 组织方式 | **否（🟡）** | README §6 只讲页面内容/刷新/CSRF/无鉴权；布局与「只写 `<section>`」的组织方式只在 [architecture.md:326-330](architecture.md#L326-L330) 与代码 → G2 |
-| 3 | 令牌有效期策略 | 是 | [README.md:309](../README.md#L309)（默认 15s 可配）+ [:416-417](../README.md#L416-L417)（短 TTL、用后即焚、SHA-256、常量时间比较） |
-| 4 | UDP 会话超时阈值 | 是（默认值） | [README.md:308](../README.md#L308)/[:324](../README.md#L324)/[:339](../README.md#L339)；未写"为什么是 60s"（P3 可选） |
-| 5 | 日志格式 | 是 | [README.md:498-508](../README.md#L498-L508)（slog、text/json、统一字段、事件清单、Windows 落盘） |
+| 3 | 令牌有效期策略 | 是 | [README.md:317](../README.md#L317)（默认 15s 可配）+ [:437](../README.md#L437)（短 TTL、用后即焚、SHA-256、常量时间比较） |
+| 4 | UDP 会话超时阈值 | 是（默认值） | [README.md:316](../README.md#L316)/[:332](../README.md#L332)/[:349](../README.md#L349)；未写"为什么是 60s"（P3 可选） |
+| 5 | 日志格式 | 是 | [README.md:534-541](../README.md#L534-L541)（slog、text/json、统一字段、事件清单、Windows 落盘） |
 
 ---
 
@@ -252,33 +255,38 @@
 
 ### 5.2 工程增强（task.md / task2 未要求，不计入需求缺失）
 
-| ID | 增强项 | 类型 | 现状与影响 | 优先级 | 建议归属阶段 |
+> **阶段 6E 复核**：v0.1.0 时点列出的 E1–E6 已在阶段 6C/6D 全部实现，下表状态改为「✅ 已实现」
+> 并补充 v0.2.0 实现位置与测试证据；E7 仍未做，E8（文档时点）已在本轮标注/修正。
+
+| ID | 增强项 | 状态 | 实现位置（v0.2.0） | 测试证据 | 备注 |
 | --- | --- | --- | --- | --- | --- |
-| E1 | agent/client 控制连接断开后**自动重连**（指数退避+抖动+上限；重连后重新注册/重拉列表/重建本地监听/在途会话处置） | 工程增强 | 现在断开即 `Run` 返回错误退出，靠 systemd/Windows 服务恢复（[control.go:245](../internal/agent/control.go#L245)、README §10 #1）；无退避，抖动场景会反复拉起 | **P1** | 阶段 A（运行期健壮性） |
-| E2 | 订阅收到 `proto` 变化时**热切换**本地监听（TCP↔UDP） | 工程增强 | 现只 WARN 保持现状（[views.go:100-107](../internal/client/views.go#L100-L107)），改协议要重启 client | **P2** | 阶段 A |
-| E3 | UDP over TCP **每会话发送队列/写者 goroutine**，消除队头阻塞对读循环的放大 | 工程增强 | 现所有会话共用一个 `writeMu` 直写（[agent/tunnel.go:140-181](../internal/agent/tunnel.go#L140-L181)、[client/tunnel.go:131-143](../internal/client/tunnel.go#L131-L143)、relay [carrier.go:275-285](../internal/relay/carrier.go#L275-L285)）：一条慢写会阻塞同承载上的全部会话 | **P1** | 阶段 A |
-| E4 | 原生 UDP 报到/BindOK 丢包处理（首包重传、幂等） | 工程增强 | 现无重传，BindOK 丢失即按 `pair_timeout` 放弃（[docs/protocol.md:404-409](protocol.md#L404-L409)、README §10 #5） | **P2** | 阶段 A |
-| E5 | soak/压力测试（长时间稳定、资源增长曲线） | 工程增强 | 只有 5 轮 e2e 计数（[README.md:750-762](../README.md#L750-L762)），无小时级压测 | **P2** | 阶段 A |
-| E6 | systemd unit（三模式）、安装/卸载 shell、Windows PowerShell 安装/卸载、Dockerfile、docker-compose、`examples/*.ini` | 工程增强 | 目前只有 README 内嵌片段（[README.md:431-458](../README.md#L431-L458)、[:464-479](../README.md#L464-L479)），部署仍需手抄 | **P1**（B） | 阶段 B（部署运维件） |
-| E7 | TLS 强制开关（`tls_required` 或 relay 侧拒绝明文） | 工程增强 | 现未配证书即明文+WARN（[server.go:198-210](../internal/relay/server.go#L198-L210)），误部署风险由文档兜底 | **P3** | 阶段 A 或 B |
-| E8 | README 阶段 4 时点数据/命令过期（`33 个 PASS`、`taskkill /PID`） | 工程增强（文档） | 与 §13.15.6 自相矛盾，审计时易误读（详见 §6） | **P2** | 阶段 B（随其他文档一起改） |
+| E1 | agent/client 控制连接断开后**自动重连**（指数退避+抖动+上限；重连后重新注册/重拉列表/重建本地监听/在途会话处置） | ✅ 已实现 | [internal/reconnect/reconnect.go:34](../internal/reconnect/reconnect.go#L34)（`Backoff`/`Delay`/`Wait`）；[internal/agent/reconnect.go:73](../internal/agent/reconnect.go#L73)、[internal/client/reconnect.go:73](../internal/client/reconnect.go#L73)（`supervise`）；[config.go:152-158](../internal/config/config.go#L152-L158)（`[server]` 字段）、[:209-214](../internal/config/config.go#L209-L214)（`[client]`） | [TestReconnectBackoffCap](../internal/reconnect/reconnect_test.go#L11)、[TestSleepCancelable](../internal/reconnect/reconnect_test.go#L93)、[TestReconnectAfterControlDrop（agent）](../internal/agent/reconnect_test.go#L52)、[TestReconnectAfterControlDrop（client）](../internal/client/reconnect_test.go#L30)、[TestE2EReconnectAfterControlCut](../test/reconnect_e2e_test.go#L135) | 默认 `reconnect=true`、`reconnect_max_backoff=60s`；`false` 回退 v0.1.0 行为；被踢出/relay 停机不重连 |
+| E2 | 订阅收到 `proto` 变化时**热切换**本地监听（TCP↔UDP） | ✅ 已实现 | [internal/client/listener.go:232](../internal/client/listener.go#L232)（`hotSwitchProto`）、[:296](../internal/client/listener.go#L296)（`reconcileListeners`）；[views.go:115](../internal/client/views.go#L115)（事件入口） | [TestHotSwitchTCPToUDP](../internal/client/reconnect_test.go#L197)、[TestHotSwitchUDPToTCP](../internal/client/reconnect_test.go#L252)、[TestHotSwitchRollbackOnFailure](../internal/client/reconnect_test.go#L298)、[TestHotSwitchRepeatedNoLeak](../internal/client/reconnect_test.go#L379) | 原地址重开；失败回滚旧协议；已建会话继续自然结束、不迁移 |
+| E3 | UDP over TCP **每会话发送队列/写者 goroutine**，消除队头阻塞对读循环的放大 | ✅ 已实现 | [internal/tunnelqueue/queue.go:64](../internal/tunnelqueue/queue.go#L64)（`Queue`）、[:145](../internal/tunnelqueue/queue.go#L145)（`SendData`）、[:249](../internal/tunnelqueue/queue.go#L249)（`writeLoop`）；接入 [agent/tunnel.go:176](../internal/agent/tunnel.go#L176)、[client/tunnel.go:60](../internal/client/tunnel.go#L60)、[relay/carrier.go:291](../internal/relay/carrier.go#L291) | [TestTunnelQueueDropPolicy](../internal/tunnelqueue/queue_test.go#L101)、[TestTunnelQueueCloseDrains](../internal/tunnelqueue/queue_test.go#L183)、[TestTunnelQueueEnqueueNeverBlocks](../internal/tunnelqueue/queue_test.go#L269)、[TestTunnelQueueNoGoroutineLeak](../internal/tunnelqueue/queue_test.go#L297)、[TestCarrierSlowSessionDoesNotBlockOthers](../internal/relay/carrier_slow_test.go#L21) | 字节+条数双限；满队列丢弃并记 `tunnel_drop`；关闭排空 |
+| E4 | 原生 UDP 报到/BindOK 丢包处理（首包重传、幂等） | ✅ 已实现 | [internal/agent/data.go:113-117](../internal/agent/data.go#L113-L117)（约 300ms × 3）、[:198](../internal/agent/data.go#L198)（重发循环）；[internal/client/session_udp.go:174-178](../internal/client/session_udp.go#L174-L178)；[internal/relay/udp_data.go:52](../internal/relay/udp_data.go#L52)（半开重复 Bind 幂等）、[:143](../internal/relay/udp_data.go#L143)（`Full` 后丢弃） | [TestNativeUDPBindOKLostRetry（agent）](../internal/agent/reconnect_test.go#L187)、[TestNativeUDPBindOKLostRetry（client）](../internal/client/reconnect_test.go#L423)、[TestNativeUDPBindIdempotent](../internal/relay/udp_bind_test.go#L29)、[TestNativeUDPFullDuplicateBindDropped](../internal/relay/udp_bind_test.go#L65) | 收到 `BindOK` 或首个业务数据报即就绪；`bind_dup_drop` |
+| E5 | soak/压力测试（长时间稳定、资源增长曲线） | ✅ 已实现 | [test/soak_test.go:49](../test/soak_test.go#L49)（`TestSoak`）、[:54](../test/soak_test.go#L54)（`TestSoakShort`）、[test/soak_metrics_windows.go:1](../test/soak_metrics_windows.go#L1)（跨平台资源采样）；[README.md:1150](../README.md#L1150) §13.17 | `go test -tags soak ./test -run TestSoakShort -timeout 10m`（30 轮 / 2m30s 全绿，TCP/UDP 每轮 4/4）；完整长跑命令见 README §13.17 | 默认 30 轮 / 150s；可配 `SOAK_ROUNDS`/`SOAK_DURATION`/`SOAK_SESSIONS` |
+| E6 | systemd unit（三模式）、安装/卸载 shell、Windows PowerShell 安装/卸载、Dockerfile、docker-compose、`examples/*.ini` | ✅ 已实现 | [deploy/systemd/pairlink-relay.service:1](../deploy/systemd/pairlink-relay.service#L1)、[deploy/linux/install.sh:1](../deploy/linux/install.sh#L1)、[deploy/windows/install-service.ps1:1](../deploy/windows/install-service.ps1#L1)、[Dockerfile:1](../Dockerfile#L1)、[deploy/docker-compose.yml:1](../deploy/docker-compose.yml#L1)、[examples/relay.ini:1](../examples/relay.ini#L1) | [TestExamples](../test/examples_test.go#L46)（8 份模板全部 Load/Validate）；[README.md:1135](../README.md#L1135) §13.16 WSL2 systemd 实测 | Docker 构建与 Windows 管理员 SCM 生命周期仍未验证（环境限制） |
+| E7 | TLS 强制开关（`tls_required` 或 relay 侧拒绝明文） | ❌ 未做 | 现状：[internal/relay/server.go:198](../internal/relay/server.go#L198)（未配证书即明文 + WARN） | 文档兜底：[README.md:429](../README.md#L429) §7.1 | 非需求缺口；P3，保留为后续增强 |
+| E8 | README 阶段 4 时点数据/命令过期（`33 个 PASS`、`taskkill /PID`） | ✅ 已实现（文档） | [README.md:705](../README.md#L705)（§13.1 已标注「阶段 4 收尾」）、[README.md:862](../README.md#L862)（§13.12 同时点标注）；[README.md:841](../README.md#L841)（`taskkill` 已改为 `os.Process.Kill()`） | 与 §13.15.6 的 27 个 `--- PASS` 并存但已标明时点，不再自相矛盾 | 纯文档修正 |
 
 ---
 
-## 6. 文档与实现不一致之处（仅列出，本轮不改）
+## 6. 文档与实现不一致之处（阶段 6E 复核）
+
+> D1/D2/D5 已在阶段 6E 关闭；D3/D4/D6 仍为描述性漂移，不影响语义。
 
 | # | 位置 | 现象 | 事实 | 影响 |
 | --- | --- | --- | --- | --- |
-| D1 | [README.md:769-770](../README.md#L769-L770)（§13.10 `TestSubprocessTCPEcho` 条目） | 仍写"最后 `taskkill /PID` 清理" | 阶段 6A 已改为跨平台 `os.Process.Kill()`（[README.md:1031](../README.md#L1031) §13.15.6 与 [test/binary_test.go](../test/binary_test.go) 现状一致） | 同一 README 内自相矛盾，读者会以为仍依赖 `taskkill` |
-| D2 | [README.md:633-635](../README.md#L633-L635)（§13.1 实测）、[:796-799](../README.md#L796-L799)（§13.12） | 写"33 个 `--- PASS`" | 当前 `test` 包顶层用例为 **27** 个（Windows，含 1 个 windows-only）/26 个（Linux），见 [README.md:1044](../README.md#L1044) §13.15.6 与本轮测试函数清点（`test` 包 27 个顶层用例） | 属阶段 4 时点快照，未标注时点；与后文 27/26 不一致 |
+| D1 | [README.md:841](../README.md#L841)（§13.10 `TestSubprocessTCPEcho` 条目） | 曾写"最后 `taskkill /PID` 清理" | **阶段 6E 已修**：改为跨平台 `os.Process.Kill()`，与 [test/binary_test.go](../test/binary_test.go) 现状一致 | 已关闭 |
+| D2 | [README.md:705](../README.md#L705)（§13.1 实测）、[:862](../README.md#L862)（§13.12） | 写"33 个 `--- PASS`" | **阶段 6E 已标注时点**：两处均写明「阶段 4 收尾」；当前 `test` 包顶层用例为 **29** 个（Windows，含 1 个 windows-only）/28 个（Linux），见 §13.15.6 | 已关闭（保留历史快照） |
 | D3 | [docs/architecture.md:230-252](architecture.md#L230-L252)（§4.6 carrier 表） | 草图字段为 `agentCarrier/clientCarrier`、`carrier{conn,writeMu}` | 实际实现为 `carrierSession{key,agent,client,full,agentID,createdAt,lastSeen}` + `carrierConn{...,writeMu,closeOnce,closed}`（[carrier.go:28-61](../internal/relay/carrier.go#L28-L61)） | 仅示意性漂移，不影响语义；写作"建议结构"即可 |
 | D4 | [docs/architecture.md:98-99](architecture.md#L98-L99)（§3.1 末条） | 写踢出"只调用 `Control.Close()` 或数据连接 `Close()`" | 实际踢出还会先写 `MsgKicked`（[relay/admin.go:212](../internal/relay/admin.go#L212)）再关闭；清理仍走既有路径，符合 task.md §5 意图 | 语义仍成立（"只关句柄、不另写清理"），描述可更精确 |
-| D5 | [README.md:515](../README.md#L515)（§10 #1） | "订阅的 proto 变化也不热切换（重启生效）" | 与实现一致（[views.go:100-107](../internal/client/views.go#L100-L107)），但该句把"客户端自动重连缺失"与"协议热切换缺失"写在一起，容易被当成同一条需求 | 建议拆成两条（重连/热切换），避免审计误判 |
+| D5 | [README.md:551](../README.md#L551)（§10 #1） | 曾把"客户端自动重连缺失"与"协议热切换缺失"写在一起 | **阶段 6C/6E 已重写**：§10 #1 只讲自动重连（已实现），§10 #6 单列热切换（已实现） | 已关闭 |
 | D6 | [README.md:742-748](../README.md#L742-L748)（§13.8） | 列 relay 页四块内容 | 实际 relay 页还有「概览」块（含 `UDP 承载模式`/`TCP 数据面`/`UDP 数据面`/`服务数`/`配对占位`/`UDP 会话数`，[admin.go:18-34](../internal/relay/admin.go#L18-L34)），task2 的验收正是靠这块 | 文档少列一块，非错误但漏了 task2 的关键证据 |
 
 ---
 
-## 附录 A：生产代码日志 `event` 清单（共 63 个）
+## 附录 A：生产代码日志 `event` 清单（共 68 个）
 
 取证方式：对 `internal/**`（排除 `_test.go`）匹配 `"event", "<name>"` 后去重排序。
 
@@ -304,7 +312,7 @@ udp_session_open        upstream_dial_failed  version_mismatch
 §7.6 要求的关键事件全部在内：连接建立（`tunnel_accept`/`control_connect`/`local_accept`）、
 注册（`service_register`/`service_registered`）、通知（`incoming`/`pair_issue`）、
 配对（`bind_ok`/`pair_complete`）、断开（`data_close`/`control_close`）、
-超时清理（`pair_timeout`/`idle_timeout`/`udp_evict`/`heartbeat_timeout`）、踢出（`kick`/`kicked`）。
+超时清理（`pair_timeout`/`idle_timeout`/`udp_evict`/`heartbeat_timeout`）、踢出（`kick`/`kicked`）；v0.2.0 新增健壮性事件 `reconnect_scheduled`/`reconnect_ok`/`reconnect_failed`、`listen_hot_switch`、`tunnel_drop`、`bind_dup_drop`。
 
 ## 附录 B：本轮取证命令与环境
 
@@ -312,18 +320,18 @@ udp_session_open        upstream_dial_failed  version_mismatch
 
 ```text
 go version                                  → go1.24.4 windows/amd64
-git log --oneline -1                        → 65f7064 test: 增加 Linux/WSL2 验证并修复测试可移植性
-git tag -l                                  → v0.1.0
-git status --porcelain                      → （空，工作区干净）
+git log --oneline -1                        → v0.2.0 发布提交（feat: v0.2.0 运行期健壮性与部署运维件）
+git tag -l                                  → v0.1.0、v0.2.0
+git status --porcelain                      → （提交后为空）
 grep -rn "^type (PairingKey|PairingTable|ServiceRegistry|PairingToken|TunnelListener|TCPDataListener|UDPDataListener)" internal/
                                             → 7/7 命中（见 §4.1）
 grep -rn "install|uninstall|IsWindowsService" internal/service/ main.go
                                             → 4 个子命令 + run + IsWindowsService（见 §1.10 §10.6）
 grep -rn "服务注册表|在线 agent|配对表|UDP 会话表|本地端口映射|当前活跃" internal/*/
                                             → 三模式页面内容齐全（见 §1.5）
-grep -rn '"event", "[a-z_]*"' internal/     → 63 个事件（见附录 A）
-grep -rn --include=*_test.go "^func Test" .     → 206 个 func Test*（含 TestMain 与 4 个辅助函数）；test 包 27 个顶层 e2e 用例
+grep -rn '"event", "[a-z_]*"' internal/     → 68 个事件（见附录 A）
+grep -rn --include=*_test.go "^func Test" .     → 242 个 func Test*（含 TestMain 与辅助函数）；test 包 32 个顶层用例
 ```
 
-> 说明：本轮**未重新执行** `go test ./...`（分析类任务，且 e2e 需 20s+/轮）；
-> 测试有效性依据 §13.15.2 的 Linux 实测（15 包全绿、race 0 数据竞争）与 §13.15.6 的 Windows 回归记录。
+> 说明：阶段 6B 取证时未重新执行 `go test ./...`（分析类任务）；阶段 6E 已在 Windows 与 WSL2
+> 全量执行 `go test ./... -count=1`、`go test -race ./... -count=1` 与 soak 短版，结果见 README §13.12/§13.15/§13.17。

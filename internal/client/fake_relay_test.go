@@ -4,6 +4,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,9 @@ type fakeRelayOptions struct {
 	// noDataPorts 为 true 时 HelloOK 不下发 tcp_data_port / udp_data_port
 	// （模拟旧 relay 或端口信息缺失）。
 	noDataPorts bool
+	// listFn 非 nil 时按「第几条隧道连接」（从 1 开始）返回服务列表，
+	// 用于模拟 relay 重启后 revision 归零/服务变化。
+	listFn func(connIndex int) (services []protocol.ServiceInfo, revision uint64)
 }
 
 // relayFrame 是假 relay 收到的控制面消息。
@@ -71,6 +75,10 @@ type fakeRelay struct {
 	readyOnce sync.Once
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	// connSeq 是隧道连接序号（从 1 开始），hellos 是收到的 Hello 数量。
+	connSeq atomic.Int32
+	hellos  atomic.Int32
 }
 
 // newFakeRelay 启动假 relay，测试结束自动关闭。
@@ -176,6 +184,7 @@ func (r *fakeRelay) acceptTunnel() {
 // 之后把收到的控制面消息放入 frames 供测试断言。
 func (r *fakeRelay) serveTunnel(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+	connIndex := int(r.connSeq.Add(1))
 
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	typ, payload, err := protocol.ReadFrame(conn)
@@ -190,6 +199,7 @@ func (r *fakeRelay) serveTunnel(conn net.Conn) {
 	if !ok {
 		return
 	}
+	r.hellos.Add(1)
 	r.mu.Lock()
 	r.hello = hello
 	r.ctrl = conn
@@ -229,6 +239,11 @@ func (r *fakeRelay) serveTunnel(conn net.Conn) {
 		Services: r.opts.services,
 		Revision: r.opts.revision,
 		UDPMode:  r.opts.udpMode,
+	}
+	if r.opts.listFn != nil {
+		services, revision := r.opts.listFn(connIndex)
+		list.Services = services
+		list.Revision = revision
 	}
 	if err := protocol.WriteFrame(conn, protocol.MsgServiceList, list); err != nil {
 		return
@@ -390,6 +405,34 @@ func (r *fakeRelay) nextDataConn(t *testing.T, timeout time.Duration) *fakeDataC
 		t.Fatalf("等待数据面连接超时")
 		return nil
 	}
+}
+
+// helloCount 返回收到的 MsgHello 数量（重连测试用）。
+func (r *fakeRelay) helloCount() int { return int(r.hellos.Load()) }
+
+// waitHelloCount 等待收到第 want 条 Hello（重连完成）。
+func (r *fakeRelay) waitHelloCount(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.helloCount() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("等待第 %d 次 Hello 超时（当前 %d）", want, r.helloCount())
+}
+
+// dropControl 关闭当前控制连接（模拟控制连接意外断开，不下发任何消息）。
+func (r *fakeRelay) dropControl(t *testing.T) {
+	t.Helper()
+	r.mu.Lock()
+	conn := r.ctrl
+	r.mu.Unlock()
+	if conn == nil {
+		t.Fatalf("假 relay 尚无控制连接")
+	}
+	_ = conn.Close()
 }
 
 // nextDatagram 等待一个 UDP 数据面数据报。

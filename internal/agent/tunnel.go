@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/config"
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
+	"github.com/lsong98sh/pairlink/internal/tunnelqueue"
 )
 
 // errCarrierClosed 表示承载连接已不可用。
@@ -20,7 +22,7 @@ var errCarrierClosed = errors.New("agent: UDP over TCP 承载连接已关闭")
 // 语义（docs/contract.md §4.6）：
 //   - 懒创建：第一个 UDP 会话到来时才拨号；
 //   - 断开后其上会话全部失效；新会话到来时允许懒建新连接，但**不做会话迁移/重建**；
-//   - 所有写经 writeMu 串行，读循环只分发、不因写阻塞。
+//   - 写侧是单 writer goroutine + 有界队列（tunnelqueue），读循环只分发、不因写阻塞。
 type carrierManager struct {
 	a   *agent
 	mu  sync.Mutex
@@ -54,7 +56,8 @@ func (m *carrierManager) closeAll() {
 //
 // 返回承载连接与其对端地址；错误表示本次会话无法建立。
 func (m *carrierManager) openSession(sess *localSession, key pairing.PairingKey, token string, localConn *net.UDPConn) (*carrier, string, error) {
-	if m.a.tcpDataAddr == "" {
+	tcpDataAddr := m.a.tcpDataAddrSnapshot()
+	if tcpDataAddr == "" {
 		return nil, "", errors.New("TCP 数据面地址不可用")
 	}
 	bind := &protocol.Bind{
@@ -71,25 +74,27 @@ func (m *carrierManager) openSession(sess *localSession, key pairing.PairingKey,
 		m.cur = nil
 	}
 	if c == nil {
-		conn, err := m.a.dialTCP(m.a.ctx, m.a.tcpDataAddr, m.a.dialTimeout())
+		conn, err := m.a.dialTCP(m.a.ctx, tcpDataAddr, m.a.dialTimeout())
 		if err != nil {
 			m.mu.Unlock()
 			return nil, "", fmt.Errorf("连接 relay TCP 数据面（UDP 承载）: %w", err)
 		}
-		c = newCarrier(m.a, conn, m.a.tcpDataAddr)
+		c = newCarrier(m.a, conn, tcpDataAddr)
 		m.cur = c
-		m.a.wg.Add(1)
-		go func() {
-			defer m.a.wg.Done()
-			c.readLoop()
-		}()
-		// 首帧必须在任何后续会话帧之前写出：持管理器锁完成这次写以保证顺序。
-		if err := c.writeFrame(protocol.MsgBind, bind); err != nil {
+		// 首帧必须在任何后续会话帧之前写出（此时发送队列尚未启动，直接同步写），
+		// 这样 relay 才能把这条连接切换到「UDP 隧道帧」模式。
+		if err := c.writeFirstFrame(protocol.MsgBind, bind); err != nil {
 			m.cur = nil
 			m.mu.Unlock()
 			c.fail(err)
 			return nil, "", fmt.Errorf("发送承载首帧 MsgBind: %w", err)
 		}
+		c.startWriter()
+		m.a.wg.Add(1)
+		go func() {
+			defer m.a.wg.Done()
+			c.readLoop()
+		}()
 		if !c.addSession(key, sess, localConn) {
 			m.mu.Unlock()
 			return nil, "", errCarrierClosed
@@ -116,9 +121,12 @@ func (m *carrierManager) openSession(sess *localSession, key pairing.PairingKey,
 	if !c.addSession(key, sess, localConn) {
 		return nil, "", errCarrierClosed
 	}
-	if err := c.writeTunnelFrame(key.String(), frame); err != nil {
+	if !c.writeTunnelFrame(key.String(), frame) {
 		c.removeSession(key)
-		return nil, "", fmt.Errorf("发送承载会话报到帧: %w", err)
+		if c.isClosed() {
+			return nil, "", errCarrierClosed
+		}
+		return nil, "", errors.New("承载连接发送队列已满，本次会话登记被丢弃")
 	}
 	m.a.log.Info("UDP over TCP 会话已挂到既有承载连接", "event", "bind",
 		"pairing_key", key.String(), "carrier", carrierUDPOverTCP, "remote", c.addr)
@@ -132,13 +140,16 @@ type tunnelSession struct {
 }
 
 // carrier 是一条 UDP over TCP 承载连接。
+//
+// 写侧由单 writer goroutine + 有界队列承担（tunnelqueue）：读循环与业务 goroutine
+// 只入队，绝不因慢对端阻塞；整帧原子写出；关闭时先停止入队、排空、再关连接。
 type carrier struct {
 	a    *agent
 	conn net.Conn
 	addr string
 
-	// writeMu 保证同一连接上的隧道帧串行写出，不会交错。
-	writeMu sync.Mutex
+	// out 是发送队列（startWriter 之后非 nil）。
+	out atomic.Pointer[tunnelqueue.Queue]
 
 	mu       sync.Mutex
 	sessions map[pairing.PairingKey]*tunnelSession
@@ -149,7 +160,7 @@ type carrier struct {
 	readyErr  error
 }
 
-// newCarrier 包装一条已拨通的承载连接。
+// newCarrier 包装一条已拨通的承载连接（尚未启动发送队列）。
 func newCarrier(a *agent, conn net.Conn, addr string) *carrier {
 	return &carrier{
 		a:        a,
@@ -160,24 +171,48 @@ func newCarrier(a *agent, conn net.Conn, addr string) *carrier {
 	}
 }
 
-// writeFrame 串行写一个普通 PairLink 帧（承载连接首帧 MsgBind）。
-func (c *carrier) writeFrame(typ protocol.MessageType, payload any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.isClosed() {
-		return errCarrierClosed
-	}
-	return protocol.WriteFrame(c.conn, typ, payload)
+// startWriter 启动发送队列的 writer goroutine。
+func (c *carrier) startWriter() {
+	q := tunnelqueue.New(c.conn, tunnelqueue.Options{
+		OnDrop: func(kind string, dropped int64, queued int) {
+			c.a.log.Warn("UDP 隧道发送队列已满，按策略丢弃", "event", "tunnel_drop",
+				"carrier", carrierUDPOverTCP, "remote", c.addr,
+				"detail", fmt.Sprintf("kind=%s dropped=%d queued=%d", kind, dropped, queued))
+		},
+	})
+	c.out.Store(q)
 }
 
-// writeTunnelFrame 串行写一个 UDP 隧道帧。
-func (c *carrier) writeTunnelFrame(session string, payload []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.isClosed() {
-		return errCarrierClosed
+// writeFirstFrame 同步写出承载连接的首帧（普通 PairLink 帧，不是隧道帧）。
+func (c *carrier) writeFirstFrame(typ protocol.MessageType, payload any) error {
+	if d := c.a.dialTimeout(); d > 0 {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(d))
 	}
-	return protocol.WriteUDPTunnelFrame(c.conn, session, payload)
+	if err := protocol.WriteFrame(c.conn, typ, payload); err != nil {
+		return err
+	}
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	return nil
+}
+
+// writeTunnelFrame 把一帧隧道数据放入发送队列；返回是否成功入队。
+//
+// 非阻塞：队列满时按丢弃策略处理（计数 + 限速 WARN），调用方不需要关闭会话。
+func (c *carrier) writeTunnelFrame(session string, payload []byte) bool {
+	q := c.out.Load()
+	if q == nil {
+		return false
+	}
+	return q.SendData(session, payload)
+}
+
+// writeControlFrame 把一帧控制帧放入优先队列。
+func (c *carrier) writeControlFrame(payload []byte) bool {
+	q := c.out.Load()
+	if q == nil {
+		return false
+	}
+	return q.SendControl(payload)
 }
 
 // isClosed 报告承载连接是否已失效。
@@ -270,7 +305,11 @@ func (c *carrier) fail(cause error) {
 	c.mu.Unlock()
 
 	c.markReady(errCarrierClosed)
-	_ = c.conn.Close()
+	if q := c.out.Load(); q != nil {
+		_ = q.Close()
+	} else {
+		_ = c.conn.Close()
+	}
 	for _, ts := range sessions {
 		ts.sess.closeAll()
 	}
@@ -452,6 +491,8 @@ func (a *agent) handleUDPTunnel(sess *localSession, key pairing.PairingKey, svc 
 }
 
 // tunnelLocalToRelay 读本地 UDP 目标的回包并写回承载连接；返回时注销该会话。
+//
+// 写侧走发送队列：队列满时该帧被丢弃（计数 + 限速 WARN），不关闭会话（UDP 允许丢包）。
 func (a *agent) tunnelLocalToRelay(c *carrier, sess *localSession, key pairing.PairingKey, localConn *net.UDPConn) {
 	defer c.removeSession(key)
 	buf := make([]byte, udpDatagramSize)
@@ -467,13 +508,12 @@ func (a *agent) tunnelLocalToRelay(c *carrier, sess *localSession, key pairing.P
 		}
 		sess.touch()
 		sess.bytesOut.Add(int64(n))
-		if werr := c.writeTunnelFrame(key.String(), buf[:n]); werr != nil {
-			if sess.isClosed() || a.ctx.Err() != nil || errors.Is(werr, errCarrierClosed) {
+		if !c.writeTunnelFrame(key.String(), buf[:n]) {
+			if sess.isClosed() || a.ctx.Err() != nil || c.isClosed() {
 				return
 			}
-			a.log.Warn("写 UDP 隧道帧失败，结束本次会话", "event", "data_close",
-				"pairing_key", key.String(), "err", werr)
-			return
+			// 丢弃（队列满）：不结束会话，等待后续帧或超时收敛。
+			continue
 		}
 	}
 }

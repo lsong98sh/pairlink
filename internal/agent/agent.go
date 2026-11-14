@@ -11,8 +11,12 @@
 //   - manage_listen 非空时提供只读管理页；
 //   - ctx 取消时关闭控制连接、全部数据/承载连接与本地 UDP 会话，等全部 goroutine 退出后返回 nil。
 //
-// 数据面是明文哑管道，不解析任何上层协议。控制连接意外断开时**不自动重连**（由
-// systemd / Windows 服务恢复策略重启进程），这是第一版明确的设计选择。
+// 数据面是明文哑管道，不解析任何上层协议。控制连接意外断开时**默认自动重连**
+// （[server] reconnect = true，默认值；指数退避 base 1s / ×2 / cap
+// reconnect_max_backoff 默认 60s / ±20% 抖动）：重连成功后重新 Hello、重新注册
+// cfg.Server.All() 的全部服务并重建心跳，重连期间关闭全部在途会话（reason=reconnect，
+// 不做迁移）。reconnect = false 时保持阶段 6C 之前的行为（断开即返回错误，由
+// systemd / Windows 服务恢复策略重启进程）。
 package agent
 
 import (
@@ -29,6 +33,7 @@ import (
 	"github.com/lsong98sh/pairlink/internal/logx"
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
+	"github.com/lsong98sh/pairlink/internal/reconnect"
 )
 
 // modeName 是日志 mode 字段与管理页展示使用的模式名。
@@ -77,9 +82,11 @@ type registeredService struct {
 //
 // 并发约定：
 //   - ctx/cancel、ctx 派生的连接、sessions、carrier 由各自内部锁保护或只在启动阶段写；
-//   - ctrlMu 保护「控制连接状态」这一组会被管理页与心跳 goroutine 并发读写的字段；
-//   - services / byService / dataAddr 在启动阶段（前台 goroutine）写完后只读，
-//     后台 goroutine 都是在那之后创建的，因此不存在数据竞争。
+//   - ctrlMu 保护「控制连接协商状态」这一组会被管理页与心跳 goroutine 并发读写的字段；
+//   - connMu 保护控制连接指针（重连会整体替换它）；
+//   - addrMu 保护 data 面地址（每次重连重新推导）；
+//   - services / byService 只在控制面 goroutine 写、由 ctrlMu 保护读取；
+//   - 后台 goroutine 在启动阶段之后创建，退出由 ctx 取消与连接关闭驱动。
 type agent struct {
 	cfg *config.Config
 	log *slog.Logger
@@ -91,6 +98,10 @@ type agent struct {
 
 	ctrl *controlConn
 
+	// connMu 保护 ctrl 指针：重连时整体替换，关停时可能被监督循环之外的
+	// goroutine（ctx 看护）关闭，因此不能只靠「单 goroutine 写」。
+	connMu sync.Mutex
+
 	ctrlMu       sync.Mutex
 	agentID      string
 	relayVersion int
@@ -101,10 +112,12 @@ type agent struct {
 	connectedAt  time.Time
 	lastAck      time.Time
 
-	// services 是已注册服务的快照，与下面的控制连接状态一起受 ctrlMu 保护
-	// （注册发生在启动阶段，管理页与测试会并发读取）。
+	// services 是已注册服务的快照，与上面的控制连接状态一起受 ctrlMu 保护
+	// （注册发生在控制面 goroutine，管理页与测试会并发读取）。
 	services []registeredService
 
+	// addrMu 保护重连时重新推导的数据面地址。
+	addrMu      sync.RWMutex
 	tcpDataAddr string
 	udpDataAddr string
 
@@ -115,16 +128,25 @@ type agent struct {
 
 	adminSrv *admin.Server
 
+	// reconnectBase 是重连退避的基准等待（默认 1s，测试可缩短）。
+	reconnectBase time.Duration
+	backoffOnce   sync.Once
+	backoffSeq    *reconnect.Backoff
+
 	wg           sync.WaitGroup
 	shutdownOnce sync.Once
 }
 
 // Run 启动 agent 模式，直到 ctx 取消或控制连接终止。
 //
-// 返回值语义（docs/contract.md §2.1）：
+// 返回值语义（docs/contract.md §2.1 / §2.4）：
 //   - ctx 取消且清理完成 → nil；
-//   - 启动失败（拨号失败、握手失败、注册失败、管理页监听失败）→ 非 nil 错误；
-//   - 运行中不可恢复（控制连接断开、被踢出）→ 非 nil 错误；收到 MsgServerShutdown → nil。
+//   - 管理页监听失败、配置非法、relay 明确拒绝（MsgError，如 auth_failed）或协议
+//     版本不兼容 → 非 nil 错误（不重试）；
+//   - 启用 [server] reconnect（默认）时：拨号/握手/注册阶段的**可重试**失败与控制
+//     连接意外断开都不会结束进程，而是按指数退避重连；重连期间进程存活；
+//   - 被踢出（MsgKicked）→ 清理后返回错误；收到 MsgServerShutdown → 返回 nil；
+//   - reconnect = false 时控制连接断开 → 返回错误（旧行为）。
 func Run(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil {
 		return errors.New("agent: 配置为 nil")
@@ -161,64 +183,60 @@ func newAgent(ctx context.Context, cfg *config.Config, log *slog.Logger) *agent 
 	return a
 }
 
-// run 完成启动、等待退出信号、执行关停。
+// run 完成启动、连接监督与关停。
+//
+// 管理页与清理 ticker 在整个进程生命周期内只启动一次；控制连接（含心跳）由
+// supervise 按连接建立/拆除，重连不重建管理页。
 func (a *agent) run() error {
-	if err := a.connect(); err != nil {
-		a.shutdown()
-		return err
-	}
 	if err := a.startAdmin(); err != nil {
 		a.shutdown()
 		return err
 	}
 	a.startBackground()
 
-	// 控制面读循环是唯一读取控制连接的 goroutine；它退出即代表控制面终止。
-	a.wg.Add(1)
-	resultCh := make(chan error, 1)
-	go func() {
-		defer a.wg.Done()
-		resultCh <- a.controlLoop()
-	}()
-
 	a.log.Info("agent 已启动", "event", "start",
-		"agent_id", a.agentIDSnapshot(),
-		"detail", fmt.Sprintf("relay=%s services=%d udp_mode=%s", a.cfg.Server.RelayAddr, len(a.registeredServices()), a.udpModeSnapshot()),
+		"detail", fmt.Sprintf("relay=%s services=%d reconnect=%t",
+			a.cfg.Server.RelayAddr, len(a.cfg.Server.All()), a.reconnectEnabled()),
 	)
 
-	var err error
-	select {
-	case <-a.ctx.Done():
-	case err = <-resultCh:
-	}
+	err := a.supervise()
 	a.shutdown()
 	return err
 }
 
 // connect 建立控制连接、完成握手、注册全部服务并推导数据面地址。
+//
+// 错误分两类：返回 permanentErr 的错误（配置非法、relay 明确拒绝、版本不兼容）
+// 不再重试；其余错误（拨号失败、读超时、连接被关闭）由 supervise 退避重试。
 func (a *agent) connect() error {
 	host, _, err := splitRelayAddr(a.cfg.Server.RelayAddr)
 	if err != nil {
-		return fmt.Errorf("agent: [server] relay_addr 非法: %w", err)
+		return permanent(fmt.Errorf("agent: [server] relay_addr 非法: %w", err))
 	}
 	a.relayHost = host
 
 	tcfg, err := serverTLSConfig(&a.cfg.Server, host, a.log)
 	if err != nil {
-		return err
+		return permanent(err)
 	}
 	conn, err := a.dialRelay(tcfg)
 	if err != nil {
 		return fmt.Errorf("agent: 连接 relay %s: %w", a.cfg.Server.RelayAddr, err)
 	}
-	a.ctrl = newControlConn(conn)
+	ctrl := newControlConn(conn)
+	a.setControl(ctrl)
 	a.log.Info("已连接 relay 控制面", "event", "control_connect",
 		"remote", conn.RemoteAddr().String(), "detail", fmt.Sprintf("tls=%t", tcfg != nil))
 
-	if err := a.handshake(); err != nil {
-		return err
+	// 握手/注册阶段允许 ctx 取消立即打断阻塞读（不必等 dial_timeout）。
+	stopWatch := a.watchCancel(ctrl)
+	err = a.handshake(ctrl)
+	if err == nil {
+		err = a.registerServices(ctrl)
 	}
-	if err := a.registerServices(); err != nil {
+	stopWatch()
+	if err != nil {
+		a.closeControl()
 		return err
 	}
 	a.resolveDataAddrs()
@@ -234,9 +252,7 @@ func (a *agent) shutdown() {
 		// 先取消 ctx：数据面 forward.Bidirectional 的看护 goroutine 会关闭两端，
 		// 心跳/清理 ticker 也会随 ctx.Done 退出。
 		a.cancel()
-		if a.ctrl != nil {
-			a.ctrl.close()
-		}
+		a.closeControl()
 		a.sessions.closeAll()
 		a.carrier.closeAll()
 		a.wg.Wait()
@@ -268,6 +284,60 @@ func (a *agent) dialTimeout() time.Duration {
 // agent 的 ini 通常没有 [relay] 段，因此等价于默认值），见 docs/protocol.md §8。
 func (a *agent) pairTimeout() time.Duration {
 	return positiveDuration(a.cfg.Relay.PairTimeout, defaultPairTimeout)
+}
+
+// setControl 发布当前控制连接（重连时整体替换）。
+func (a *agent) setControl(c *controlConn) {
+	a.connMu.Lock()
+	a.ctrl = c
+	a.connMu.Unlock()
+}
+
+// controlConn 返回当前控制连接（可能为 nil，表示未连接/重连等待中）。
+func (a *agent) controlConn() *controlConn {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	return a.ctrl
+}
+
+// closeControl 关闭并清空当前控制连接（幂等）。
+func (a *agent) closeControl() {
+	a.connMu.Lock()
+	c := a.ctrl
+	a.ctrl = nil
+	a.connMu.Unlock()
+	if c != nil {
+		c.close()
+	}
+}
+
+// tcpDataAddrSnapshot 返回当前 TCP 数据面地址。
+func (a *agent) tcpDataAddrSnapshot() string {
+	a.addrMu.RLock()
+	defer a.addrMu.RUnlock()
+	return a.tcpDataAddr
+}
+
+// udpDataAddrSnapshot 返回当前原生 UDP 数据面地址。
+func (a *agent) udpDataAddrSnapshot() string {
+	a.addrMu.RLock()
+	defer a.addrMu.RUnlock()
+	return a.udpDataAddr
+}
+
+// setDataAddrs 发布本次连接推导出的数据面地址。
+func (a *agent) setDataAddrs(tcpAddr, udpAddr string) {
+	a.addrMu.Lock()
+	a.tcpDataAddr = tcpAddr
+	a.udpDataAddr = udpAddr
+	a.addrMu.Unlock()
+}
+
+// resetRegisteredServices 清空已注册服务快照（每次（重）连接重新注册前调用）。
+func (a *agent) resetRegisteredServices() {
+	a.ctrlMu.Lock()
+	a.services = nil
+	a.ctrlMu.Unlock()
 }
 
 // udpSessionTimeout 返回本地 UDP 会话空闲清理时间。
@@ -343,10 +413,11 @@ type controlSnapshot struct {
 
 // controlSnapshot 返回控制连接状态快照。
 func (a *agent) controlSnapshot() controlSnapshot {
+	ctrl := a.controlConn()
 	a.ctrlMu.Lock()
 	defer a.ctrlMu.Unlock()
 	s := controlSnapshot{
-		connected:   a.ctrl != nil,
+		connected:   ctrl != nil,
 		since:       a.connectedAt,
 		agentID:     a.agentID,
 		udpMode:     a.udpMode,
@@ -356,10 +427,15 @@ func (a *agent) controlSnapshot() controlSnapshot {
 		lastAck:     a.lastAck,
 		version:     a.relayVersion,
 	}
-	if a.ctrl != nil {
-		s.addr = a.ctrl.remoteAddr()
+	if ctrl != nil {
+		s.addr = ctrl.remoteAddr()
 	}
 	return s
+}
+
+// adminSnapshot 返回管理页渲染需要的控制面与数据面快照。
+func (a *agent) adminSnapshot() (controlSnapshot, string, string) {
+	return a.controlSnapshot(), a.tcpDataAddrSnapshot(), a.udpDataAddrSnapshot()
 }
 
 // endSession 关闭并移除一个本地会话（关连接 → 删表项）。

@@ -85,8 +85,13 @@ UDP 隧道帧解析模式**；此后该 TCP 连接上传输的就是 UDP 隧道�
 - 一条承载连接上可同时存在多个会话；relay 按 `session` 分别转发到对端的承载连接。
 - 单帧上限 65665 字节（129 字节会话标识 + 65535 字节数据报 + 1 字节长度），
   超限视为协议错误并关闭该承载连接（防内存放大）。
+- 写侧推荐（阶段 6C 起三端统一）：**单 writer goroutine + 有界发送队列**，读循环只入队，
+  绝不因慢对端阻塞；控制帧（`session=""`）走独立的优先队列，避免被数据洪泛饿死；
+  队列满时按策略丢弃并计数（`event=tunnel_drop`，限速 WARN），关闭时先停止入队、
+  排空（有上限）再关连接。帧仍必须**整帧单次 `Write`**，不得拆帧或与其它 goroutine 交错。
 - **帧头属于 PairLink 封装，不违反"数据面不解析上层协议"原则**：UDP 数据报的字节原样
-  作为 payload，不解析其内容。
+  作为 payload，不解析其内容。唯一的例外是原生 UDP 的重复报到检测：只嗅探 5 字节帧头
+  判断"是不是同一配对键的 MsgBind 帧"（见 §5.2.1 第 4 条）。
 
 ## 3. 消息一览
 
@@ -238,6 +243,9 @@ relay 推送 `updated` 事件。
 
 `MsgBindOK` 本身也是一个完整帧数据报（5 字节帧头 + JSON）。
 
+阶段 6C 起：**同一端点重复报到会重复回 `MsgBindOK`**（幂等，见 §5.2.1 第 4/6 条）。
+远端的正确用法是"收到即就绪，重复收到只更新就绪状态"，不要求按序号去重。
+
 ### 4.11 `MsgHeartbeat`（0x0E）/ `MsgHeartbeatAck`（0x0F）
 
 均为空消息。收到 `MsgHeartbeat` 必须尽快回 `MsgHeartbeatAck`；收到 Ack 更新 `LastSeen`。
@@ -388,25 +396,30 @@ stateDiagram-v2
 3. **不做源地址漂移**：同一侧端点改变一律拒绝（`ErrUDPEndpointConflict`），由上层超时清理
    后重新接入（spec 允许）。
 4. **令牌语义（UDP 特化）**：UDP 无连接，报到帧可能丢包重发，因此：
-   - 半会话阶段对同一侧的重复 `MsgBind`：relay 已在"按源地址反查"一步命中该端点，
-     **不再解析帧、不再校验令牌、不再回 `MsgBindOK`**（等价于按数据报处理并丢弃，
-     因为对端尚未报到）；因此 BindOK 丢失时的重试不会得到第二次应答，
-     agent/client 必须按 `pair_timeout` 放弃并重新走控制面配对；
+   - **半会话阶段对同一侧、同一端点的重复 `MsgBind`：幂等**——relay 在"按源地址反查"一步
+     命中该端点后，嗅探 5 字节帧头确认是同一配对键的 `MsgBind`，**再次回 `MsgBindOK`**
+     （令牌只校验不消费，与首次登记一致）。这样 BindOK 丢包时 agent/client 的 300ms 重发
+     能得到应答，不必等 `pair_timeout` 后重走控制面配对；
    - 会话变 `Full` 的那一刻调用一次 `token.Store.Consume`；
-   - `Full` 之后的数据报不再看令牌（按端点索引转发）；**relay 不再解析任何数据报内容**，
-     因此同一端点再次发来的 `MsgBind` 会被当作普通载荷转发给对端——本版 agent/client
-     从不重传 Bind，所以正常部署不会触发；
-   - 令牌仍受 `token_ttl` 约束，过期后任何新的 Bind 都返回 `invalid_token`，必须重新走
-     控制面 `ConnectRequest`。
+   - `Full` 之后的数据报按端点索引转发，relay **不做内容解析**；唯一例外是帧头嗅探：
+     若数据报的第一个字节是 `MsgBind` 且能解析出**同一配对键**，则**丢弃、不转发**
+     （否则这个报到帧会被当作业务数据污染对端数据流），并记 debug 日志
+     （`event=bind_dup_drop`）。其它数据报（包括看起来像 Bind、但配对键不同的）照常原样
+     转发；
+   - 令牌仍受 `token_ttl` 约束，过期后任何**新的**（未登记端点的）Bind 都返回
+     `invalid_token`，必须重新走控制面 `ConnectRequest`。
 5. **超时两级**：半会话用 `pair_timeout`（阶段 2 用 `UDPTable.Snapshot` 筛选 `!Complete &&
    now-CreatedAt > pair_timeout` 后 `Remove`）；完整会话用 `udp_session_timeout` 调
    `UDPTable.Sweep`。
-6. **UDP 的 BindOK 只回一次**：同一 `(key, side, endpoint)` 首次登记时回一次；
-   `Full` 之后 relay 不再回 BindOK（收到的字节都当数据）。若 BindOK 丢失，agent/client
-   按 `pair_timeout` 放弃本次配对并让第三方重试（第一版不做可靠重传，见 README 已知限制）。
-   已知边界：若 BindOK 与随后转发的业务数据报在网络中**乱序**（同一 socket 顺序写出，
-   实际几乎不可能），先到的业务数据报会被 agent/client 当作首包正常处理，而迟到的 BindOK
-   会被 agent 当作业务数据转给本地目标；第一版不为此额外解析每个数据报（README 已知限制）。
+6. **报到重传与 BindOK 重复应答（阶段 6C）**：agent/client 发 `MsgBind` 后，若在
+   `pair_timeout` 内每约 **300ms** 仍未收到应答，就**重发报到帧，最多 3 次**；
+   收到 `MsgBindOK` **或首个业务数据报**即视为就绪。relay 侧对应地：半开会**重复回**
+   `MsgBindOK`（幂等），`Full` 后丢弃重复的 Bind 帧（见第 4 条）。
+   - 为什么可以重复回而不算协议违规：UDP 报到本身没有事务状态，重复应答只是让对端
+     "确认自己已就绪"，不会改变会话映射；
+   - 遗留边界：若 BindOK 与随后转发的业务数据报在网络中**乱序**（同一 socket 顺序写出，
+     实际几乎不可能），先到的业务数据报仍会被 agent/client 当作首包正常处理，而迟到的
+     BindOK 会被当作业务数据转给本地目标；双方都不为此额外解析每个数据报。
 
 #### 5.2.2 UDP over TCP（`udp_mode = tcp_tunnel`，未配置 `udp_listen`）
 
@@ -500,6 +513,11 @@ stateDiagram-v2
 | agent 本地 UDP 清理 | `[server] udp_session_timeout` | 60s | agent 侧本地 UDP 转发会话空闲 |
 | client 本地 UDP 清理 | `[client] udp_session_timeout` | 60s | client 侧本地 UDP 转发会话空闲（阶段 4 起可配置） |
 | 拨号超时 | `[server]`/`[client] dial_timeout` | 10s | 连接 relay / 本地目标超时 |
+| UDP 报到重发间隔 | 内置常量 | 300ms | 原生 UDP 的 `MsgBind` 在未收到应答时的重发间隔（阶段 6C） |
+| UDP 报到最多重发 | 内置常量 | 3 次 | 在 `pair_timeout` 内的最大重发次数；之后继续等剩余超时后放弃 |
+| 重连退避基准 | 内置常量 | 1s | agent/client 控制连接重连的第 1 次等待（阶段 6C） |
+| 重连退避上限 | `[server]`/`[client] reconnect_max_backoff` | 60s | 指数退避（×2 + ±20% 抖动）的上限；必须 > 0 |
+| 隧道发送队列 | 内置常量 | 1024 帧 / 8 MiB（数据）、256 帧（控制） | UDP over TCP 承载连接的发送队列上限（阶段 6C） |
 
 `HelloOK.heartbeat_seconds` 是建议值：实际间隔取 `min(本地配置, 建议值)`。
 控制面任何合法消息都刷新 `LastSeen`（不仅是心跳）。

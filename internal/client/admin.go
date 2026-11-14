@@ -46,6 +46,7 @@ func (c *client) startAdmin() error {
 // 概览、relay 服务列表、本地端口映射表、当前活跃配对。
 func (c *client) renderAdminPage(w io.Writer, _ *http.Request) {
 	services, revision := c.servicesView()
+	neg := c.negotiated()
 
 	var b bytes.Buffer
 	add := b.WriteString
@@ -53,14 +54,15 @@ func (c *client) renderAdminPage(w io.Writer, _ *http.Request) {
 	// 概览
 	add(`<section><h2>概览</h2><table><tbody>`)
 	row(&b, "relay 隧道", c.cfg.Client.RelayAddr)
-	row(&b, "client_id", orDash(c.clientID))
-	row(&b, "udp_mode", c.udpMode)
+	row(&b, "client_id", orDash(neg.clientID))
+	row(&b, "udp_mode", neg.udpMode)
 	row(&b, "服务列表 revision", strconv.FormatUint(revision, 10))
 	row(&b, "订阅服务变更", yesNo(c.cfg.Client.Subscribe))
-	row(&b, "TCP 数据面", orDash(c.tcpDataAddr))
+	row(&b, "自动重连", yesNo(c.cfg.Client.Reconnect))
+	row(&b, "TCP 数据面", orDash(neg.tcpDataAddr))
 	udpPlane := "（tcp_tunnel，复用 tcp_listen）"
-	if c.udpMode == "native" {
-		udpPlane = orDash(c.udpDataAddr)
+	if neg.udpMode == "native" {
+		udpPlane = orDash(neg.udpDataAddr)
 	}
 	row(&b, "UDP 数据面", udpPlane)
 	row(&b, "本地 TCP 连接 / UDP 会话", fmt.Sprintf("%d / %d", c.sessionCount(), c.udpSessionCount()))

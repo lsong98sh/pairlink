@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lsong98sh/pairlink/internal/version"
 )
 
 // pairlinkExe 是 TestMain 构建出的真实二进制路径。
@@ -86,8 +88,9 @@ func TestBinaryVersionUsageAndConfigErrors(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("-version 退出码 = %d，期望 0（输出=%q）", code, out)
 	}
-	if got := strings.TrimSpace(out); got != "pairlink v0.1.0" {
-		t.Fatalf("-version 输出 = %q，期望 %q", got, "pairlink v0.1.0")
+	want := "pairlink " + version.Version
+	if got := strings.TrimSpace(out); got != want {
+		t.Fatalf("-version 输出 = %q，期望 %q", got, want)
 	}
 	t.Logf("-version: %s（退出码 0）", strings.TrimSpace(out))
 

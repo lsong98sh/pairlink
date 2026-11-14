@@ -1,0 +1,35 @@
+# 构建上下文只保留编译所需内容，避免把 .git、本机二进制、日志和测试带进镜像。
+.git
+.gitignore
+.github/
+.idea/
+.vscode/
+
+# 本机构建产物（容器内会重新编译）
+pairlink
+pairlink.exe
+pairlink-*
+dist/
+build/
+coverage.txt
+*.exe
+*.test
+*.out
+
+# 运行时产物
+*.log
+logs/
+
+# 配置模板、部署件、测试与文档不参与镜像构建（compose 从宿主机只读挂载 ini）
+deploy/
+docs/
+test/
+examples/
+task.md
+task2.txt
+README.md
+
+# 私有证书/密钥
+*.pem
+*.key
+*.crt

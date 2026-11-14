@@ -215,7 +215,8 @@ func TestServerShutdown(t *testing.T) {
 	}
 }
 
-// TestControlConnectionLost 覆盖控制连接意外断开：返回错误、不自动重连。
+// TestControlConnectionLost 覆盖控制连接意外断开 + reconnect=false（旧行为）：
+// 返回错误、不自动重连。reconnect=true 的自愈语义见 reconnect_test.go。
 func TestControlConnectionLost(t *testing.T) {
 	f := newFakeRelay(t, relayOptions{
 		token:         "test-token",
@@ -224,6 +225,8 @@ func TestControlConnectionLost(t *testing.T) {
 	})
 	cfg := newTestConfig(f.tunnelAddr(),
 		config.ServerService{ID: "default", Proto: "tcp", Addr: startTCPEcho(t)})
+	// 直接构造 Config 时 Reconnect 零值为 false（= 阶段 6C 之前的旧行为）。
+	cfg.Server.Reconnect = false
 	run := startAgent(t, cfg)
 	recv(t, f.registrations, "注册请求")
 

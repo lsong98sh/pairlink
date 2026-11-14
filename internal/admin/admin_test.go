@@ -77,7 +77,7 @@ func httpPost(t *testing.T, rawURL string, values url.Values, headers map[string
 }
 
 func TestIndexAndPages(t *testing.T) {
-	s := startTestServer(t, Options{Title: "PairLink 测试页", Mode: "relay", Version: "v0.1.0", Logger: discardLogger()})
+	s := startTestServer(t, Options{Title: "PairLink 测试页", Mode: "relay", Version: "v9.9.9", Logger: discardLogger()})
 	s.AddPage(Page{
 		Path:  "/services",
 		Title: "服务列表",
@@ -99,7 +99,7 @@ func TestIndexAndPages(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("首页状态码 = %d", status)
 	}
-	for _, want := range []string{"PairLink 测试页", "relay", "v0.1.0", "服务列表", "/services", "首页"} {
+	for _, want := range []string{"PairLink 测试页", "relay", "v9.9.9", "服务列表", "/services", "首页"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("首页缺少 %q", want)
 		}
@@ -132,7 +132,7 @@ func TestCSRF(t *testing.T) {
 	called := 0
 	s := startTestServer(t, Options{
 		Mode:    "relay",
-		Version: "v0.1.0",
+		Version: "v9.9.9",
 		Actions: []Action{{
 			Name:  "kick",
 			Title: "踢出",
