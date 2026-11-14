@@ -69,6 +69,20 @@ func (s *Store) TTL() time.Duration {
 	return s.ttl
 }
 
+// SetTTL 更新令牌有效期（阶段 7：管理页运行期修改 token_ttl）。
+//
+// 只影响此后签发的令牌；已签发令牌保留原 expiresAt。
+// ttl <= 0 返回错误且不改变当前值。
+func (s *Store) SetTTL(ttl time.Duration) error {
+	if ttl <= 0 {
+		return errors.New("token: 令牌有效期必须大于 0")
+	}
+	s.mu.Lock()
+	s.ttl = ttl
+	s.mu.Unlock()
+	return nil
+}
+
 // Issue 为配对键签发一个新令牌（32 字节 crypto/rand → base64url 无填充）。
 //
 // 同一配对键重复签发会覆盖旧令牌，旧令牌立即失效。

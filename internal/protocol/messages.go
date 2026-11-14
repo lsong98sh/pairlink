@@ -238,3 +238,18 @@ type ServerShutdown struct {
 	// Reason 是停机原因，仅用于日志与展示。
 	Reason string `json:"reason"`
 }
+
+// UnregisterService 是 agent 主动注销服务的请求（0x13）。
+//
+// 阶段 7 新增：agent 管理页删除/修改本地服务时，先向 relay 注销旧注册。
+// 旧 relay 收到未知类型会记日志并忽略，因此这是向后兼容的新增消息。
+type UnregisterService struct {
+	// ServiceID 是待注销的服务ID（1..64，字符集 [a-z0-9-_]）。
+	ServiceID string `json:"service_id"`
+}
+
+// ServiceUnregistered 是注销成功的确认（0x14）。
+type ServiceUnregistered struct {
+	// ServiceID 是已注销的服务ID。
+	ServiceID string `json:"service_id"`
+}

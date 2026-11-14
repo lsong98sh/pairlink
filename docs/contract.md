@@ -176,6 +176,10 @@ TLS：`cfg.Relay.TLSCert`/`TLSKey` 均非空时隧道 `tls.Listen`（`tls.Config
      鉴权失败 `auth_failed` / 版本不兼容 `unsupported_version` / 注册被 relay 明确拒绝
      （均返回错误，重试无意义）、TLS 握手失败（配置不匹配）、`ctx` 取消（返回 `nil`）。
 8. 本地目标连接失败只影响本次配对（关数据连接 + 日志），不得让整个 `Run` 退出。
+9. 阶段 7：管理页（回环绑定）可新增/修改/删除 `[server] service.<id>`、修改主服务
+   `protocol` + `local`。顺序为"校验 → 改本地服务表 → 向 relay 注册/注销并等确认
+   （3s）→ 成功才写回 ini"；relay 拒绝/超时/写盘失败都回滚本地表与 relay 状态。
+   重连后重新注册的是**当前**服务表（不是启动时的 `cfg.Server.All()`）。
 
 ### 2.5 client.Run 的职责
 
@@ -222,6 +226,12 @@ TLS：`cfg.Relay.TLSCert`/`TLSKey` 均非空时隧道 `tls.Listen`（`tls.Config
     - 切换只关监听 socket，已建立的会话各自持有连接，允许自然结束；新连接走新协议；
     - 服务不在列表里时保留当前监听协议（`service_missing` 的 TCP 占位只用于首次启动），
       服务重新出现且 proto 不同则再次热切换。
+11. 阶段 7：管理页（回环绑定）可新增/修改/删除 `[client] service.<id>` 本地映射：
+    - 新增：按 relay 服务列表选择 proto（列表缺失 → TCP 占位 + WARN），打开监听成功后写回 ini；
+    - 修改：地址变化时先开新监听、成功再关旧监听；协议变化复用 `hotSwitchProto`；
+    - 删除：关闭监听并删除 ini 行；写盘失败时重开监听/恢复映射并报错。
+    - 运行期映射表（受锁保护）是 `reconcileListeners` 与重连校对的唯一来源；
+      `cfg.Client.Services` 只作为启动初始值。
 
 ## 3. 冻结包的可用 API（阶段 2 只允许用这些）
 
@@ -238,6 +248,10 @@ const DefaultServiceID = "default"
 func ParseMode(s string) (Mode, error)
 func (m Mode) Valid() bool
 func (m Mode) String() string
+func ValidateServiceID(id string) error                  // 阶段 7：管理页表单校验
+func NormalizeListenAddr(v string) (string, error)       // 阶段 7：管理页表单校验
+func PatchValue(path, section, key, value string) error  // 阶段 7：ini 行级补丁（原子写）
+func DeleteKey(path, section, key string) error          // 阶段 7：删除 ini 键行
 
 type Config struct {
     Path     string
@@ -311,7 +325,8 @@ const (
     MsgHello, MsgHelloOK, MsgRegisterService, MsgServiceRegistered,
     MsgListServices, MsgServiceList, MsgSubscribe, MsgServiceEvent,
     MsgConnectRequest, MsgPairResult, MsgIncoming, MsgBind, MsgBindOK,
-    MsgHeartbeat, MsgHeartbeatAck, MsgError, MsgKicked, MsgServerShutdown MessageType = ...
+    MsgHeartbeat, MsgHeartbeatAck, MsgError, MsgKicked, MsgServerShutdown,
+    MsgUnregisterService, MsgServiceUnregistered MessageType = ...
 )
 func (t MessageType) String() string
 func (t MessageType) Valid() bool
@@ -331,7 +346,8 @@ func ReadUDPTunnelFrame(r io.Reader) (session string, payload []byte, err error)
 // 消息结构体（全部字段见 docs/protocol.md §4）
 Hello, HelloOK, RegisterService, ServiceRegistered, ListServices, ServiceList,
 Subscribe, ServiceEvent, ConnectRequest, PairResult, Incoming, Bind, BindOK,
-Heartbeat, HeartbeatAck, Error, Kicked, ServerShutdown
+Heartbeat, HeartbeatAck, Error, Kicked, ServerShutdown,
+UnregisterService, ServiceUnregistered
 
 // Error 新增可选关联字段（阶段 4，向后兼容、不升版本）：
 //   ClientConnID string  // relay 应答某个 ConnectRequest 的错误时填入其 client_conn_id；
@@ -551,17 +567,27 @@ func (s *Server) Handler() http.Handler
 func (s *Server) CSRFToken() string
 func (s *Server) CSRFInput() template.HTML
 func (s *Server) WriteHTML(w http.ResponseWriter, r *http.Request, pageBody template.HTML)
+func (s *Server) Writable() bool                       // 阶段 7：manage_listen 是否绑定回环
+func IsLoopbackListen(addr string) bool                // 阶段 7：127.0.0.0/8、::1、localhost
+func OnlyPostFields(r *http.Request, allowed ...string) bool // 阶段 7：表单字段白名单
+func ParsePositiveDuration(raw string) (time.Duration, error) // 阶段 7
+func (s *Server) Audit(r *http.Request, action, target, oldValue, newValue string)  // 阶段 7
+func (s *Server) AuditFailure(r *http.Request, action, target string, err error)    // 阶段 7
+func RedirectNotice(w http.ResponseWriter, r *http.Request, path string, isErr bool, msg string) // 阶段 7：303
+func NoticeBar(r *http.Request) template.HTML          // 阶段 7：?ok=/?err= 提示条
 var ErrAlreadyStarted error
 ```
 
 - 页面只写主体 HTML（`<section>…`），`Render` 内**不要**写 `<html>`/`<head>`/`<body>`。
-- Action 的 CSRF 校验由框架完成；Handler 内直接用 `r.PostFormValue(...)` 即可。
+- Action 的 CSRF 校验与只读门禁由框架完成；Handler 内应先用 `OnlyPostFields` 校验字段白名单，
+  再用 `r.PostFormValue(...)` 取值。非回环绑定时 Handler 不会被调用（403）。
 - 管理页路径 `/` 为内置首页（自动列出页面与操作），`/action/<Name>` 为写操作，
   `/debug/pprof/` 仅在 `Pprof=true` 时存在。
 - 三个模式注册的页面必须覆盖 spec §5 的内容：
-  - relay：服务注册表、在线 agent、当前配对表、UDP 会话表、踢出操作；
-  - agent：本机已注册服务、到 relay 的控制连接状态、当前活跃数据连接；
-  - client：relay 返回的可用服务列表、本地端口映射表、当前活跃配对。
+  - relay：服务注册表、在线 agent、当前配对表、UDP 会话表、踢出操作、五参数配置区；
+  - agent：本机服务表（含修改/删除/新增）、主服务编辑、到 relay 的控制连接状态、
+    当前活跃数据连接；
+  - client：relay 返回的可用服务列表、本地端口映射表（含新增/修改/删除）、当前活跃配对。
 
 ### 3.9 `internal/service`
 
@@ -583,6 +609,49 @@ func IsWindowsService() bool
 ```
 
 阶段 2 **不直接使用**该包（`main.go` 已接线）。
+
+### 3.10 管理页写能力边界（阶段 7）
+
+**门禁（必须）**：管理页写能力**只在 `[common] manage_listen` 绑定回环地址时启用**。
+
+- 回环判定：`127.0.0.0/8`、`::1`、`localhost`（`admin.IsLoopbackListen`）；
+  空 host / `0.0.0.0` / `::` / 具体网卡地址一律**只读**。
+- 只读时：页面顶部显示红色横幅"只读模式：manage_listen 绑定在非回环地址，出于安全考虑
+  写操作已禁用"，隐藏/禁用所有写表单；所有写 Action 在方法校验（GET→405）之后
+  一律返回 **403**（CSRF 校验不再执行，也不得执行 Handler）。
+- 可写时：仍保留现有一次性 CSRF 令牌机制，写操作必须 POST + 有效令牌；
+  每次写操作记审计日志 `event=admin_action`（`remote`/`action`/`target`/`old`/`new`），
+  被拒绝的写请求记 `event=admin_action_denied`，失败记 `event=admin_action_failed`。
+
+**可改字段白名单（其它字段一律 400/403，不得回显进 ini）**：
+
+| 模式 | 可改 | 生效方式 |
+| --- | --- | --- |
+| relay | `[relay] pair_timeout` / `idle_timeout` / `heartbeat_timeout` / `udp_session_timeout` / `token_ttl` | 校验 → 写回 ini → 更新运行时（写 ini 失败则运行时不改）；对后续连接/清理生效 |
+| agent | `[server] service.<id>`（新增/修改/删除，`default` 除外）；主服务 `protocol` + `local` | 改本地服务表 → 向 relay 注册/注销并等确认（3s）→ 成功才写回 ini；失败回滚 |
+| client | `[client] service.<id>`（本地监听映射，新增/修改/删除） | 开关/切换本地监听 → 成功才写回 ini；写盘失败回滚监听与映射 |
+
+不可改：`relay_addr`、`token`、`auth_token`、监听端口、`tls*`、证书路径、`manage_listen`、
+日志、重连参数、其它未列出的键。
+
+**持久化语义**（`config.PatchValue` / `config.DeleteKey`）：
+
+- 只替换目标键 `=` 之后的值，保留前导空白、键名写法与 `=` 前对齐；注释、空行、
+  未知键、键顺序原样保留；
+- 键不存在时插到该段最后一个非空行之后；段不存在时在文件末尾空一行后追加；
+- 保留 LF/CRLF 与结尾换行状态、BOM 与权限位；
+- 同目录临时文件 + `os.Rename` 原子替换；进程内用包级互斥锁串行化；
+  不清理多余空行、不做任何重新格式化；
+- 同一段重复键：Patch 替换全部同名键（解析器以最后一个为准），Delete 删除全部同名行；
+  同名段重复出现时同样覆盖全部段（解析器会合并重复段）。
+
+**值校验**：duration 必须 `>0`；`service_id` 必须 `[a-z0-9-_]{1,64}` 且附加服务不得为
+`default`；地址必须可解析为 host:port（端口 1..65535，裸端口补 127.0.0.1）；
+所有表单值长度上限 256；所有页面输出 HTML 转义；不拼接 shell、不接收文件路径。
+
+**协议**：agent 删除/修改服务新增 `MsgUnregisterService`(0x13) /
+`MsgServiceUnregistered`(0x14)（docs/protocol.md §4.15），不提升 `ProtocolVersion`；
+旧 relay 会忽略未知类型，因此服务增删要求 relay v0.3.0+（超时后 agent 回滚并报错）。
 
 ## 4. 三个模式共同遵守的语义规则
 

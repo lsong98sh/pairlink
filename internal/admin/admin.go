@@ -1,7 +1,9 @@
 // Package admin 提供三种模式复用的管理页框架。
 //
-// 第一版管理页只读：唯一的写操作通过 Action 注册（默认 POST + 一次性 CSRF 令牌），
-// 且禁止用 GET 触发写操作。页面使用内联 CSS，不引用任何外部资源，便于内网/隔离环境使用。
+// 阶段 7 起管理页可写，但写能力只在 manage_listen 绑定回环地址时启用：
+// 非回环绑定时页面显示只读横幅，所有 Action 返回 403。可写时写操作通过 Action
+// 注册（默认 POST + 一次性 CSRF 令牌），且禁止用 GET 触发写操作。
+// 页面使用内联 CSS，不引用任何外部资源，便于内网/隔离环境使用。
 package admin
 
 import (
@@ -35,6 +37,8 @@ const (
 )
 
 // Action 是一个写操作。默认 Method 为 POST；GET 等其它方法一律返回 405。
+//
+// 非回环绑定时所有 Action 在方法校验后返回 403（见 IsLoopbackListen / Writable）。
 type Action struct {
 	// Name 是 URL 片段，实际路径为 /action/<Name>。
 	Name string
@@ -87,6 +91,10 @@ type Server struct {
 	listener net.Listener
 	httpSrv  *http.Server
 
+	// writable 表示是否允许写操作：只有 manage_listen 绑定回环地址时为 true。
+	// 在 New 时根据 addr 判定，运行期间不变。
+	writable bool
+
 	csrfMu     sync.Mutex
 	csrfTokens map[string]time.Time
 }
@@ -108,6 +116,7 @@ func New(addr string, opts Options) *Server {
 		startedAt:  time.Now(),
 		actions:    make(map[string]bool),
 		csrfTokens: make(map[string]time.Time),
+		writable:   IsLoopbackListen(addr),
 	}
 
 	s.mux.HandleFunc("/", s.handleIndex)
@@ -154,6 +163,12 @@ func (s *Server) registerAction(a Action) {
 		if r.Method != method {
 			w.Header().Set("Allow", method)
 			http.Error(w, fmt.Sprintf("405 方法不允许：该操作必须使用 %s", method), http.StatusMethodNotAllowed)
+			return
+		}
+		// 阶段 7 安全门禁：非回环绑定一律只读，所有写 Action 返回 403。
+		if !s.writable {
+			s.AuditDenied(r, action.Name)
+			http.Error(w, "403 只读模式：manage_listen 绑定在非回环地址，写操作已禁用", http.StatusForbidden)
 			return
 		}
 		if !s.consumeCSRF(r) {

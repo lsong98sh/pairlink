@@ -578,6 +578,17 @@ func validateServiceID(id string) error {
 	return nil
 }
 
+// ValidateServiceID 是 validateServiceID 的公开版本，供管理页表单校验使用。
+//
+// 规则：非空、只允许 a-z0-9-_、长度 1..64（docs/contract.md §3.10）。
+func ValidateServiceID(id string) error { return validateServiceID(id) }
+
+// NormalizeListenAddr 是 normalizeListenAddr 的公开版本，供管理页表单校验使用。
+//
+// 语义：裸端口 / ":port" 补 127.0.0.1；host:port / [IPv6]:port 原样规范化；
+// 端口必须 1..65535。返回值已用 net.JoinHostPort 规范化。
+func NormalizeListenAddr(v string) (string, error) { return normalizeListenAddr(v) }
+
 // upsertServerService 以 ID 为键写入服务映射：重复 ID 后者覆盖并留在首次出现位置。
 func upsertServerService(list []ServerService, svc ServerService) []ServerService {
 	for i := range list {

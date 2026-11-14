@@ -19,7 +19,7 @@
 name: pairlink
 
 x-pairlink: &pairlink
-  image: pairlink:v0.2.0
+  image: pairlink:v0.3.0
   build:
     context: ..
     dockerfile: Dockerfile

@@ -37,6 +37,7 @@ func (s *server) renderAdmin(w io.Writer, _ *http.Request) {
 	s.renderAdminServices(w)
 	s.renderAdminPairs(w)
 	s.renderAdminUDPSessions(w)
+	s.renderAdminConfig(w)
 }
 
 // renderAdminAgents 渲染在线 agent 列表。
@@ -295,7 +296,12 @@ func (s *server) kickCarrier(keyText string) bool {
 }
 
 // kickForm 生成一个带框架 CSRF 令牌的踢出表单。
+//
+// 非回环只读模式下不渲染表单（写 Action 本身也会返回 403）。
 func (s *server) kickForm(kind, id string) string {
+	if s.admin == nil || !s.admin.Writable() {
+		return `<span class="dim">只读</span>`
+	}
 	return fmt.Sprintf(`<form class="inline" method="post" action="/action/kick">%s<input type="hidden" name="kind" value="%s"><input type="hidden" name="id" value="%s"><button type="submit" class="danger">踢出</button></form>`,
 		string(s.admin.CSRFInput()),
 		template.HTMLEscapeString(kind),

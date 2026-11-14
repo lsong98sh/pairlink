@@ -92,28 +92,34 @@ const (
 	MsgKicked MessageType = 0x11
 	// MsgServerShutdown 表示 relay 即将停机。
 	MsgServerShutdown MessageType = 0x12
+	// MsgUnregisterService 是 agent 主动注销服务的请求（阶段 7 新增）。
+	MsgUnregisterService MessageType = 0x13
+	// MsgServiceUnregistered 是 relay 对注销请求的确认（阶段 7 新增）。
+	MsgServiceUnregistered MessageType = 0x14
 )
 
 // messageNames 是消息类型的可读名（用于日志与错误信息）。
 var messageNames = map[MessageType]string{
-	MsgHello:             "hello",
-	MsgHelloOK:           "hello_ok",
-	MsgRegisterService:   "register_service",
-	MsgServiceRegistered: "service_registered",
-	MsgListServices:      "list_services",
-	MsgServiceList:       "service_list",
-	MsgSubscribe:         "subscribe",
-	MsgServiceEvent:      "service_event",
-	MsgConnectRequest:    "connect_request",
-	MsgPairResult:        "pair_result",
-	MsgIncoming:          "incoming",
-	MsgBind:              "bind",
-	MsgBindOK:            "bind_ok",
-	MsgHeartbeat:         "heartbeat",
-	MsgHeartbeatAck:      "heartbeat_ack",
-	MsgError:             "error",
-	MsgKicked:            "kicked",
-	MsgServerShutdown:    "server_shutdown",
+	MsgHello:               "hello",
+	MsgHelloOK:             "hello_ok",
+	MsgRegisterService:     "register_service",
+	MsgServiceRegistered:   "service_registered",
+	MsgListServices:        "list_services",
+	MsgServiceList:         "service_list",
+	MsgSubscribe:           "subscribe",
+	MsgServiceEvent:        "service_event",
+	MsgConnectRequest:      "connect_request",
+	MsgPairResult:          "pair_result",
+	MsgIncoming:            "incoming",
+	MsgBind:                "bind",
+	MsgBindOK:              "bind_ok",
+	MsgHeartbeat:           "heartbeat",
+	MsgHeartbeatAck:        "heartbeat_ack",
+	MsgError:               "error",
+	MsgKicked:              "kicked",
+	MsgServerShutdown:      "server_shutdown",
+	MsgUnregisterService:   "unregister_service",
+	MsgServiceUnregistered: "service_unregistered",
 }
 
 // String 返回消息类型的可读名；未知类型返回 unknown(0xNN)。
@@ -232,6 +238,10 @@ func Decode(typ MessageType, payload []byte) (any, error) {
 		msg = &Kicked{}
 	case MsgServerShutdown:
 		msg = &ServerShutdown{}
+	case MsgUnregisterService:
+		msg = &UnregisterService{}
+	case MsgServiceUnregistered:
+		msg = &ServiceUnregistered{}
 	default:
 		return nil, fmt.Errorf("%w: 0x%02x", ErrUnknownType, uint8(typ))
 	}

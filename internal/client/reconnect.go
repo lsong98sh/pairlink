@@ -110,6 +110,9 @@ func (c *client) supervise() error {
 					return err
 				}
 				listenersReady = true
+				// 管理页可能在首次列表到达前就先加了映射（按 TCP 占位）；
+				// 这里用刚拿到的基线再校对一次协议。
+				c.reconcileListeners()
 			} else {
 				// 断线期间服务协议可能变化：用新基线校对本地监听。
 				c.reconcileListeners()

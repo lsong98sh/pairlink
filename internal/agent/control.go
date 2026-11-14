@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,9 +18,75 @@ import (
 //
 // 读只由控制面读循环 goroutine 负责；握手/注册阶段在启动 goroutine 中同步读，
 // 两者不重叠，因此不需要读锁。
+//
+// 阶段 7：管理页的服务变更需要"发请求 → 等 relay 确认"，确认帧由 controlLoop
+// 读到后通过 pending 通道交给等待方（同一时刻只允许一个在途变更，由 agent.regMu
+// 串行化）。握手/首次注册阶段使用同步读，不经过 pending。
 type controlConn struct {
 	conn net.Conn
 	mu   sync.Mutex
+
+	pendingMu sync.Mutex
+	pendingID string
+	pendingCh chan serviceAck
+}
+
+// serviceAck 是一次服务变更请求的应答。
+type serviceAck struct {
+	// typ 是确认帧类型：MsgServiceRegistered / MsgServiceUnregistered；
+	// 出错时为零值且 err 非 nil。
+	typ       protocol.MessageType
+	serviceID string
+	udpMode   string
+	err       error
+}
+
+// beginServiceWait 登记一个在途服务变更，返回等待通道。
+func (c *controlConn) beginServiceWait(serviceID string) chan serviceAck {
+	ch := make(chan serviceAck, 1)
+	c.pendingMu.Lock()
+	c.pendingID = serviceID
+	c.pendingCh = ch
+	c.pendingMu.Unlock()
+	return ch
+}
+
+// endServiceWait 清除在途登记（幂等；只清自己登记的那个通道）。
+func (c *controlConn) endServiceWait(ch chan serviceAck) {
+	c.pendingMu.Lock()
+	if c.pendingCh == ch {
+		c.pendingCh = nil
+		c.pendingID = ""
+	}
+	c.pendingMu.Unlock()
+}
+
+// deliverServiceAck 把控制面确认交给等待方；没有等待方或 serviceID 不匹配时丢弃。
+//
+// MsgError 的 serviceID 为空（协议未带该字段），按"应答当前在途请求"处理。
+func (c *controlConn) deliverServiceAck(ack serviceAck) {
+	c.pendingMu.Lock()
+	ch := c.pendingCh
+	id := c.pendingID
+	c.pendingMu.Unlock()
+	if ch == nil {
+		return
+	}
+	if ack.serviceID != "" && id != "" && !strings.EqualFold(ack.serviceID, id) {
+		return
+	}
+	select {
+	case ch <- ack:
+	default:
+	}
+}
+
+// failServiceWait 在控制连接关闭时唤醒等待方，避免白等超时。
+func (c *controlConn) failServiceWait(err error) {
+	if err == nil {
+		err = errors.New("agent: 控制连接已关闭")
+	}
+	c.deliverServiceAck(serviceAck{err: err})
 }
 
 // newControlConn 包装一个已建立的控制连接。
@@ -56,6 +123,7 @@ func (c *controlConn) close() {
 	if c == nil || c.conn == nil {
 		return
 	}
+	c.failServiceWait(errors.New("agent: 控制连接已关闭"))
 	_ = c.conn.Close()
 }
 
@@ -135,7 +203,7 @@ func (a *agent) handshake(ctrl *controlConn) error {
 func (a *agent) registerServices(ctrl *controlConn) error {
 	a.resetRegisteredServices()
 	timeout := a.dialTimeout()
-	for _, svc := range a.cfg.Server.All() {
+	for _, svc := range a.svcStore.snapshot() {
 		req := &protocol.RegisterService{
 			ServiceID: svc.ID,
 			Proto:     svc.Proto,
@@ -284,8 +352,38 @@ func (a *agent) controlLoop(ctrl *controlConn) error {
 			a.ctrlMu.Lock()
 			a.lastAck = time.Now()
 			a.ctrlMu.Unlock()
+		case protocol.MsgServiceRegistered:
+			decoded, derr := protocol.Decode(typ, payload)
+			if derr != nil {
+				a.log.Warn("服务注册确认解析失败", "event", "service_registered", "err", derr)
+				continue
+			}
+			reg, ok := decoded.(*protocol.ServiceRegistered)
+			if !ok {
+				continue
+			}
+			ctrl.deliverServiceAck(serviceAck{
+				typ:       protocol.MsgServiceRegistered,
+				serviceID: reg.ServiceID,
+				udpMode:   reg.UDPMode,
+			})
+		case protocol.MsgServiceUnregistered:
+			decoded, derr := protocol.Decode(typ, payload)
+			if derr != nil {
+				a.log.Warn("服务注销确认解析失败", "event", "service_unregistered", "err", derr)
+				continue
+			}
+			unreg, ok := decoded.(*protocol.ServiceUnregistered)
+			if !ok {
+				continue
+			}
+			ctrl.deliverServiceAck(serviceAck{
+				typ:       protocol.MsgServiceUnregistered,
+				serviceID: unreg.ServiceID,
+			})
 		case protocol.MsgError:
 			a.log.Warn("relay 下发错误", "event", "relay_error", "detail", protocolErrText(payload))
+			ctrl.deliverServiceAck(serviceAck{err: fmt.Errorf("relay 拒绝: %s", protocolErrText(payload))})
 		case protocol.MsgKicked:
 			reason := decodeReason(protocol.MsgKicked, payload)
 			a.log.Warn("已被 relay 踢出，不自动重连", "event", "kicked", "detail", reason)

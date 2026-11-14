@@ -21,7 +21,11 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	writeRow(&b, "版本", template.HTMLEscapeString(s.opts.Version))
 	writeRow(&b, "运行时长", template.HTMLEscapeString(formatUptime(time.Since(s.startedAt))))
 	writeRow(&b, "自动刷新", "开启（可通过右上角链接暂停）")
-	writeRow(&b, "配置", "只读页面；修改配置请编辑 ini 并重启进程")
+	if s.writable {
+		writeRow(&b, "配置", "可写：写操作会改运行时并写回 ini（保留注释与格式）；可改字段见各模式页面")
+	} else {
+		writeRow(&b, "配置", "只读：manage_listen 绑定在非回环地址，写操作已禁用")
+	}
 	b.WriteString(`</tbody></table></section>`)
 
 	pages := s.Pages()
@@ -41,8 +45,17 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`</section>`)
 
 	if len(s.opts.Actions) > 0 {
-		b.WriteString(`<section><h2>操作</h2><p class="dim">写操作需要一次性 CSRF 令牌，页面刷新后令牌会更新。</p>`)
+		b.WriteString(`<section><h2>操作</h2>`)
+		if s.writable {
+			b.WriteString(`<p class="dim">写操作需要一次性 CSRF 令牌，页面刷新后令牌会更新。</p>`)
+		} else {
+			b.WriteString(`<p class="dim">只读模式：写操作已禁用（HTTP 403）。</p>`)
+		}
 		for _, a := range s.opts.Actions {
+			if !s.writable {
+				fmt.Fprintf(&b, `<span class="dim">%s（禁用）</span> `, template.HTMLEscapeString(a.Title))
+				continue
+			}
 			method := a.Method
 			if method == "" {
 				method = http.MethodPost

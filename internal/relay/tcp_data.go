@@ -124,7 +124,7 @@ func (s *server) handleDataConn(conn net.Conn) {
 		return
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(s.cfg.Relay.PairTimeout)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(s.pairTimeout())); err != nil {
 		log.Debug("设置数据面读超时失败", "event", "bind_fail", "err", err)
 		return
 	}
@@ -216,7 +216,7 @@ func (s *server) handleTCPBind(conn net.Conn, bind *protocol.Bind, log *slog.Log
 
 	case errors.Is(claimErr, pairing.ErrWaiting):
 		// 先到：保持连接静默等待，绝对不写任何字节。
-		timer := time.NewTimer(s.cfg.Relay.PairTimeout)
+		timer := time.NewTimer(s.pairTimeout())
 		defer timer.Stop()
 
 		select {
@@ -282,8 +282,8 @@ func (s *server) finishPair(key pairing.PairingKey, pair pairing.Pair, log *slog
 		"proto", "tcp",
 	)
 
-	agentWrapped := forward.WithIdleTimeout(agentConn, s.cfg.Relay.IdleTimeout)
-	clientWrapped := forward.WithIdleTimeout(clientConn, s.cfg.Relay.IdleTimeout)
+	agentWrapped := forward.WithIdleTimeout(agentConn, s.idleTimeoutValue())
+	clientWrapped := forward.WithIdleTimeout(clientConn, s.idleTimeoutValue())
 	outcome := forward.BidirectionalWithOutcome(s.ctx, agentWrapped, clientWrapped)
 
 	// 空闲超时与异常结束要能在日志里区分：Bidirectional 只给字节数时，
@@ -293,7 +293,7 @@ func (s *server) finishPair(key pairing.PairingKey, pair pairing.Pair, log *slog
 		log.Warn("数据面空闲超时，关闭配对",
 			"event", "idle_timeout",
 			"agent_id", s.agentIDForService(key.ServiceID),
-			"detail", "idle_timeout="+s.cfg.Relay.IdleTimeout.String(),
+			"detail", "idle_timeout="+s.idleTimeoutValue().String(),
 		)
 	case outcome.Err() != nil:
 		log.Warn("数据面异常结束，关闭配对",

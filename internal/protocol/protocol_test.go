@@ -22,18 +22,20 @@ func sampleMessages() map[MessageType]any {
 			{ServiceID: "web", Proto: "tcp", AgentID: "a1", Online: true},
 			{ServiceID: "game", Proto: "udp", AgentID: "a2", Online: false},
 		}, Revision: 7, UDPMode: UDPModeTCPTunnel},
-		MsgSubscribe:      &Subscribe{Enable: true},
-		MsgServiceEvent:   &ServiceEvent{Event: EventAdded, Service: ServiceInfo{ServiceID: "web", Proto: "tcp", AgentID: "a1", Online: true}, Revision: 8},
-		MsgConnectRequest: &ConnectRequest{ServiceID: "web", ClientConnID: "c-1"},
-		MsgPairResult:     &PairResult{PairingKey: "web/c-1", PairingToken: "abc", Proto: "tcp", Role: RoleClient},
-		MsgIncoming:       &Incoming{PairingKey: "web/c-1", PairingToken: "abc", Proto: "udp", Role: RoleAgent, ClientAddr: "1.2.3.4:5678"},
-		MsgBind:           &Bind{PairingKey: "web/c-1", PairingToken: "abc", Role: RoleClient, Carrier: CarrierUDPOverTCP},
-		MsgBindOK:         &BindOK{PairingKey: "web/c-1"},
-		MsgHeartbeat:      &Heartbeat{},
-		MsgHeartbeatAck:   &HeartbeatAck{},
-		MsgError:          &Error{Code: ErrCodeServiceNotFound, Message: "没有该服务", Detail: "web", ClientConnID: "0123456789abcdef"},
-		MsgKicked:         &Kicked{Reason: "管理页踢出"},
-		MsgServerShutdown: &ServerShutdown{Reason: "重启"},
+		MsgSubscribe:           &Subscribe{Enable: true},
+		MsgServiceEvent:        &ServiceEvent{Event: EventAdded, Service: ServiceInfo{ServiceID: "web", Proto: "tcp", AgentID: "a1", Online: true}, Revision: 8},
+		MsgConnectRequest:      &ConnectRequest{ServiceID: "web", ClientConnID: "c-1"},
+		MsgPairResult:          &PairResult{PairingKey: "web/c-1", PairingToken: "abc", Proto: "tcp", Role: RoleClient},
+		MsgIncoming:            &Incoming{PairingKey: "web/c-1", PairingToken: "abc", Proto: "udp", Role: RoleAgent, ClientAddr: "1.2.3.4:5678"},
+		MsgBind:                &Bind{PairingKey: "web/c-1", PairingToken: "abc", Role: RoleClient, Carrier: CarrierUDPOverTCP},
+		MsgBindOK:              &BindOK{PairingKey: "web/c-1"},
+		MsgHeartbeat:           &Heartbeat{},
+		MsgHeartbeatAck:        &HeartbeatAck{},
+		MsgError:               &Error{Code: ErrCodeServiceNotFound, Message: "没有该服务", Detail: "web", ClientConnID: "0123456789abcdef"},
+		MsgKicked:              &Kicked{Reason: "管理页踢出"},
+		MsgServerShutdown:      &ServerShutdown{Reason: "重启"},
+		MsgUnregisterService:   &UnregisterService{ServiceID: "web"},
+		MsgServiceUnregistered: &ServiceUnregistered{ServiceID: "web"},
 	}
 }
 
@@ -218,7 +220,7 @@ func TestMessageTypeNames(t *testing.T) {
 		MsgHello, MsgHelloOK, MsgRegisterService, MsgServiceRegistered, MsgListServices,
 		MsgServiceList, MsgSubscribe, MsgServiceEvent, MsgConnectRequest, MsgPairResult,
 		MsgIncoming, MsgBind, MsgBindOK, MsgHeartbeat, MsgHeartbeatAck, MsgError,
-		MsgKicked, MsgServerShutdown,
+		MsgKicked, MsgServerShutdown, MsgUnregisterService, MsgServiceUnregistered,
 	}
 	seen := map[MessageType]bool{}
 	for _, typ := range all {

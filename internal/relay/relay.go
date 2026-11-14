@@ -93,7 +93,45 @@ func newServer(cfg *config.Config) *server {
 	}
 
 	s.pairs.SetOnExpire(s.onPairExpire)
+	s.idleTimeout.Store(int64(cfg.Relay.IdleTimeout))
+	s.heartbeatTimeout.Store(int64(cfg.Relay.HeartbeatTimeout))
+	s.udpSessionTimeout.Store(int64(cfg.Relay.UDPSessionTimeout))
 	return s
+}
+
+// pairTimeout 返回当前占位/数据面报到超时（运行期可被管理页修改）。
+func (s *server) pairTimeout() time.Duration {
+	return s.pairs.Timeout()
+}
+
+// tokenTTL 返回当前一次性令牌有效期（运行期可被管理页修改）。
+func (s *server) tokenTTL() time.Duration {
+	return s.tokens.TTL()
+}
+
+// idleTimeoutValue 返回当前数据面空闲超时。
+func (s *server) idleTimeoutValue() time.Duration {
+	return time.Duration(s.idleTimeout.Load())
+}
+
+// heartbeatTimeoutValue 返回当前控制面心跳判死超时。
+func (s *server) heartbeatTimeoutValue() time.Duration {
+	return time.Duration(s.heartbeatTimeout.Load())
+}
+
+// udpSessionTimeoutValue 返回当前 UDP 会话空闲超时。
+func (s *server) udpSessionTimeoutValue() time.Duration {
+	return time.Duration(s.udpSessionTimeout.Load())
+}
+
+// setRuntimeTimeouts 更新三个 atomic 超时（调用方已完成校验）。
+//
+// pair_timeout / token_ttl 分别通过 PairingTable / token.Store 的 Set* 更新，
+// 不经过本函数。
+func (s *server) setRuntimeTimeouts(idle, heartbeat, udpSession time.Duration) {
+	s.idleTimeout.Store(int64(idle))
+	s.heartbeatTimeout.Store(int64(heartbeat))
+	s.udpSessionTimeout.Store(int64(udpSession))
 }
 
 // onPairExpire 是 PairingTable 的超时回调：关闭超时占位的连接。

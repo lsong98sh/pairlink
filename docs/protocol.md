@@ -37,7 +37,7 @@ UDP 数据面承载模式由 relay 决定并通过 `udp_mode` 下发：
 
 | 字段 | 长度 | 说明 |
 | --- | --- | --- |
-| `type` | 1 字节 | 消息类型，见第 3 节；`0x01`..`0x12` 已定义 |
+| `type` | 1 字节 | 消息类型，见第 3 节；`0x01`..`0x14` 已定义 |
 | `payload_len` | 4 字节 | 大端无符号整数，payload 字节数 |
 | `payload` | n 字节 | JSON 对象（UTF-8）；空消息可为 0 字节或 `{}` |
 
@@ -115,6 +115,8 @@ UDP 隧道帧解析模式**；此后该 TCP 连接上传输的就是 UDP 隧道�
 | `0x10` | `MsgError` | 双向 | 错误响应 |
 | `0x11` | `MsgKicked` | relay → agent/client | 被管理页踢出 |
 | `0x12` | `MsgServerShutdown` | relay → agent/client | relay 即将停机 |
+| `0x13` | `MsgUnregisterService` | agent → relay | 主动注销服务（阶段 7） |
+| `0x14` | `MsgServiceUnregistered` | relay → agent | 注销确认（阶段 7） |
 
 ## 4. 消息字段定义
 
@@ -327,6 +329,29 @@ sequenceDiagram
 7. 一条承载连接上的帧是**串行**的：写方必须保证整帧原子写出（`WriteUDPTunnelFrame` 已保证），
    读方用 `io.ReadFull` 读取；不同会话的数据帧可以交错，但不能拆帧。
 
+### 4.15 `MsgUnregisterService`（0x13）/ `MsgServiceUnregistered`（0x14）
+
+阶段 7 新增，用于 agent 管理页删除/修改服务时主动注销旧注册。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `service_id` | string | 待注销 / 已注销的服务ID，`[a-z0-9-_]{1,64}` |
+
+规则：
+
+1. 只有 `role=agent` 的控制连接可以发送 `MsgUnregisterService`；
+   client 发送回 `bad_request`。
+2. relay 校验该 `service_id` 属于当前 agent（`ServiceRegistry.Unregister(id, agentID)`）：
+   - 服务不存在或 owner 不符 → `MsgError{code:"bad_request"}`，**不得**删除服务；
+   - 成功 → 删除注册项、派发 `removed` 事件（订阅者可见）、更新该 agent 的服务列表，
+     并回 `MsgServiceUnregistered{service_id}`。
+3. agent 收到 `MsgServiceUnregistered` 后才认为注销成功；超时/`MsgError` 时保持本地
+   服务表与原 ini 不变（页面显示错误）。
+4. 错误码复用第 6 节的 `bad_request` / `internal`，不新增错误码。
+5. 该消息**不提升 `ProtocolVersion`**：旧 relay 收到未知类型 `0x13` 会按 §2 的
+   "未知 type 记日志并忽略"处理，不会回确认 → 新 agent 的删除/修改会超时失败。
+   因此**在 agent 管理页增删服务需要 relay v0.3.0+**；只读页面与其它功能不受影响。
+
 ## 5. 状态机
 
 ### 5.1 TCP 配对状态机
@@ -476,6 +501,9 @@ stateDiagram-v2
 可只丢弃 + 日志）。UDP over TCP 承载连接可以用控制帧（`session=""` + `MsgError`）报告
 单会话错误，不会污染数据帧，也不会中断其它会话。
 
+阶段 7 的 `MsgUnregisterService`/`MsgServiceUnregistered` 复用上述错误码，不新增码值：
+服务不存在或 owner 不符一律回 `bad_request`（不泄露服务归属细节）。
+
 ## 7. 令牌生命周期
 
 ```mermaid
@@ -522,6 +550,10 @@ stateDiagram-v2
 `HelloOK.heartbeat_seconds` 是建议值：实际间隔取 `min(本地配置, 建议值)`。
 控制面任何合法消息都刷新 `LastSeen`（不仅是心跳）。
 
+阶段 7 起 relay 的 `pair_timeout` / `idle_timeout` / `heartbeat_timeout` /
+`udp_session_timeout` / `token_ttl` 可在管理页运行期修改（同时写回 ini）：
+修改对**后续**连接/占位/清理生效；已建立的连接与已签发的令牌保留原超时。
+
 ## 9. 版本协商
 
 - `protocol.ProtocolVersion = 1`；版本只在 `MsgHello` / `MsgHelloOK` 中出现。
@@ -537,6 +569,9 @@ stateDiagram-v2
   未识别 `udp_mode` 的一端应回退到 `native` 并在日志中 WARN。
 - `MsgError.client_conn_id`（阶段 4）同为**新增可选字段**：旧 relay 不填、旧 client 忽略，
   不提升 `ProtocolVersion`。
+- `MsgUnregisterService`（0x13）/ `MsgServiceUnregistered`（0x14，阶段 7）是**新增消息类型**：
+  旧端遇到未知类型只记日志并忽略，因此可混跑；但**服务的新增/删除/修改需要 relay v0.3.0+**
+  （旧 relay 不会回注销确认，agent 会在 3s 后超时并回滚）。
 
 ## 10. 典型时序（TCP）
 

@@ -208,16 +208,16 @@ sudo ./deploy/linux/install-relay.sh --uninstall --purge
 
 ```bash
 # 仓库根目录
-docker build -t pairlink:v0.2.0 .
+docker build -t pairlink:v0.3.0 .
 
 # 冒烟：版本
-docker run --rm pairlink:v0.2.0 -version
+docker run --rm pairlink:v0.3.0 -version
 
 # 前台跑 relay（配置从宿主机只读挂载；容器内管理页需绑 0.0.0.0）
 docker run --rm --read-only --cap-drop ALL \
   -p 127.0.0.1:17090:17090 \
   -v "$PWD/examples/docker/relay.ini:/etc/pairlink/relay.ini:ro" \
-  pairlink:v0.2.0 -relay -config /etc/pairlink/relay.ini
+  pairlink:v0.3.0 -relay -config /etc/pairlink/relay.ini
 ```
 
 > 挂载的 ini/证书必须让容器内 uid 65532 可读：主机上 `chmod 0644`（或
@@ -259,9 +259,9 @@ docker compose down
 > compose 未启动。** 下面命令需在装有 Docker Engine + Compose v2 的机器上执行。
 
 ```bash
-docker build -t pairlink:v0.2.0 .
-docker run --rm pairlink:v0.2.0 -version
-docker image inspect pairlink:v0.2.0 --format '{{.Config.User}} {{.Config.Entrypoint}}'
+docker build -t pairlink:v0.3.0 .
+docker run --rm pairlink:v0.3.0 -version
+docker image inspect pairlink:v0.3.0 --format '{{.Config.User}} {{.Config.Entrypoint}}'
 # 期望：nonroot:nonroot [/pairlink]
 
 docker compose -f deploy/docker-compose.yml up -d --build

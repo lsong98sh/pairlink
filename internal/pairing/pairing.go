@@ -190,6 +190,20 @@ func (t *PairingTable) Timeout() time.Duration {
 	return t.timeout
 }
 
+// SetTimeout 更新占位超时时间（阶段 7：管理页运行期修改 pair_timeout）。
+//
+// 只影响此后新建的占位；已存在的占位保留创建时计算出的 deadline。
+// timeout <= 0 返回错误且不改变当前值。
+func (t *PairingTable) SetTimeout(timeout time.Duration) error {
+	if timeout <= 0 {
+		return errors.New("pairing: 占位超时必须大于 0")
+	}
+	t.mu.Lock()
+	t.timeout = timeout
+	t.mu.Unlock()
+	return nil
+}
+
 // Claim 登记一侧报到。
 //
 // 返回值语义：

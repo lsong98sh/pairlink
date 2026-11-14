@@ -23,6 +23,8 @@ type layoutData struct {
 	Now       string
 	RefreshOn bool
 	ToggleURL string
+	Writable  bool
+	Notice    template.HTML
 	Nav       []navItem
 	Body      template.HTML
 }
@@ -56,6 +58,15 @@ button:hover{background:#f3f4f6}
 button.danger{border-color:#dc2626;color:#dc2626}
 button.danger:hover{background:#fef2f2}
 .tag{display:inline-block;padding:0 6px;border-radius:4px;background:#eef2ff;color:#3730a3;font-size:12px}
+.notice{margin:0 0 14px;padding:8px 12px;border-radius:6px;border:1px solid transparent;font-size:13px}
+.notice.ok{background:#ecfdf5;border-color:#6ee7b7;color:#065f46}
+.notice.err{background:#fef2f2;border-color:#fca5a5;color:#991b1b}
+.banner{margin:0 0 14px;padding:10px 14px;border-radius:6px;font-size:13px;font-weight:600}
+.banner.readonly{background:#fef2f2;border:1px solid #dc2626;color:#991b1b}
+.form-inline{display:inline-flex;gap:4px;align-items:center;margin:0}
+.form-inline input[type=text]{width:150px}
+input[type=text],input[type=password],select{border:1px solid #d1d5db;border-radius:6px;padding:3px 6px;font-size:13px}
+table form{margin:0}
 footer{padding:10px 18px;color:#9ca3af;font-size:12px}
 @media (prefers-color-scheme:dark){
  body{background:#111827;color:#e5e7eb}
@@ -65,6 +76,10 @@ footer{padding:10px 18px;color:#9ca3af;font-size:12px}
  nav{background:#1f2937}
  nav a{color:#e5e7eb}
  nav a:hover{background:#374151}
+ .notice.ok{background:#064e3b;border-color:#047857;color:#d1fae5}
+ .notice.err{background:#7f1d1d;border-color:#b91c1c;color:#fee2e2}
+ .banner.readonly{background:#7f1d1d;border-color:#dc2626;color:#fee2e2}
+ input[type=text],input[type=password],select{background:#111827;color:#e5e7eb;border-color:#4b5563}
 }
 `
 
@@ -86,8 +101,12 @@ const layoutHTML = `<!DOCTYPE html>
     · <a href="{{.ToggleURL}}">{{if .RefreshOn}}暂停自动刷新{{else}}开启自动刷新{{end}}</a></div>
 </header>
 {{if .Nav}}<nav>{{range .Nav}}<a href="{{.Path}}">{{.Title}}</a>{{end}}</nav>{{end}}
-<main>{{.Body}}</main>
-<footer>PairLink 管理页（只读） · 配置修改请编辑 ini 后重启进程</footer>
+<main>
+{{if not .Writable}}<div class="banner readonly">只读模式：manage_listen 绑定在非回环地址，出于安全考虑写操作已禁用</div>{{end}}
+{{.Notice}}
+{{.Body}}
+</main>
+<footer>PairLink 管理页{{if .Writable}} · 写操作会先改运行时并写回 ini（保留注释与格式）{{else}}（只读） · 配置修改请编辑 ini 后重启进程{{end}}</footer>
 </body>
 </html>
 `
@@ -108,6 +127,8 @@ func (s *Server) WriteHTML(w http.ResponseWriter, r *http.Request, pageBody temp
 		Now:       time.Now().Format("2006-01-02 15:04:05"),
 		RefreshOn: autoRefresh(r),
 		ToggleURL: toggleRefreshURL(r),
+		Writable:  s.writable,
+		Notice:    NoticeBar(r),
 		Nav:       s.navItems(),
 		Body:      pageBody,
 	}

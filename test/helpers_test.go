@@ -399,10 +399,23 @@ func startRelay(t *testing.T, cfg *config.Config) *runHandle {
 	})
 	if cfg.Common.ManageListen != "" {
 		waitUntil(t, 5*time.Second, "relay 管理页就绪", []*runHandle{h}, func() bool {
-			return adminReachable(cfg.Common.ManageListen, "/")
+			return adminReachable(dialableAdminAddr(cfg.Common.ManageListen), "/")
 		})
 	}
 	return h
+}
+
+// dialableAdminAddr 把通配监听地址（0.0.0.0 / :: / 空 host）换成 127.0.0.1，
+// 便于测试通过回环地址访问绑定在所有网卡上的管理页。
+func dialableAdminAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func startAgent(t *testing.T, cfg *config.Config) *runHandle {

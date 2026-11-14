@@ -229,6 +229,9 @@ func TestControlConnectionLost(t *testing.T) {
 	cfg.Server.Reconnect = false
 	run := startAgent(t, cfg)
 	recv(t, f.registrations, "注册请求")
+	// 等首次注册确认被 agent 消化（ctrlReady）：否则断链可能落在"等确认"阶段，
+	// 错误措辞会变成注册超时而非控制连接断开（-race 下会随机复现）。
+	waitCond(t, 5*time.Second, func() bool { return run.a.ctrlReady.Load() }, "控制连接就绪")
 
 	f.closeControl()
 	err := run.wait(t)

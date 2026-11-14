@@ -43,6 +43,10 @@ type relayOptions struct {
 	heartbeatSecs int
 	// failServiceID 非空时对该服务的注册回 MsgError。
 	failServiceID string
+	// failUnregisterID 非空时对该服务的注销回 MsgError。
+	failUnregisterID string
+	// silentServiceID 非空时对该服务的注册/注销都不回应（模拟超时）。
+	silentServiceID string
 	// agentID 是 HelloOK.agent_id。
 	agentID string
 	// enableTCPData 为 true 时监听 TCP 数据面（127.0.0.1:0）。
@@ -95,6 +99,8 @@ type fakeRelay struct {
 
 	// registrations 记录 agent 发来的注册请求。
 	registrations chan *protocol.RegisterService
+	// unregistrations 记录 agent 发来的注销请求。
+	unregistrations chan *protocol.UnregisterService
 	// binds 记录 TCP 数据面报到帧。
 	binds chan *protocol.Bind
 	// dataConns 交出 TCP 数据面连接（纯透传）。
@@ -124,17 +130,18 @@ type fakeRelay struct {
 func newFakeRelay(t *testing.T, opts relayOptions) *fakeRelay {
 	t.Helper()
 	f := &fakeRelay{
-		t:             t,
-		opts:          opts,
-		registrations: make(chan *protocol.RegisterService, 16),
-		binds:         make(chan *protocol.Bind, 16),
-		dataConns:     make(chan net.Conn, 16),
-		carrierConns:  make(chan net.Conn, 4),
-		tunnelBinds:   make(chan tunnelBind, 16),
-		tunnelData:    make(chan tunnelData, 32),
-		controlFrames: make(chan []byte, 16),
-		udpBinds:      make(chan udpBind, 16),
-		udpData:       make(chan []byte, 32),
+		t:               t,
+		opts:            opts,
+		registrations:   make(chan *protocol.RegisterService, 16),
+		unregistrations: make(chan *protocol.UnregisterService, 16),
+		binds:           make(chan *protocol.Bind, 16),
+		dataConns:       make(chan net.Conn, 16),
+		carrierConns:    make(chan net.Conn, 4),
+		tunnelBinds:     make(chan tunnelBind, 16),
+		tunnelData:      make(chan tunnelData, 32),
+		controlFrames:   make(chan []byte, 16),
+		udpBinds:        make(chan udpBind, 16),
+		udpData:         make(chan []byte, 32),
 	}
 	f.dropBindOK.Store(int32(opts.dropBindOK))
 
@@ -412,6 +419,13 @@ func (f *fakeRelay) handleTunnel(conn net.Conn) {
 				})
 				continue
 			}
+			select {
+			case f.registrations <- req:
+			default:
+			}
+			if f.opts.silentServiceID != "" && req.ServiceID == f.opts.silentServiceID {
+				continue
+			}
 			if err := protocol.WriteFrame(conn, protocol.MsgServiceRegistered, &protocol.ServiceRegistered{
 				ServiceID: req.ServiceID,
 				Proto:     req.Proto,
@@ -419,9 +433,33 @@ func (f *fakeRelay) handleTunnel(conn net.Conn) {
 			}); err != nil {
 				return
 			}
+		case protocol.MsgUnregisterService:
+			decoded, derr := protocol.Decode(typ, payload)
+			if derr != nil {
+				continue
+			}
+			req, isReq := decoded.(*protocol.UnregisterService)
+			if !isReq {
+				continue
+			}
 			select {
-			case f.registrations <- req:
+			case f.unregistrations <- req:
 			default:
+			}
+			if f.opts.silentServiceID != "" && req.ServiceID == f.opts.silentServiceID {
+				continue
+			}
+			if f.opts.failUnregisterID != "" && req.ServiceID == f.opts.failUnregisterID {
+				_ = protocol.WriteFrame(conn, protocol.MsgError, &protocol.Error{
+					Code:    protocol.ErrCodeBadRequest,
+					Message: "服务未注册",
+				})
+				continue
+			}
+			if err := protocol.WriteFrame(conn, protocol.MsgServiceUnregistered, &protocol.ServiceUnregistered{
+				ServiceID: req.ServiceID,
+			}); err != nil {
+				return
 			}
 		case protocol.MsgHeartbeat:
 			f.heartbeats.Add(1)

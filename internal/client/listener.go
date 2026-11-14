@@ -100,10 +100,20 @@ func (c *client) serveListener(l *localListener) {
 //
 // 任何本地监听失败（端口冲突等）都返回错误，由 run 结束进程，不静默跳过。
 func (c *client) startListeners() error {
+	// 与阶段 7 的管理页映射变更串行化：避免"初始监听尚未完成"时并发新增映射，
+	// 导致初始扫描看到新映射后重复绑定同一地址并回滚掉它。
+	c.mappingOpMu.Lock()
+	defer c.mappingOpMu.Unlock()
+
 	services, _ := c.servicesView()
 	neg := c.negotiated()
 
-	for _, svc := range c.cfg.Client.Services {
+	for _, svc := range c.mappingSnapshot() {
+		// 管理页可能已经先一步为同一 service_id 打开了监听（动态新增），
+		// 初始扫描不得重复绑定同一地址。
+		if c.listenerByService(svc.ID) != nil {
+			continue
+		}
 		info, inList := services[svc.ID]
 		proto := "tcp"
 		switch {
@@ -294,8 +304,11 @@ func (c *client) hotSwitchProto(serviceID, wantProto string) {
 // 只处理「列表里明确给出了不同 proto」的服务；服务不在列表里时保留当前监听协议
 // （service_missing 占位只用于首次启动，避免服务短暂消失导致来回切换）。
 func (c *client) reconcileListeners() {
+	c.mappingOpMu.Lock()
+	defer c.mappingOpMu.Unlock()
+
 	services, _ := c.servicesView()
-	for _, svc := range c.cfg.Client.Services {
+	for _, svc := range c.mappingSnapshot() {
 		info, ok := services[svc.ID]
 		if !ok {
 			continue

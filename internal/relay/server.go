@@ -35,6 +35,14 @@ type server struct {
 	// udpMode 在启动时确定，运行期间不变：native 或 tcp_tunnel。
 	udpMode string
 
+	// 阶段 7：管理页可在运行期修改的三个超时（纳秒，atomic）。
+	//
+	// pair_timeout 由 PairingTable 自己持有（SetTimeout），token_ttl 由 token.Store
+	// 持有（SetTTL），不在这里重复存储。
+	idleTimeout       atomic.Int64
+	heartbeatTimeout  atomic.Int64
+	udpSessionTimeout atomic.Int64
+
 	services *registry.ServiceRegistry
 	agents   *registry.AgentRegistry
 	pairs    *pairing.PairingTable
@@ -259,12 +267,20 @@ func (s *server) startAdmin() error {
 		Version: version.Version,
 		Logger:  logx.Component(s.log, "admin"),
 		Pprof:   s.cfg.Common.Pprof,
-		Actions: []admin.Action{{
-			Name:    "kick",
-			Title:   "踢出",
-			Method:  "POST",
-			Handler: s.handleKickAction,
-		}},
+		Actions: []admin.Action{
+			{
+				Name:    "kick",
+				Title:   "踢出",
+				Method:  "POST",
+				Handler: s.handleKickAction,
+			},
+			{
+				Name:    "relay-config",
+				Title:   "修改 relay 参数",
+				Method:  "POST",
+				Handler: s.handleConfigAction,
+			},
+		},
 	}
 	srv := admin.New(s.cfg.Common.ManageListen, opts)
 	srv.AddPage(admin.Page{
@@ -286,7 +302,7 @@ func (s *server) startAdmin() error {
 func (s *server) runTickers() {
 	defer s.wg.Done()
 
-	pairInterval := s.cfg.Relay.PairTimeout / 2
+	pairInterval := s.pairTimeout() / 2
 	if pairInterval < minSweepInterval {
 		pairInterval = minSweepInterval
 	}
@@ -327,7 +343,7 @@ func (s *server) sweepUDP() {
 			if entry.Complete {
 				continue
 			}
-			if now.Sub(entry.CreatedAt) < s.cfg.Relay.PairTimeout {
+			if now.Sub(entry.CreatedAt) < s.pairTimeout() {
 				continue
 			}
 			s.udpTable.Remove(entry.Key)
@@ -338,7 +354,7 @@ func (s *server) sweepUDP() {
 			)
 		}
 		// 完整会话用 udp_session_timeout（从最后活动时间算起）。
-		for _, key := range s.udpTable.Sweep(now, s.cfg.Relay.UDPSessionTimeout) {
+		for _, key := range s.udpTable.Sweep(now, s.udpSessionTimeoutValue()) {
 			s.log.Info("UDP 会话空闲清理",
 				"event", "udp_session_close",
 				"pairing_key", key.String(),
@@ -347,7 +363,7 @@ func (s *server) sweepUDP() {
 		}
 	}
 
-	half, full := s.carriers.sweep(now, s.cfg.Relay.PairTimeout, s.cfg.Relay.UDPSessionTimeout)
+	half, full := s.carriers.sweep(now, s.pairTimeout(), s.udpSessionTimeoutValue())
 	for _, key := range half {
 		s.log.Warn("UDP over TCP 半会话配对超时",
 			"event", "pair_timeout",
@@ -366,7 +382,7 @@ func (s *server) sweepUDP() {
 
 // checkHeartbeats 依据 LastSeen 判死控制面连接（周期 5s）。
 func (s *server) checkHeartbeats() {
-	timeout := s.cfg.Relay.HeartbeatTimeout
+	timeout := s.heartbeatTimeoutValue()
 	if timeout <= 0 {
 		return
 	}
@@ -533,7 +549,7 @@ func (s *server) serviceInfo(entry registry.ServiceEntry) protocol.ServiceInfo {
 		agent, ok := s.agents.Get(entry.AgentID)
 		if !ok {
 			online = false
-		} else if s.cfg.Relay.HeartbeatTimeout > 0 && time.Since(agent.LastSeen) > s.cfg.Relay.HeartbeatTimeout {
+		} else if s.heartbeatTimeoutValue() > 0 && time.Since(agent.LastSeen) > s.heartbeatTimeoutValue() {
 			online = false
 		}
 	}
@@ -547,10 +563,10 @@ func (s *server) serviceInfo(entry registry.ServiceEntry) protocol.ServiceInfo {
 
 // heartbeatSeconds 返回下发给 agent/client 的建议心跳间隔（秒）。
 func (s *server) heartbeatSeconds() int {
-	if s.cfg.Relay.HeartbeatTimeout <= 0 {
+	if s.heartbeatTimeoutValue() <= 0 {
 		return 30
 	}
-	sec := int(s.cfg.Relay.HeartbeatTimeout / (3 * time.Second))
+	sec := int(s.heartbeatTimeoutValue() / (3 * time.Second))
 	if sec < 1 {
 		sec = 1
 	}

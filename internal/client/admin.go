@@ -14,7 +14,7 @@ import (
 	"github.com/lsong98sh/pairlink/internal/version"
 )
 
-// startAdmin 在 cfg.Common.ManageListen 非空时启动只读管理页。
+// startAdmin 在 cfg.Common.ManageListen 非空时启动管理页（阶段 7 起可写）。
 func (c *client) startAdmin() error {
 	if c.cfg.Common.ManageListen == "" {
 		return nil
@@ -25,6 +25,10 @@ func (c *client) startAdmin() error {
 		Version: version.Version,
 		Logger:  c.log,
 		Pprof:   c.cfg.Common.Pprof,
+		Actions: []admin.Action{
+			{Name: "client-mapping-save", Title: "新增/修改映射", Method: http.MethodPost, Handler: c.handleMappingSave},
+			{Name: "client-mapping-delete", Title: "删除映射", Method: http.MethodPost, Handler: c.handleMappingDelete},
+		},
 	})
 	srv.AddPage(admin.Page{
 		Path:   "/client",
@@ -96,21 +100,44 @@ func (c *client) renderAdminPage(w io.Writer, _ *http.Request) {
 
 	// 本地端口映射表
 	add(`<section><h2>本地端口映射表</h2>`)
-	listeners := c.listenerViews()
-	if len(listeners) == 0 {
+	if !c.adminWritable() {
+		add(`<p class="dim">只读模式下映射不可编辑；请将 manage_listen 绑定到 127.0.0.1 后重启。</p>`)
+	}
+	mappings := c.mappingViews()
+	if len(mappings) == 0 {
 		add(`<p class="empty">没有本地监听（[client] 未配置 service.&lt;ID&gt;）</p>`)
 	} else {
-		add(`<table><thead><tr><th>本地监听地址</th><th>协议</th><th>远端 service_id</th>` +
-			`<th>ini 配置值</th></tr></thead><tbody>`)
-		for _, l := range listeners {
+		add(`<table><thead><tr><th>service_id</th><th>本地监听地址</th><th>实际绑定</th>` +
+			`<th>远端 proto</th><th>操作</th></tr></thead><tbody>`)
+		for _, m := range mappings {
+			actions := `<span class="dim">只读</span>`
+			if c.adminWritable() && m.ServiceID != config.DefaultServiceID {
+				actions = fmt.Sprintf(`<form class="inline" method="post" action="/action/client-mapping-save">%s`+
+					`<input type="hidden" name="service_id" value="%s"><input type="text" name="listen" value="%s" size="18">`+
+					`<button type="submit">修改</button></form> `+
+					`<form class="inline" method="post" action="/action/client-mapping-delete">%s`+
+					`<input type="hidden" name="service_id" value="%s"><button type="submit" class="danger">删除</button></form>`,
+					string(c.csrfInput()), template.HTMLEscapeString(m.ServiceID), template.HTMLEscapeString(m.Listen),
+					string(c.csrfInput()), template.HTMLEscapeString(m.ServiceID))
+			}
 			fmt.Fprintf(&b,
-				`<tr><td class="mono">%s</td><td>%s</td><td class="mono">%s</td><td class="mono">%s</td></tr>`,
-				template.HTMLEscapeString(l.Addr),
-				template.HTMLEscapeString(l.Proto),
-				template.HTMLEscapeString(l.ServiceID),
-				template.HTMLEscapeString(l.Listen))
+				`<tr><td class="mono">%s</td><td class="mono">%s</td><td class="mono">%s</td><td>%s</td><td>%s</td></tr>`,
+				template.HTMLEscapeString(m.ServiceID),
+				template.HTMLEscapeString(m.Listen),
+				template.HTMLEscapeString(orDash(m.Actual)),
+				template.HTMLEscapeString(m.Proto),
+				actions)
 		}
 		add(`</tbody></table>`)
+	}
+	if c.adminWritable() {
+		fmt.Fprintf(&b, `<h3 style="font-size:14px;margin:14px 0 6px">新增映射</h3>`+
+			`<form method="post" action="/action/client-mapping-save" class="form-inline">%s`+
+			`<label>service_id <input type="text" name="service_id" size="14" placeholder="web"></label> `+
+			`<label>本地监听 <input type="text" name="listen" size="20" placeholder="127.0.0.1:8080"></label> `+
+			`<button type="submit">新增映射</button></form>`,
+			string(c.csrfInput()))
+		add(`<p class="dim">service_id 只允许 a-z0-9-_（1..64），且不能是 default；本地监听地址允许裸端口（补 127.0.0.1）。</p>`)
 	}
 	add(`</section>`)
 
@@ -138,6 +165,19 @@ func (c *client) renderAdminPage(w io.Writer, _ *http.Request) {
 	add(`</section>`)
 
 	_, _ = w.Write(b.Bytes())
+}
+
+// adminWritable 报告管理页是否可写（未启动管理页时视为只读）。
+func (c *client) adminWritable() bool {
+	return c.admin != nil && c.admin.Writable()
+}
+
+// csrfInput 返回表单 CSRF 隐藏域（未启动管理页时为空）。
+func (c *client) csrfInput() template.HTML {
+	if c.admin == nil {
+		return ""
+	}
+	return c.admin.CSRFInput()
 }
 
 // row 写一行键值表格（值做 HTML 转义）。

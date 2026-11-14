@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/admin"
@@ -121,7 +122,13 @@ type agent struct {
 	tcpDataAddr string
 	udpDataAddr string
 
-	byService map[string]config.ServerService
+	// svcStore 是运行期可变的本地服务表（阶段 7：管理页可增删改）。
+	svcStore *serviceStore
+	// regMu 串行化管理页的服务变更（注册/注销是请求-应答事务，不能交错）。
+	regMu sync.Mutex
+	// ctrlReady 在握手与首次注册完成后置位；管理页只对就绪的控制连接发变更，
+	// 避免在 controlLoop 尚未开始读的时候等待应答而超时。
+	ctrlReady atomic.Bool
 
 	sessions *sessionTable
 	carrier  *carrierManager
@@ -169,15 +176,12 @@ func newAgent(ctx context.Context, cfg *config.Config, log *slog.Logger) *agent 
 	}
 	actx, cancel := context.WithCancel(ctx)
 	a := &agent{
-		cfg:       cfg,
-		log:       log,
-		ctx:       actx,
-		cancel:    cancel,
-		sessions:  newSessionTable(),
-		byService: make(map[string]config.ServerService),
-	}
-	for _, svc := range cfg.Server.All() {
-		a.byService[svc.ID] = svc
+		cfg:      cfg,
+		log:      log,
+		ctx:      actx,
+		cancel:   cancel,
+		sessions: newSessionTable(),
+		svcStore: newServiceStore(cfg.Server.All()),
 	}
 	a.carrier = newCarrierManager(a)
 	return a
@@ -196,7 +200,7 @@ func (a *agent) run() error {
 
 	a.log.Info("agent 已启动", "event", "start",
 		"detail", fmt.Sprintf("relay=%s services=%d reconnect=%t",
-			a.cfg.Server.RelayAddr, len(a.cfg.Server.All()), a.reconnectEnabled()),
+			a.cfg.Server.RelayAddr, a.svcStore.len(), a.reconnectEnabled()),
 	)
 
 	err := a.supervise()
@@ -240,6 +244,8 @@ func (a *agent) connect() error {
 		return err
 	}
 	a.resolveDataAddrs()
+	// 首次注册完成、controlLoop 即将开始读取：此后管理页才允许发服务变更。
+	a.ctrlReady.Store(true)
 	return nil
 }
 
@@ -302,6 +308,7 @@ func (a *agent) controlConn() *controlConn {
 
 // closeControl 关闭并清空当前控制连接（幂等）。
 func (a *agent) closeControl() {
+	a.ctrlReady.Store(false)
 	a.connMu.Lock()
 	c := a.ctrl
 	a.ctrl = nil
@@ -372,7 +379,27 @@ func (a *agent) setUDPMode(mode string) {
 // addRegisteredService 记录一条注册成功的服务（管理页展示用）。
 func (a *agent) addRegisteredService(reg registeredService) {
 	a.ctrlMu.Lock()
+	for i := range a.services {
+		if a.services[i].Service.ID == reg.Service.ID {
+			a.services[i] = reg
+			a.ctrlMu.Unlock()
+			return
+		}
+	}
 	a.services = append(a.services, reg)
+	a.ctrlMu.Unlock()
+}
+
+// removeRegisteredService 移除一条已注册服务快照（管理页展示用）。
+func (a *agent) removeRegisteredService(serviceID string) {
+	a.ctrlMu.Lock()
+	out := a.services[:0]
+	for _, reg := range a.services {
+		if reg.Service.ID != serviceID {
+			out = append(out, reg)
+		}
+	}
+	a.services = out
 	a.ctrlMu.Unlock()
 }
 
@@ -473,7 +500,7 @@ func (a *agent) handleIncoming(msg *protocol.Incoming) {
 		a.log.Warn("接入通知的配对键非法，已忽略", "event", "incoming", "pairing_key", msg.PairingKey, "err", err)
 		return
 	}
-	svc, ok := a.byService[key.ServiceID]
+	svc, ok := a.svcStore.get(key.ServiceID)
 	if !ok {
 		a.log.Warn("接入通知指向未注册的服务，已忽略", "event", "incoming",
 			"pairing_key", key.String(), "service_id", key.ServiceID)

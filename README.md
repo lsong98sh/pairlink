@@ -7,7 +7,7 @@ PairLink 是一个**协议无关的字节流中转**：同一套系统可以承�
 数据库、自定义 TCP/UDP 服务，中继不解析也不终止上层协议（HTTPS/SSH 的端到端加密由
 第三方客户端与真实服务自行完成，中继透明转发）。
 
-- 版本：`v0.2.0`
+- 版本：`v0.3.0`
 - 许可证：Apache-2.0
 - 语言：Go 1.24.4，单二进制三模式
 - 唯一第三方依赖：`golang.org/x/sys`（Windows 服务 SCM）
@@ -285,7 +285,7 @@ udp_session_timeout = 60s
 | --- | --- |
 | `-relay` / `-agent` / `-client` | 必须且只能指定一个模式 |
 | `-config <path>` | ini 配置文件路径（必填） |
-| `-version` | 打印 `pairlink v0.2.0` 并退出（退出码 0） |
+| `-version` | 打印 `pairlink v0.3.0` 并退出（退出码 0） |
 | `-service <op>` | 仅 Windows：`install` / `start` / `stop` / `uninstall`（另有内部使用的 `run`） |
 
 退出码：`0` 正常；`1` 运行/配置错误；`2` 参数用法错误（会打印帮助）。
@@ -310,7 +310,7 @@ udp_session_timeout = 60s
 
 | 键 | 类型 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- | --- |
-| `manage_listen` | `host:port` | 否 | 空 | 管理页监听地址；为空表示不启动管理页。建议只监听 `127.0.0.1` |
+| `manage_listen` | `host:port` | 否 | 空 | 管理页监听地址；为空表示不启动管理页。建议只监听 `127.0.0.1`；**绑定回环时管理页可写，否则只读**（§6） |
 | `pprof` | bool | 否 | `false` | 为 `true` 时在管理端口挂载 `/debug/pprof/` |
 | `log_level` | string | 否 | `info` | `debug` / `info` / `warn` / `error` |
 | `log_format` | string | 否 | `text` | `text` / `json` |
@@ -326,11 +326,11 @@ udp_session_timeout = 60s
 | `tls_cert` | 路径 | `tls=true` 时是 | 空 | 隧道 TLS 证书；`tls = true` 时必须与 `tls_key` 成对，`auto` 下都为空则明文并 WARN |
 | `tls_key` | 路径 | `tls=true` 时是 | 空 | 隧道 TLS 私钥；`tls = true` 时必须与 `tls_cert` 成对 |
 | `auth_token` | string | 建议 | 空 | agent/client 接入密钥；为空则 WARN 并放行（仅内网调试） |
-| `pair_timeout` | duration | 否 | `10s` | 待配对表占位超时 / 数据面报到读帧超时 |
-| `idle_timeout` | duration | 否 | `300s` | TCP 数据面空闲超时（无流量即断开） |
-| `heartbeat_timeout` | duration | 否 | `90s` | 控制面无心跳判死时间 |
-| `udp_session_timeout` | duration | 否 | `60s` | UDP 完整会话空闲超时 |
-| `token_ttl` | duration | 否 | `15s` | 一次性配对令牌有效期 |
+| `pair_timeout` | duration | 否 | `10s` | 待配对表占位超时 / 数据面报到读帧超时（可在管理页修改） |
+| `idle_timeout` | duration | 否 | `300s` | TCP 数据面空闲超时（无流量即断开）（可在管理页修改） |
+| `heartbeat_timeout` | duration | 否 | `90s` | 控制面无心跳判死时间（可在管理页修改） |
+| `udp_session_timeout` | duration | 否 | `60s` | UDP 完整会话空闲超时（可在管理页修改） |
+| `token_ttl` | duration | 否 | `15s` | 一次性配对令牌有效期（可在管理页修改） |
 
 ### 5.4 `[server]`（agent 模式）
 
@@ -338,9 +338,9 @@ udp_session_timeout = 60s
 | --- | --- | --- | --- | --- |
 | `relay_addr` | `host:port` | **是** | — | relay 隧道地址 |
 | `token` | string | **是** | — | 接入密钥，需与 relay 的 `auth_token` 一致 |
-| `protocol` | `tcp`/`udp` | 否 | `tcp` | **主服务**协议；配置了 `local` 而未写 `protocol` 时按 `tcp` |
-| `local` | `host:port` / 端口 | 否 | 空 | **主服务**的本地目标地址（缺 host 补 `127.0.0.1`） |
-| `service.<ID>` | `<proto>:<port>` 或 `<proto>:<host>:<port>` | 否 | — | 附加服务映射；见 §5.6 |
+| `protocol` | `tcp`/`udp` | 否 | `tcp` | **主服务**协议；配置了 `local` 而未写 `protocol` 时按 `tcp`（可在管理页修改） |
+| `local` | `host:port` / 端口 | 否 | 空 | **主服务**的本地目标地址（缺 host 补 `127.0.0.1`）（可在管理页修改） |
+| `service.<ID>` | `<proto>:<port>` 或 `<proto>:<host>:<port>` | 否 | — | 附加服务映射；见 §5.6；**可在管理页新增/修改/删除** |
 | `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（有 `tls_ca` 或 `tls_insecure_skip_verify` 才 TLS，否则明文）/ `true`（强制 TLS；`tls_ca` 为空时用**系统根证书**做标准校验，公网 CA 场景写这个）/ `false`（强制明文，`tls_ca`/insecure 被忽略并 WARN）；只接受 `auto`/`true`/`false` |
 | `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；`tls = auto` 时为空且未开 `tls_insecure_skip_verify` 则走**明文**，`tls = true` 时为空则用**系统根证书**校验（见 §7.1） |
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过 relay 证书校验（仅测试，启动 WARN） |
@@ -356,7 +356,7 @@ udp_session_timeout = 60s
 | --- | --- | --- | --- | --- |
 | `relay_addr` | `host:port` | **是** | — | relay 隧道地址 |
 | `token` | string | **是** | — | 接入密钥 |
-| `service.<ID>` | `host:port` / 端口 | 否 | — | 本地监听地址（缺 host 补 `127.0.0.1`）；见 §5.6 |
+| `service.<ID>` | `host:port` / 端口 | 否 | — | 本地监听地址（缺 host 补 `127.0.0.1`）；见 §5.6；**可在管理页新增/修改/删除** |
 | `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（有 `tls_ca` 或 `tls_insecure_skip_verify` 才 TLS，否则明文）/ `true`（强制 TLS；`tls_ca` 为空时用**系统根证书**做标准校验，公网 CA 场景写这个）/ `false`（强制明文，`tls_ca`/insecure 被忽略并 WARN）；只接受 `auto`/`true`/`false` |
 | `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；`tls = auto` 时为空且未开 `tls_insecure_skip_verify` 则走**明文**，`tls = true` 时为空则用**系统根证书**校验（见 §7.1） |
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过证书校验（仅测试，启动 WARN） |
@@ -430,19 +430,27 @@ service.ssh = :2222
 
 ## 6. 管理页
 
-三种模式都在 `[common] manage_listen` 上提供简单的只读 HTML 管理页：
+三种模式都在 `[common] manage_listen` 上提供 HTML 管理页。**阶段 7 起可修改部分配置并写回 ini**：
+写能力**仅在 `manage_listen` 绑定回环地址**（`127.0.0.0/8`、`::1`、`localhost`）时启用；
+绑定非回环（如 `0.0.0.0`）时整页只读并显示红色横幅，所有写接口返回 **403**。
 
-| 模式 | 页面内容 |
-| --- | --- |
-| relay | 服务注册表（服务ID、协议、在线状态、所属 agent）、在线 agent 列表、当前配对表、UDP 会话表、**踢出**操作 |
-| agent | 本机已注册服务列表、到 relay 的控制连接状态、当前活跃数据连接 |
-| client | relay 返回的可用服务列表、本地端口映射表、当前活跃配对 |
+| 模式 | 页面内容 | 可写操作 |
+| --- | --- | --- |
+| relay | 服务注册表（服务ID、协议、在线状态、所属 agent）、在线 agent 列表、当前配对表、UDP 会话表 | **踢出**（agent / 配对 / 承载连接）+ **参数配置区**：`pair_timeout`、`idle_timeout`、`heartbeat_timeout`、`udp_session_timeout`、`token_ttl` 的修改 |
+| agent | 本机已注册服务列表、到 relay 的控制连接状态、当前活跃数据连接 | **服务表**：`service.<id>` 新增/修改/删除；**主服务** `protocol` + `local` 修改 |
+| client | relay 返回的可用服务列表、本地端口映射表、当前活跃配对 | **映射表**：`service.<id>` 本地监听地址的新增/修改/删除 |
 
 - 顶栏显示模式、版本、运行时长；页面默认 **1 秒自动刷新**，可点右上角暂停/开启。
-- **第一版只读**：配置修改一律改 ini + 重启。唯一写操作是 relay 页面的"踢出"，
-  它通过一次性 CSRF 令牌 + POST 提交，禁止 GET 触发写操作。
+- **持久化**：写操作同时改运行时并**写回 ini**。ini 补丁只替换目标键的值，**保留注释、空行、
+  键顺序、对齐与换行风格**（LF/CRLF），按行插入/删除键，同目录临时文件 + `Rename` 原子替换并
+  保留权限位；不支持跨行值与行尾注释（值中的 `;`/`#` 属于值本身）。
+- **一致性**：relay 参数先校验 → 写 ini → 改运行时（写 ini 失败则不改运行时）；agent 服务改动
+  需先得到 relay 确认（3s 超时）才落盘，失败回滚内存；client 映射先开监听成功才落盘，失败回滚旧监听。
+- **鉴权**：管理页**没有账号体系**，写能力的边界就是"只能绑回环"。写操作仍走一次性 CSRF 令牌 +
+  POST，禁止 GET 触发写；每次写操作记审计日志 `event=admin_action`（含 `remote`/`action`/
+  `target`/`old`/`new`），被拒记 `admin_action_denied`，失败记 `admin_action_failed`。
+- 其它字段（`relay_addr`、`token`、监听端口、`tls*`、`reconnect` 等）**不在页面开放**，仍改 ini + 重启。
 - `pprof = true` 时额外提供 `/debug/pprof/`；生产环境建议关闭，或只监听 `127.0.0.1`。
-- 管理页无登录鉴权：**不要暴露到公网**，用 SSH 隧道/内网访问。
 
 **HTML 组织方式（设计选择）**：三种模式共用 `internal/admin` 的**一套内联布局**——统一的
 `<html lang="zh-CN">` 外壳、内联 CSS、顶栏（模式 / 版本 / 运行时长 / 刷新开关），不引用任何
@@ -558,7 +566,7 @@ sudo journalctl -u pairlink-relay -f
 ### 8.4 容器（Docker）
 
 ```bash
-docker build -t pairlink:v0.2.0 .
+docker build -t pairlink:v0.3.0 .
 docker compose -f deploy/docker-compose.yml up -d --build
 curl -fsS http://127.0.0.1:18080/ | grep -qi 'welcome to nginx' && echo 'e2e OK'
 docker compose -f deploy/docker-compose.yml down
@@ -616,8 +624,11 @@ docker compose -f deploy/docker-compose.yml down
    仍存在的限制：切换只关监听 socket，已建立的会话继续自然结束、不迁移；服务从列表消失时保留当前
    协议（不切回 TCP 占位），启动时缺失的服务仍按 TCP 占位监听；订阅事件本身可能因推送队列满而丢
    （relay 会改发全量 `ServiceList` 兜底，见 §3.2）。
-7. **管理页无鉴权、无配置写入**：只读页面 + 唯一写操作"踢出"；配置改 ini 后重启。
-   默认 1s 自动刷新且不可配置间隔。
+7. **管理页无账号鉴权，写能力仅限回环**：`manage_listen` 绑定 `127.0.0.0/8`、`::1`、`localhost` 时页面可写，
+   绑定 `0.0.0.0`/`::` 时只读且所有写 Action 返回 403。可写时表单仍受一次性 CSRF 保护，
+   写操作会同时更新运行时并写回 ini；ini patch 保留注释、空行、键顺序、对齐与换行风格，但
+   **不支持跨行值、行尾注释**（值中的 `;`/`#` 属于值本身）**与同名段/重复键之外的复杂结构**；
+   同一 ini 被其它进程或编辑器同时修改时**后写覆盖先写**。页面默认 1s 自动刷新且间隔不可配置。
 8. **relay 状态全在内存**：重启后服务注册与配对关系丢失，agent/client 需要重启恢复。
 9. **单 relay 进程**：没有集群/多活；relay 是单点。
 10. **数据面无 TLS**：relay 是明文哑管道，安全性依赖上层协议自身的端到端加密。
@@ -772,7 +783,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
 | 8 | task2：`udp_mode` 在三处下发 | `TestE2EUDPModeNegotiation` | **PASS**：`HelloOK`、`ServiceRegistered`、`ServiceList` 的 `udp_mode` 在 native 与 tcp_tunnel 两种模式下都与 relay 判定一致；`tcp_data_port > 0`，native 的 `udp_data_port > 0`，tcp_tunnel 为 0 |
 | 9 | 三种模式管理页 + pprof | `TestE2EAdminPagesThreeModes` | **PASS**：relay/agent/client 页面均 200；标题分别为 `PairLink relay/agent/client 管理页`；关键表头齐全；无 `<script src=`；三个端口的 `/debug/pprof/goroutine?debug=1` 均返回 200 且含 `goroutine profile: total` |
 | 10 | 无僵尸配对 / 无 goroutine 泄漏 | `TestE2EGoroutineNoLeak` | **PASS**：5 次完整配对流量后运行中 pprof `total=30`，无 `internal/forward.Bidirectional` 残留；全部 `Run` 退出后 goroutine `2 → 3`（容差 +2），`runtime/pprof` 中无 `internal/{relay,agent,client,forward}` 栈帧；每个测试的看护基线均 `2 → 2` |
-| 11 | 单二进制：版本/参数/配置错误退出码 | `TestBinaryVersionUsageAndConfigErrors` | **PASS**：`-version` → `pairlink v0.2.0` 且退出码 0；无模式/多模式/未知 flag → 退出码 **2**；`-relay -config 不存在` / `-agent -config 非法 ini` → 退出码 **1** 且有中文错误 |
+| 11 | 单二进制：版本/参数/配置错误退出码 | `TestBinaryVersionUsageAndConfigErrors` | **PASS**：`-version` → `pairlink v0.3.0` 且退出码 0；无模式/多模式/未知 flag → 退出码 **2**；`-relay -config 不存在` / `-agent -config 非法 ini` → 退出码 **1** 且有中文错误 |
 | 12 | 真实二进制三子进程 TCP echo | `TestSubprocessTCPEcho` | **PASS**：`go build` 出的真实 `pairlink.exe` 分别以 relay/agent/client 三个子进程运行，未改造的第三方 TCP 客户端回显成功；阶段 6A 起收尾统一用跨平台的 `os.Process.Kill()`（Windows/Linux 通用，不再依赖 `taskkill`） |
 | 13 | 跨平台编译（纯 Go 无 CGO） | `TestCrossCompile` | **PASS**：`linux/amd64` 13,895,704 B；`windows/amd64` 14,444,032 B；`windows/arm64` 13,505,024 B；三个平台 `go build ./...` 均通过 |
 | 14 | Windows 服务 | `TestE2EWindowsService` | **PASS（非管理员分支）**：`pairlink-relay -service install` 退出码 1，输出可读错误 `service: 连接 SCM（需要管理员权限）: Access is denied.`，无 panic/静默成功；完整 install→start→stop→uninstall 需管理员，本机未执行（见 §13.10） |
@@ -882,7 +893,7 @@ pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|
 ### 13.10 真实二进制、子进程与跨平台
 
 - `TestBinaryVersionUsageAndConfigErrors`：`pairlink -version` 输出
-  `pairlink v0.2.0`；无模式/多模式/未知 flag 退出码 2；配置文件缺失/非法退出码 1，
+  `pairlink v0.3.0`；无模式/多模式/未知 flag 退出码 2；配置文件缺失/非法退出码 1，
   错误信息为中文且可定位。
 - `TestSubprocessTCPEcho`：TestMain 在临时目录 `go build` 出真实 `pairlink.exe`，启动
   relay/agent/client 三个子进程，第三方 TCP echo 成功，最后用跨平台 `os.Process.Kill()` 清理（阶段 6A 起不再依赖 `taskkill`）。
@@ -1260,14 +1271,14 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 
 ## 14. 版本与许可证
 
-- 版本：`v0.2.0`
+- 版本：`v0.3.0`
 - 许可证：[Apache-2.0](LICENSE)
 
 ---
 
 ## 15. 变更记录（Changelog）
 
-### v0.3.0（未发布）
+### v0.3.0（当前）
 
 **新增**
 
@@ -1276,8 +1287,19 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
   使用**系统根证书**做标准校验——公网 CA 场景不再需要 `tls_insecure_skip_verify`；
   relay 侧 `tls = true` 缺证书对直接启动失败；`tls = false` 时证书/CA 被忽略并 WARN。
   新增 `examples/relay-tls.ini` 与 `examples/agent-tls.ini`（含 openssl 自签示例）。
+- **管理页动态配置（阶段 7）**：relay 可在页面修改 `pair_timeout` / `idle_timeout` /
+  `heartbeat_timeout` / `udp_session_timeout` / `token_ttl`；agent 可新增/修改/删除
+  `[server] service.<id>` 并修改主服务 `protocol`/`local`；client 可新增/修改/删除本地映射。
+  写操作同时改运行时并**写回 ini**（只替换值、保留注释与格式、原子替换）。
+  **仅 `manage_listen` 绑定回环地址时可写**，非回环页面只读且写 Action 返回 403，
+  可写时仍保留一次性 CSRF 与 `admin_action` 审计日志。
+  协议新增 `MsgUnregisterService`(0x13) / `MsgServiceUnregistered`(0x14)，不提升
+  `ProtocolVersion`；agent 增删服务需要 relay v0.3.0+。
 
 **变更**
+
+- 版本号 `v0.2.0` → `v0.3.0`：`internal/version` 仍是唯一来源，`-version` 输出
+  `pairlink v0.3.0`，三模式管理页顶栏同步。
 
 - **部署脚本按模式拆分（阶段 6F）**：删除 `deploy/linux/{install,uninstall}.sh` 与
   `deploy/windows/{install-service,uninstall-service}.ps1`；改为每个角色一个入口

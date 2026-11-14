@@ -2,6 +2,7 @@ package relay
 
 import (
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -292,6 +293,9 @@ func (l *TunnelListener) dispatch(tc *tunnelConn, typ protocol.MessageType, msg 
 	case protocol.MsgRegisterService:
 		l.handleRegisterService(tc, msg.(*protocol.RegisterService))
 		return true
+	case protocol.MsgUnregisterService:
+		l.handleUnregisterService(tc, msg.(*protocol.UnregisterService))
+		return true
 	case protocol.MsgListServices:
 		l.handleListServices(tc)
 		return true
@@ -374,6 +378,51 @@ func (l *TunnelListener) handleRegisterService(tc *tunnelConn, req *protocol.Reg
 	)
 }
 
+// handleUnregisterService 处理 agent 的服务注销（阶段 7，0x13）。
+//
+// 只允许注销本 agent 名下的服务：owner 不符或服务不存在都回 bad_request，
+// 不泄露服务归属细节。成功后注册表派发 removed 事件（订阅者可见），
+// 并回 MsgServiceUnregistered。
+func (l *TunnelListener) handleUnregisterService(tc *tunnelConn, req *protocol.UnregisterService) {
+	s := tc.srv
+	if tc.role != protocol.RoleAgent {
+		_ = tc.writeError(protocol.ErrCodeBadRequest, "只有 agent 可以注销服务")
+		return
+	}
+	if !validServiceID(req.ServiceID) {
+		_ = tc.writeError(protocol.ErrCodeBadRequest, "service_id 非法")
+		return
+	}
+	if err := s.services.Unregister(req.ServiceID, tc.agentID); err != nil {
+		switch {
+		case errors.Is(err, registry.ErrServiceNotFound):
+			_ = tc.writeError(protocol.ErrCodeBadRequest, "服务未注册")
+		case errors.Is(err, registry.ErrServiceOwnerMismatch):
+			_ = tc.writeError(protocol.ErrCodeBadRequest, "服务不属于本 agent")
+		default:
+			tc.log.Error("注销服务失败", "event", "service_unregister", "service_id", req.ServiceID, "err", err)
+			_ = tc.writeError(protocol.ErrCodeInternal, "服务注销失败")
+		}
+		return
+	}
+
+	ids := make([]string, 0, 4)
+	for _, svc := range s.services.ListByAgent(tc.agentID) {
+		ids = append(ids, svc.ID)
+	}
+	_ = s.agents.SetServices(tc.agentID, ids)
+
+	if err := tc.write(protocol.MsgServiceUnregistered, &protocol.ServiceUnregistered{
+		ServiceID: req.ServiceID,
+	}); err != nil {
+		return
+	}
+	tc.log.Info("服务注销",
+		"event", "service_unregister",
+		"service_id", req.ServiceID,
+	)
+}
+
 // handleListServices 返回当前服务列表。
 func (l *TunnelListener) handleListServices(tc *tunnelConn) {
 	s := tc.srv
@@ -433,8 +482,8 @@ func (l *TunnelListener) handleConnectRequest(tc *tunnelConn, req *protocol.Conn
 
 	agent, online := s.agents.Get(entry.AgentID)
 	agentOnline := online
-	if agentOnline && s.cfg.Relay.HeartbeatTimeout > 0 {
-		agentOnline = time.Since(agent.LastSeen) <= s.cfg.Relay.HeartbeatTimeout
+	if agentOnline && s.heartbeatTimeoutValue() > 0 {
+		agentOnline = time.Since(agent.LastSeen) <= s.heartbeatTimeoutValue()
 	}
 	if !agentOnline {
 		tc.log.Warn("接入请求的 agent 不在线",

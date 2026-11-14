@@ -127,6 +127,7 @@ func newClientWithLogger(ctx context.Context, cfg *config.Config, log *slog.Logg
 		ctrlLog:     logx.Component(log, "control"),
 		host:        host,
 		services:    make(map[string]protocol.ServiceInfo),
+		mappings:    append([]config.ClientService(nil), cfg.Client.Services...),
 		tcpSessions: make(map[string]*tcpSession),
 		udpSessions: make(map[udpSessionKey]*udpSession),
 		udpByConn:   make(map[string]*udpSession),
@@ -190,6 +191,13 @@ type client struct {
 	listenSwitchMu sync.Mutex
 	listeners      []*localListener
 
+	// mappingMu 保护运行期本地映射表（阶段 7：管理页可增删改）。
+	// cfg.Client.Services 只作为启动时的初始值，重连校对与管理页都以本表为准。
+	mappingMu sync.Mutex
+	mappings  []config.ClientService
+	// mappingOpMu 串行化管理页的映射变更（新增/修改/删除）。
+	mappingOpMu sync.Mutex
+
 	// listenFn 打开本地监听（测试可注入以模拟端口占用/失败）。
 	listenFn func(proto, addr string) (*localListener, error)
 
@@ -221,7 +229,7 @@ func (c *client) run() error {
 
 	c.log.Info("client 启动", "event", "start",
 		"detail", fmt.Sprintf("relay=%s services=%d reconnect=%t",
-			c.cfg.Client.RelayAddr, len(c.cfg.Client.Services), c.reconnectEnabled()))
+			c.cfg.Client.RelayAddr, len(c.mappingSnapshot()), c.reconnectEnabled()))
 
 	if err := c.startAdmin(); err != nil {
 		c.shutdown()

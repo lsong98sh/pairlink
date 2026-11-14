@@ -419,6 +419,53 @@ TLS 是否启用由**三层**决定，优先级从高到低：
 鉴权失败 / 版本不匹配 / TLS 握手失败 / `reconnect=false` 下的断开（返回错误）会结束 `Run`；
 其余断开都进入退避重连，进程保持存活。
 
+### 7.9 管理页动态配置（阶段 7）
+
+**门禁**：`internal/admin` 在 `New(addr, …)` 时用 `IsLoopbackListen(addr)` 计算 `Writable`：
+只有 `127.0.0.0/8`、`::1`、`localhost` 才允许写；非回环时布局渲染只读红条，
+所有 `/action/*` 在方法校验之后直接 403，CSRF 不消费、Handler 不执行。
+
+**写请求的统一路径**（三种模式一致）：
+
+```
+POST /action/<name> + 一次性 CSRF
+  → 门禁（非回环 403）
+  → OnlyPostFields 白名单（未知字段 400）
+  → 严格值校验（duration>0 / service_id 正则 / host:port / 长度≤256）
+  → 持久化 config.PatchValue / DeleteKey（同目录临时文件 + Rename 原子替换）
+  → 成功后更新运行时（relay 五参数）或先改运行时再持久化（agent/client 事务式流程）
+  → 审计日志 event=admin_action
+  → 303 回本页 ?ok=<msg>（失败 ?err=<msg>）
+```
+
+顺序取舍：
+
+- relay 五个参数：**先写 ini，成功才改运行时**；写盘失败时运行时保持原值并报
+  "运行时未改变"，避免"只改了一半"。
+- agent：先改运行期服务表 → 向 relay 注册/注销并等确认（3s）→ 成功才写 ini；
+  relay 拒绝/超时回滚内存；写 ini 失败回滚内存并尽力反向注册/注销。
+- client：先开关/切换监听 → 成功才写 ini；写盘失败关闭新监听、恢复旧监听与映射。
+
+**ini patch 的原子性与并发**（`internal/config/patch.go`）：
+
+- 进程内包级 `patchMu` 串行化"读整份文件 → 改行 → 原子替换"；HTTP handler 并发写同一
+  ini 不会互相覆盖。跨进程（编辑器/另一实例）不在保证范围，可能后写覆盖先写。
+- 只做行级替换：保留注释、空行、键顺序、键名写法、`=` 前对齐、LF/CRLF、结尾换行、
+  BOM 与权限位；不重新格式化、不清理连续空行。
+- `os.CreateTemp`（同目录）→ 写入 → `Sync` → `Chmod` → `Close` → `os.Rename`；
+  任一步失败删除临时文件，原文件保持完整。
+- 同一段重复键：Patch 替换全部同名键、Delete 删除全部同名行；同名段重复出现时也会
+  覆盖全部同名段（ini 解析器会合并重复段）。
+- 参数校验拒绝含换行/方括号的段名与含换行的键/值，防止行注入。
+
+**审计字段**（`internal/admin/notice.go`）：`event=admin_action`、`remote`、`action`、
+`target`、`old`、`new`（值截断到 200 字符并去掉控制字符）；被门禁拒绝记
+`event=admin_action_denied`，失败记 `event=admin_action_failed`。不含令牌/密钥。
+
+**协议**：agent 增删服务新增 0x13/0x14（`docs/protocol.md` §4.15），不升版本；
+`agent.controlConn` 用"单在途请求 + 确认通道"把 relay 的注册/注销确认从 `controlLoop`
+交给管理页 goroutine（`agent.regMu` 串行化），控制连接关闭/重连时唤醒等待方并回滚。
+
 ## 8. 可观测性
 
 - `[common] pprof = true` 时在 `manage_listen` 挂 `/debug/pprof/`（`internal/admin` 已实现，

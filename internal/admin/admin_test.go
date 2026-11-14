@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -226,6 +227,183 @@ func TestShutdown(t *testing.T) {
 	client := &http.Client{Timeout: 300 * time.Millisecond}
 	if _, err := client.Get("http://" + addr + "/"); err == nil {
 		t.Fatal("Shutdown 后请求应失败")
+	}
+}
+
+// startTestServerAt 在指定地址启动管理页（用于回环/非回环门禁用例）。
+func startTestServerAt(t *testing.T, addr string, opts Options) *Server {
+	t.Helper()
+	if opts.Logger == nil {
+		opts.Logger = discardLogger()
+	}
+	s := New(addr, opts)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start(%s) 失败: %v", addr, err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		shutdownCtx, c := context.WithTimeout(context.Background(), 2*time.Second)
+		defer c()
+		_ = s.Shutdown(shutdownCtx)
+	})
+	return s
+}
+
+// TestIsLoopbackListen 覆盖回环地址判定。
+func TestIsLoopbackListen(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:9000":    true,
+		"127.0.0.2:9000":    true,
+		"[::1]:9000":        true,
+		"localhost:9000":    true,
+		"0.0.0.0:9000":      false,
+		":9000":             false,
+		"[::]:9000":         false,
+		"192.168.1.10:9000": false,
+		"example.com:9000":  false,
+		"":                  false,
+	}
+	for addr, want := range cases {
+		if got := IsLoopbackListen(addr); got != want {
+			t.Errorf("IsLoopbackListen(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+// TestWritableGateLoopback 覆盖回环绑定可写、CSRF 仍生效。
+func TestWritableGateLoopback(t *testing.T) {
+	called := 0
+	s := startTestServerAt(t, "127.0.0.1:0", Options{
+		Mode: "relay",
+		Actions: []Action{{
+			Name:  "cfg",
+			Title: "修改",
+			Handler: func(w http.ResponseWriter, r *http.Request) {
+				called++
+				w.WriteHeader(http.StatusOK)
+			},
+		}},
+	})
+	if !s.Writable() {
+		t.Fatal("127.0.0.1 绑定应可写")
+	}
+	_, body := httpGet(t, "http://"+s.Addr()+"/")
+	if strings.Contains(body, "只读模式") {
+		t.Fatalf("回环页面不应出现只读横幅: %s", body)
+	}
+	if status, _ := httpPost(t, "http://"+s.Addr()+"/action/cfg", url.Values{}, nil); status != http.StatusForbidden {
+		t.Fatalf("无 CSRF 应 403，实际 %d", status)
+	}
+	tok := s.CSRFToken()
+	if status, _ := httpPost(t, "http://"+s.Addr()+"/action/cfg", url.Values{"csrf_token": {tok}}, nil); status != http.StatusOK || called != 1 {
+		t.Fatalf("回环 + CSRF 应执行: status=%d called=%d", status, called)
+	}
+}
+
+// TestWritableGateNonLoopback 覆盖非回环绑定：页面横幅 + 所有写 Action 403。
+func TestWritableGateNonLoopback(t *testing.T) {
+	called := 0
+	s := startTestServerAt(t, "0.0.0.0:0", Options{
+		Mode: "relay",
+		Actions: []Action{{
+			Name:  "cfg",
+			Title: "修改",
+			Handler: func(w http.ResponseWriter, r *http.Request) {
+				called++
+				w.WriteHeader(http.StatusOK)
+			},
+		}},
+	})
+	if s.Writable() {
+		t.Fatal("0.0.0.0 绑定应只读")
+	}
+	base := "http://" + s.Addr()
+	_, body := httpGet(t, base+"/")
+	if !strings.Contains(body, "只读模式") || !strings.Contains(body, "manage_listen") {
+		t.Fatalf("非回环页面缺少只读横幅: %s", body)
+	}
+	if !strings.Contains(body, "写操作已禁用") {
+		t.Fatalf("只读横幅应说明写操作已禁用: %s", body)
+	}
+	if strings.Contains(body, `action="/action/`) {
+		t.Fatalf("只读模式下不应渲染写表单: %s", body)
+	}
+	// 带合法 CSRF 也必须 403。
+	tok := s.CSRFToken()
+	status, _ := httpPost(t, base+"/action/cfg", url.Values{"csrf_token": {tok}}, nil)
+	if status != http.StatusForbidden {
+		t.Fatalf("只读模式下写操作应 403，实际 %d", status)
+	}
+	if called != 0 {
+		t.Fatal("只读模式下 handler 不应被调用")
+	}
+	// GET 仍然是 405（方法校验优先于门禁）。
+	if status, _ := httpGet(t, base+"/action/cfg"); status != http.StatusMethodNotAllowed {
+		t.Fatalf("GET 写操作应 405，实际 %d", status)
+	}
+}
+
+// TestOnlyPostFields 覆盖表单字段白名单。
+func TestOnlyPostFields(t *testing.T) {
+	mk := func(values url.Values) *http.Request {
+		req, err := http.NewRequest(http.MethodPost, "/", strings.NewReader(values.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req
+	}
+	if !OnlyPostFields(mk(url.Values{"key": {"a"}, "value": {"b"}, "csrf_token": {"t"}}), "key", "value") {
+		t.Fatal("白名单内字段应通过")
+	}
+	if OnlyPostFields(mk(url.Values{"key": {"a"}, "evil": {"b"}}), "key") {
+		t.Fatal("未知字段应被拒绝")
+	}
+}
+
+// TestParsePositiveDuration 覆盖 duration 校验。
+func TestParsePositiveDuration(t *testing.T) {
+	if d, err := ParsePositiveDuration("30s"); err != nil || d != 30*time.Second {
+		t.Fatalf("30s 解析失败: %v %v", d, err)
+	}
+	for _, bad := range []string{"", "abc", "0s", "-1s", "0", strings.Repeat("1", 65)} {
+		if _, err := ParsePositiveDuration(bad); err == nil {
+			t.Errorf("ParsePositiveDuration(%q) 应报错", bad)
+		}
+	}
+}
+
+// TestRedirectNoticeAndAudit 覆盖提示条与审计日志。
+func TestRedirectNoticeAndAudit(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	s := startTestServerAt(t, "127.0.0.1:0", Options{Logger: logger})
+	req, _ := http.NewRequest(http.MethodGet, "/relay?ok=%E5%B7%B2%E4%BF%9D%E5%AD%98&err=%3Cscript%3E", nil)
+	bar := string(NoticeBar(req))
+	if !strings.Contains(bar, "操作失败") || strings.Contains(bar, "<script>") {
+		t.Fatalf("提示条应优先 err 且转义 HTML: %s", bar)
+	}
+	s.Audit(req, "relay-config", "[relay] pair_timeout", "10s", "30s")
+	logs := buf.String()
+	for _, want := range []string{"event=admin_action", "action=relay-config", "target=", "old=10s", "new=30s"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("审计日志缺少 %q: %s", want, logs)
+		}
+	}
+}
+
+// TestRedirectNoticeSeeOther 覆盖 303 重定向与查询参数。
+func TestRedirectNoticeSeeOther(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/action/x", nil)
+	RedirectNotice(rec, req, "/relay", false, "已更新")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("状态码 = %d, want 303", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/relay?ok=") {
+		t.Fatalf("Location = %q", loc)
 	}
 }
 
