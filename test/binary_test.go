@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +16,17 @@ import (
 
 // pairlinkExe 是 TestMain 构建出的真实二进制路径。
 var pairlinkExe string
+
+// exeName 给可执行文件名补上当前平台的后缀（Windows 为 ".exe"，其它平台为空）。
+//
+// 这样测试代码不出现硬编码的 ".exe"，同一份用例在 Windows / Linux / macOS
+// 上都能定位到真实产物。
+func exeName(base string) string {
+	if runtime.GOOS == "windows" {
+		return base + ".exe"
+	}
+	return base
+}
 
 // repoRoot 是仓库根目录（test 包的父目录）。
 var repoRoot string
@@ -34,11 +44,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "创建临时目录: %v\n", err)
 		os.Exit(1)
 	}
-	exeName := "pairlink"
-	if runtime.GOOS == "windows" {
-		exeName = "pairlink.exe"
-	}
-	exe := filepath.Join(dir, exeName)
+	exe := filepath.Join(dir, exeName("pairlink"))
 	cmd := exec.Command("go", "build", "-o", exe, ".")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
@@ -171,26 +177,61 @@ func (p *childProc) exited() bool {
 	}
 }
 
+// kill 强制结束子进程（幂等）。
+//
+// 统一用 os.Process.Kill()：它是 Windows 与 Unix 都可用的最小公倍数，
+// 不依赖 taskkill / kill 等平台专有命令，也不需要外部进程配合。
 func (p *childProc) kill(t *testing.T) {
 	t.Helper()
 	if p.exited() {
 		return
 	}
-	// 按任务要求用 taskkill /PID 收尾（Windows）；其它平台回退 Process.Kill。
-	if runtime.GOOS == "windows" {
-		_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(p.cmd.Process.Pid)).Run()
-	}
-	select {
-	case <-p.done:
-		return
-	case <-time.After(2 * time.Second):
-		_ = p.cmd.Process.Kill()
+	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Logf("%s 子进程 Kill: %v", p.name, err)
 	}
 	select {
 	case <-p.done:
 	case <-time.After(5 * time.Second):
 		t.Errorf("%s 子进程无法结束（pid=%d）", p.name, p.cmd.Process.Pid)
 	}
+}
+
+// interrupt 请求优雅关停并报告是否真的发出了信号。
+//
+// Unix：os.Process.Signal(os.Interrupt) 投递 SIGINT，PairLink 的
+// signal.NotifyContext 会捕获它并走正常关停路径（退出码 0）。
+// Windows：Go 不支持向子进程投递 Ctrl+C（Signal 返回 "not supported by
+// windows"），此时回退 Process.Kill 并返回 false，调用方据此不做
+// "退出码必须为 0" 的断言——这是平台能力差异，不是产品行为差异。
+func (p *childProc) interrupt() bool {
+	if runtime.GOOS == "windows" {
+		_ = p.cmd.Process.Kill()
+		return false
+	}
+	if err := p.cmd.Process.Signal(os.Interrupt); err != nil {
+		_ = p.cmd.Process.Kill()
+		return false
+	}
+	return true
+}
+
+// waitExit 等待子进程结束，返回退出码（-1 表示被信号杀死或未知）。
+func (p *childProc) waitExit(t *testing.T, timeout time.Duration) int {
+	t.Helper()
+	select {
+	case <-p.done:
+	case <-time.After(timeout):
+		t.Fatalf("%s 子进程未在 %s 内退出（pid=%d）\n--- 日志尾部 ---\n%s",
+			p.name, timeout, p.cmd.Process.Pid, p.logTail())
+	}
+	if p.err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(p.err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 func (p *childProc) logTail() string {
@@ -316,6 +357,137 @@ func TestSubprocessTCPEcho(t *testing.T) {
 	t.Logf("真实子进程三进程 TCP echo 成功（relay/agent/client），本地端口 %s", hostPort(clientPort))
 }
 
+// TestSubprocessGracefulShutdown 验收项：真实三子进程在收到中断信号后优雅关停。
+//
+// 断言（Unix 上全部执行）：
+//   - client / agent / relay 收到 SIGINT 后退出码均为 0（PairLink 用
+//     signal.NotifyContext 捕获 os.Interrupt/SIGTERM，ctx 取消视为正常退出）；
+//   - 每个子进程日志都出现 "event=exit" 与 "PairLink 已退出"；
+//   - 三个监听端口（client 本地端口、relay 隧道/管理端口、agent 管理端口）在进程
+//     退出后都不再接受连接，即操作系统层面已释放。
+//
+// Windows 上 Go 无法向子进程投递 Ctrl+C，interrupt() 回退 Process.Kill，
+// 因此只断言"进程确实退出"；这一平台差异在 README 的诚实清单里写明。
+func TestSubprocessGracefulShutdown(t *testing.T) {
+	guardGoroutines(t)
+
+	echoAddr := startTCPEchoServer(t)
+
+	relayManage := hostPort(freeTCPPort(t))
+	relayCfg, relayPath := writeRelayINI(t, relaySpec{
+		Tunnel:      hostPort(freeTCPPort(t)),
+		TCP:         hostPort(freeTCPPort(t)),
+		Manage:      relayManage,
+		PairTimeout: 5 * time.Second,
+		LogLevel:    "info",
+	})
+	relayProc := startChild(t, "relay", "-relay", "-config", relayPath)
+	waitChild(t, 10*time.Second, "relay 子进程端口就绪", []*childProc{relayProc}, func() bool {
+		conn, err := net.DialTimeout("tcp", relayCfg.Relay.TunnelListen, 300*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return adminReachable(relayManage, "/")
+	})
+
+	agentManage := hostPort(freeTCPPort(t))
+	_, agentPath := writeAgentINI(t, agentSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    agentManage,
+		Protocol:  "tcp",
+		Local:     echoAddr,
+		LogLevel:  "info",
+	})
+	agentProc := startChild(t, "agent", "-agent", "-config", agentPath)
+	waitChild(t, 10*time.Second, "agent 子进程注册服务", []*childProc{relayProc, agentProc}, func() bool {
+		code, body, err := adminGet(relayManage, "/relay?refresh=0")
+		return err == nil && code == 200 && strings.Contains(body, "服务注册表（1）")
+	})
+
+	clientPort := freeTCPPort(t)
+	clientCfg, clientPath := writeClientINI(t, clientSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    hostPort(freeTCPPort(t)),
+		Services:  []clientService{{ID: "default", Listen: hostPort(clientPort)}},
+		LogLevel:  "info",
+	})
+	clientProc := startChild(t, "client", "-client", "-config", clientPath)
+	waitChild(t, 10*time.Second, "client 子进程本地监听就绪", []*childProc{relayProc, agentProc, clientProc}, func() bool {
+		code, body, err := adminGet(clientCfg.Common.ManageListen, "/client?refresh=0")
+		return err == nil && code == 200 && strings.Contains(body, hostPort(clientPort))
+	})
+
+	// 关停前先证明链路是活的（避免"空转也能过"）。
+	conn, err := net.DialTimeout("tcp", hostPort(clientPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("关停前连接 client 本地端口: %v", err)
+	}
+	echoText(t, conn, "before-shutdown")
+	_ = conn.Close()
+
+	// 逆序关停：client → agent → relay，与服务依赖方向一致。
+	procs := []*childProc{clientProc, agentProc, relayProc}
+	signalled := true
+	for _, p := range procs {
+		if !p.interrupt() {
+			signalled = false
+		}
+	}
+
+	for _, p := range procs {
+		code := p.waitExit(t, 15*time.Second)
+		if signalled && code != 0 {
+			t.Fatalf("%s 优雅关停退出码 = %d，期望 0\n--- 日志尾部 ---\n%s", p.name, code, p.logTail())
+		}
+		t.Logf("%s 退出码 = %d", p.name, code)
+		if signalled {
+			tail := p.logTail()
+			if !strings.Contains(tail, "event=exit") {
+				t.Fatalf("%s 日志缺少 event=exit\n--- 日志尾部 ---\n%s", p.name, tail)
+			}
+			if !strings.Contains(tail, "PairLink 已退出") {
+				t.Fatalf("%s 日志缺少“PairLink 已退出”\n--- 日志尾部 ---\n%s", p.name, tail)
+			}
+		}
+	}
+
+	// 端口释放：进程退出后不再接受连接（轮询给内核一点时间）。
+	released := []struct {
+		name string
+		addr string
+	}{
+		{"client 本地端口", hostPort(clientPort)},
+		{"relay 隧道端口", relayCfg.Relay.TunnelListen},
+		{"relay 管理端口", relayManage},
+		{"agent 管理端口", agentManage},
+	}
+	for _, r := range released {
+		waitChild(t, 5*time.Second, r.name+"已释放", nil, func() bool {
+			c, err := net.DialTimeout("tcp", r.addr, 200*time.Millisecond)
+			if err == nil {
+				_ = c.Close()
+				return false
+			}
+			return true
+		})
+		t.Logf("%s 已释放（%s 不再监听）", r.name, r.addr)
+	}
+
+	if !signalled {
+		t.Log("Windows：无法向子进程投递 Ctrl+C，本次仅验证进程退出；优雅关停路径由 README §13.15 的 Linux/WSL2 实测（SIGTERM）覆盖")
+	}
+}
+
+// exeNameFor 按“目标平台”给产物补后缀。与 exeName 的区别：它描述交叉编译
+// 产物的宿主，而不是运行测试的平台。
+func exeNameFor(goos, base string) string {
+	if goos == "windows" {
+		return base + ".exe"
+	}
+	return base
+}
+
 // TestCrossCompile 验收项：纯 Go（无 CGO）跨平台编译通过。
 func TestCrossCompile(t *testing.T) {
 	guardGoroutines(t)
@@ -330,9 +502,7 @@ func TestCrossCompile(t *testing.T) {
 	outDir := t.TempDir()
 	for _, tc := range targets {
 		outName := fmt.Sprintf("pairlink-%s-%s", tc.goos, tc.goarch)
-		if tc.goos == "windows" {
-			outName += ".exe"
-		}
+		outName = exeNameFor(tc.goos, outName)
 		outPath := filepath.Join(outDir, outName)
 		cmd := exec.Command("go", "build", "-o", outPath, ".")
 		cmd.Dir = repoRoot
@@ -368,9 +538,15 @@ func TestCrossCompile(t *testing.T) {
 }
 
 // wslAvailable 检测本机是否有可用 WSL 发行版。
+//
+// 三个平台都可调用：直接跑在 Linux 内核上（含 WSL2 内部）时视为“可用”，
+// Windows 上则实际探测 wsl.exe，其它平台返回不可用并说明原因。
 func wslAvailable() (bool, string) {
+	if runtime.GOOS == "linux" {
+		return true, fmt.Sprintf("当前平台为 %s/%s 原生运行", runtime.GOOS, runtime.GOARCH)
+	}
 	if runtime.GOOS != "windows" {
-		return false, "当前不是 Windows 平台"
+		return false, fmt.Sprintf("当前平台 %s/%s 既非 Linux 也无 WSL", runtime.GOOS, runtime.GOARCH)
 	}
 	cmd := exec.Command("wsl.exe", "-l", "-q")
 	out, err := cmd.CombinedOutput()

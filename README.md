@@ -531,8 +531,11 @@ systemctl enable --now pairlink-relay
 8. **relay 状态全在内存**：重启后服务注册与配对关系丢失，agent/client 需要重启恢复。
 9. **单 relay 进程**：没有集群/多活；relay 是单点。
 10. **数据面无 TLS**：relay 是明文哑管道，安全性依赖上层协议自身的端到端加密。
-11. **Linux 二进制只在交叉编译层面验证**：本机无 WSL/无 Linux 真机，`GOOS=linux` 只证明
-    编译与纯 Go 依赖（`CGO_ENABLED=0`）通过，未在真实 Linux 上跑三进程 echo。
+11. **Linux 已在真机（WSL2 Ubuntu）验证**：阶段 6A 起在 WSL2 的 Ubuntu 26.04
+    （`go1.24.4 linux/amd64` / `gcc 15.2` / `CGO_ENABLED=1`）上跑通了全量单测、`-race`
+    （真跑，非 `CGO_ENABLED=0` 降级）与真实三进程端到端（HTTP / TCP echo / UDP 两种承载 /
+    三个管理页 / 踢出 / SIGTERM 优雅关停 / 端口释放），并做了跨 OS 联调与 TLS 复核，
+    详见 §13.15。仍未覆盖：systemd 真实托管、非 loopback 多网卡、长时间 soak。
 12. **Windows 服务未做完整生命周期验证**：本机非管理员，只验证了 `-service install` 的
     "需要管理员权限"错误路径与服务命名 `pairlink-<mode>`；install→start→stop→uninstall
     的实际 SCM 状态、`pairlink-<mode>.log` 落盘需管理员环境复核。
@@ -606,8 +609,8 @@ GOOS=windows GOARCH=arm64 go build ./...
 | 操作系统 | Windows 10 专业版 10.0.19045（amd64） |
 | Go | `go1.24.4 windows/amd64` |
 | 权限 | **非管理员**（Windows 服务完整生命周期未执行，见 §13.10） |
-| WSL | **不可用**：`wsl -l -q` 退出码 1，无发行版；Linux 二进制只做了交叉编译 |
-| CGO | 构建与交叉编译均 `CGO_ENABLED=0`（纯 Go） |
+| WSL | 阶段 3/4 时**不可用**（`wsl -l -q` 退出码 1）；**阶段 6A 起可用**：Ubuntu 26.04 / WSL 2 / `go1.24.4 linux/amd64` / `gcc 15.2` / `CGO_ENABLED=1`，真机结果见 §13.15 |
+| CGO | Windows 构建与交叉编译均 `CGO_ENABLED=0`（纯 Go）；Linux 单测/`-race` 用 `CGO_ENABLED=1` |
 | 网络范围 | 全部为 `127.0.0.1` loopback，未做公网/NAT/防火墙验证 |
 
 ```bash
@@ -652,7 +655,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
 | 9 | 三种模式管理页 + pprof | `TestE2EAdminPagesThreeModes` | **PASS**：relay/agent/client 页面均 200；标题分别为 `PairLink relay/agent/client 管理页`；关键表头齐全；无 `<script src=`；三个端口的 `/debug/pprof/goroutine?debug=1` 均返回 200 且含 `goroutine profile: total` |
 | 10 | 无僵尸配对 / 无 goroutine 泄漏 | `TestE2EGoroutineNoLeak` | **PASS**：5 次完整配对流量后运行中 pprof `total=30`，无 `internal/forward.Bidirectional` 残留；全部 `Run` 退出后 goroutine `2 → 3`（容差 +2），`runtime/pprof` 中无 `internal/{relay,agent,client,forward}` 栈帧；每个测试的看护基线均 `2 → 2` |
 | 11 | 单二进制：版本/参数/配置错误退出码 | `TestBinaryVersionUsageAndConfigErrors` | **PASS**：`-version` → `pairlink v0.1.0` 且退出码 0；无模式/多模式/未知 flag → 退出码 **2**；`-relay -config 不存在` / `-agent -config 非法 ini` → 退出码 **1** 且有中文错误 |
-| 12 | 真实二进制三子进程 TCP echo | `TestSubprocessTCPEcho` | **PASS**：`go build` 出的真实 `pairlink.exe` 分别以 relay/agent/client 三个子进程运行，未改造的第三方 TCP 客户端回显成功；`taskkill /PID` 收尾 |
+| 12 | 真实二进制三子进程 TCP echo | `TestSubprocessTCPEcho` | **PASS**：`go build` 出的真实 `pairlink.exe` 分别以 relay/agent/client 三个子进程运行，未改造的第三方 TCP 客户端回显成功；阶段 6A 起收尾统一用跨平台的 `os.Process.Kill()`（Windows/Linux 通用，不再依赖 `taskkill`） |
 | 13 | 跨平台编译（纯 Go 无 CGO） | `TestCrossCompile` | **PASS**：`linux/amd64` 13,895,704 B；`windows/amd64` 14,444,032 B；`windows/arm64` 13,505,024 B；三个平台 `go build ./...` 均通过 |
 | 14 | Windows 服务 | `TestE2EWindowsService` | **PASS（非管理员分支）**：`pairlink-relay -service install` 退出码 1，输出可读错误 `service: 连接 SCM（需要管理员权限）: Access is denied.`，无 panic/静默成功；完整 install→start→stop→uninstall 需管理员，本机未执行（见 §13.10） |
 | 15 | 阶段4：TLS 隧道端到端（自签 CA） | `TestE2ETLSTCPEcho` | **PASS**：`crypto/x509` 生成 CA + 服务端证书（SAN 127.0.0.1），relay `tls_cert/tls_key`、agent/client `tls_ca`，TCP echo 回显 `tls-echo-1`，结束后配对表回落 |
@@ -767,8 +770,9 @@ pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|
   启动 relay/agent/client 三个子进程，第三方 TCP echo 成功，最后 `taskkill /PID` 清理。
 - `TestCrossCompile`：`CGO_ENABLED=0` 下 `linux/amd64`、`windows/amd64`、
   `windows/arm64` 的 `go build ./...` 与单二进制产物均通过。
-- `TestE2EWSLOrCrossCompileNote`：本机 `wsl -l -q` 失败（无 WSL），
-  因此 **Linux 二进制未在真机运行**，只证明了交叉编译通过。
+- `TestE2EWSLOrCrossCompileNote`：阶段 3/4 时本机 `wsl -l -q` 失败（无 WSL），
+  当时 **Linux 二进制未在真机运行**，只证明了交叉编译通过；阶段 6A 起 WSL2 可用，
+  该用例改为记录"WSL 可用（Ubuntu）/原生 Linux"，真机结果见 §13.15。
 
 ### 13.11 Windows 服务
 
@@ -828,8 +832,9 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
 
 ### 13.14 已知限制与未验证项（诚实说明）
 
-1. **Linux 二进制未在真机/WSL 运行**：本机 `wsl -l -q` 退出码 1，无 WSL 发行版；
-   Linux 只验证了 `CGO_ENABLED=0` 交叉编译。真实 Linux 上的三进程 echo 未执行。
+1. **Linux 真机验证已补齐（阶段 6A）**：本条在阶段 3/4 成立，现由 §13.15 取代——
+   WSL2 Ubuntu 上跑了全量单测 + `-race` + 真实 Linux 二进制三进程 + 跨 OS 联调 + TLS。
+   仍然未验证：systemd 托管、非 loopback 网络、长时间 soak。
 2. **Windows 服务完整生命周期未验证**：本机非管理员。已验证非管理员错误路径、
    `pairlink-<mode>` 命名（`internal/service` 单测 + 代码路径），但 install/start/stop/uninstall
    的实际 RUNNING/STOPPED 状态与 `pairlink-<mode>.log` 落盘未在本机执行。
@@ -853,6 +858,207 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
    全仓日志（含 debug/错误路径）无明文 `pairing_token`。
    **仍需管理员/真机验证的只有：真实 Linux 运行、Windows 服务完整生命周期（本节第 1、2 条）。**
 8. **未做长时间 soak**：资源泄漏用 e2e goroutine 计数 + `pprof` 佐证，未做数小时压测。
+
+### 13.15 阶段 6A：Linux / WSL2 真机验证
+
+> 本节是阶段 6A 的**实测记录**，也就是阶段 3/4 里"Linux 未在真机运行"这一条的收尾。
+> 做法：把仓库复制到 WSL2 的 ext4 上（`~/pairlink`，避开 9p 的性能损耗），
+> `CGO_ENABLED=1` 让 `-race` 真正生效；再用 `go build` 出的 **Linux 二进制**起真实三进程
+> （不是 `go test` 的进程内栈），另做 WSL2 relay ↔ Windows agent/client 的跨 OS 联调。
+
+#### 13.15.1 环境与复现命令
+
+| 项 | 实测值 |
+| --- | --- |
+| 发行版 | Ubuntu 26.04（WSL 2），内核 `6.18.40.1-microsoft-standard-WSL2` x86_64 |
+| Go | `go1.24.4 linux/amd64`（`$HOME/.local/go/bin/go`，`GOTOOLCHAIN=local`） |
+| C 工具链 | `gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0`，`CGO_ENABLED=1` |
+| 权限 | 普通用户 `solomon`，**全程无 sudo** |
+| 二进制 | `go build` 产物为**动态链接** ELF（CGO 开启），13,980,366 B |
+| 网络 | loopback + WSL vEthernet；未做公网/NAT 验证 |
+
+```bash
+# 1) 复制到 ext4（9p 上跑测试很慢）
+rm -rf ~/pairlink && cp -a /mnt/e/BizWorks/pairlink ~/pairlink && cd ~/pairlink
+export PATH="$HOME/.local/go/bin:$PATH"
+export GOPROXY=https://goproxy.cn,direct GOTOOLCHAIN=local CGO_ENABLED=1
+
+# 2) 单测 / race
+go build ./... && go vet ./...
+go test ./... -count=1
+go test -race ./... -count=1
+go test ./test/... -v -count=1
+
+# 3) 真实三进程（见 13.15.3）
+go build -o /tmp/pairlink .
+```
+
+#### 13.15.2 单测与 race 逐包耗时
+
+`go test ./... -count=1`：15 个包全 `ok`、0 失败、总计 17s。
+`go test -race ./... -count=1`：全 `ok`、**0 个 `--- FAIL`、0 处 `DATA RACE`**，总计 74s。
+（`CGO_ENABLED=1` + `gcc 15.2`，race 检测器是真正启用的，不是被 CGO 关掉后的降级运行。）
+
+| 包 | `go test` | `go test -race` |
+| --- | --- | --- |
+| `pairlink`（main） | 0.032s | 1.031s |
+| `internal/admin` | 0.034s | 1.072s |
+| `internal/agent` | 1.650s | 2.635s |
+| `internal/client` | 2.047s | 3.092s |
+| `internal/config` | 0.042s | 1.069s |
+| `internal/forward` | 0.406s | 1.390s |
+| `internal/logx` | 0.011s | 1.034s |
+| `internal/pairing` | 0.023s | 1.037s |
+| `internal/protocol` | 0.022s | 1.095s |
+| `internal/registry` | 0.013s | 1.042s |
+| `internal/relay` | 6.193s | 7.233s |
+| `internal/service` | 0.012s | 1.017s |
+| `internal/token` | 0.045s | 1.153s |
+| `internal/version` | 0.012s | 1.019s |
+| `test`（e2e） | 12.856s | 15.992s |
+
+`go test ./test/... -v -count=1`：`ok github.com/lsong98sh/pairlink/test 11.081s`，
+**26 个顶层 `--- PASS`、0 个 `--- FAIL`**（比 Windows 少 1 个：`TestE2EWindowsService` 带
+`//go:build windows`）。
+
+**Linux 上没有出现任何"测试可移植性失败"**：该测试集本来就是"动态分配端口 +
+`filepath.Join` + 轮询等待 + `t.TempDir()`"的写法，把源码搬到 ext4 后直接全绿。
+阶段 6A 仍做了四处改动（其中一处是补强而非修补），见 §13.15.6。
+
+#### 13.15.3 真实 Linux 三进程端到端（核心验收）
+
+`/tmp/pairlink` 以三个**独立进程**运行（`&` 后台、日志重定向到文件、按端口轮询就绪，
+不用固定 sleep 当同步）；relay 端口取 17000+ 随机空闲段；第三方 HTTP
+（`python3 -m http.server`）与 TCP/UDP echo（python 小服务）都是**完全未改造的真实服务**。
+分三段跑：native UDP → 踢出 → tcp_tunnel。
+
+| # | 验证项 | 结果 | 关键输出 |
+| --- | --- | --- | --- |
+| 1 | 本地 HTTP（第三方零改造） | PASS | `HTTP 200`，正文 `<!doctype html><title>pairlink-linux</title><h1>pairlink-linux-e2e-ok</h1>`；`/index.html?x=1` 同样 200 |
+| 2 | TCP echo 双向 | PASS | `linux-e2e-tcp-echo-1` / `-2` 两条连接原样回显（client 本地端口 → relay → agent → 第三方 echo） |
+| 3 | UDP **native** | PASS | 回显 `echo:probe-native-1`；relay 页 `UDP 承载模式 = native`、`UDP 会话表（native，1）` |
+| 4 | UDP **tcp_tunnel** | PASS | relay 不配 `udp_listen`：页显示 `UDP 承载模式 = tcp_tunnel` + `未监听（复用 tcp_listen 的 UDP over TCP）`；回显 `echo:probe-tunnel-1`；`UDP 会话表（UDP over TCP，…）` |
+| 5 | 三个管理页 | PASS | relay `/relay`、agent `/status`、client `/client` 均 **200**；标题分别是 `PairLink relay/agent/client 管理页`；关键表头齐全；均无 `<script src=` |
+| 6 | 管理页踢出 | PASS | `GET /action/kick` → **405**，无 CSRF 的 POST → **403**，带令牌 POST → **200**；agent 退出码 **1**，日志 `err="agent: 已被 relay 踢出（被管理页踢出）"`；relay 页 `在线 agent（0）`、`服务注册表（0）`；此后经 client 访问失败 |
+| 7 | SIGTERM 优雅关停 | PASS | client / agent / relay 退出码均 **0**；日志均含 `event=exit` + `PairLink 已退出`，agent/client 另有 `event=shutdown`，relay 另有 `event=server_shutdown`（"relay 开始停机"） |
+| 8 | 端口释放 | PASS | 关停后 `ss -ltn` / `ss -lun` 不再监听 client 本地端口、relay tunnel/tcp/udp/manage、agent/client 管理端口 |
+
+脚本合计 **116 条断言、0 失败**（`PASS=116 FAIL=0`）。关键片段：
+
+```text
+端口分配: http=28678 tcp_echo=20630 udp_echo=20458
+  relay: tunnel=27195 tcp=20433 udp=27703 manage=25547
+  agent manage=24357  client manage=18081 http=18580 echo=28707 udp=22013
+PASS  go build -o /tmp/pairlink 退出码 = 0
+PASS  relay 服务注册完成（页面含 [服务注册表（3）]）
+PASS  HTTP http://127.0.0.1:18580/ 状态码 = 200
+  正文: <!doctype html><title>pairlink-linux</title><h1>pairlink-linux-e2e-ok</h1>
+PASS  TCP echo 经 client→relay→agent 双向回显（回显=linux-e2e-tcp-echo-1）
+PASS  UDP native 回显（服务端加 echo: 前缀）（回显=echo:probe-native-1）
+PASS  relay 管理页状态码 = 200
+PASS  client 收到 SIGTERM 后退出码 = 0
+PASS  relay 日志有 [event=server_shutdown]
+PASS  关停后 UDP 端口 27703（端口 27703 已释放，ss 不再监听）
+PASS  GET /action/kick 必须 405 = 405
+PASS  无 CSRF 的 POST 必须 403 = 403
+PASS  合法 POST /action/kick 状态码 = 200
+PASS  被踢 agent 退出码（Run 返回错误） = 1
+PASS  踢出后 relay 在线 agent 归零（页面含 [在线 agent（0）]）
+PASS  踢出后经 client 访问失败（curl 状态码 [000]）
+PASS  relay UDP 承载模式为 tcp_tunnel（页面含 [tcp_tunnel]）
+PASS  UDP over TCP 隧道回显（回显=echo:probe-tunnel-1）
+===== 结果：PASS=116 FAIL=0 =====
+ALL GREEN
+```
+
+#### 13.15.4 跨 OS 联调：WSL2 relay ↔ Windows agent/client
+
+拓扑（实测成功）：
+
+```text
+第三方客户端 / curl
+   └─> Windows client 本地端口（127.0.0.1:<随机端口>）
+         └─> TCP 隧道 ──> WSL2 relay（0.0.0.0：tunnel 17911 / tcp 19054 / udp 18153 / manage 17915）
+                                └─> Windows agent（relay_addr = 172.18.28.1:17911）
+                                      └─> Windows 第三方 HTTP :14445 / TCP echo :14446 / UDP echo :64257
+```
+
+- **WSL2 的 localhost 转发在本机不可用**：Windows 侧连 `127.0.0.1:17911` 被拒绝
+  （`connectex: No connection could be made because the target machine actively refused it.`），
+  而 WSL 内 `ss -ltn` 明确显示 `*:17911` 正在 LISTEN；本机没有 `.wslconfig`。
+  这是该 WSL2 构建/网络模式的宿主行为，**不是 PairLink 的问题**（relay 已按任务书绑定 `0.0.0.0`）。
+- **改用 WSL IP**（任务书允许的替代方案，未用 `netsh portproxy`）：
+  `hostname -I` → `172.18.28.1`；Windows 侧 `vEthernet (WSL)` = `172.18.16.1`，同一 /20 网段。
+  agent/client 配 `relay_addr = 172.18.28.1:17911`，数据面地址按契约 §4.5 从
+  `relay_addr` 的 host 推导为 `172.18.28.1:19054` / `172.18.28.1:18153`。
+- 结果 **13 条断言、0 失败**：
+  - Windows → WSL relay 管理页 **200**；relay 页 `服务注册表（3）`、`在线 agent（1）`、`UDP 承载模式 = native`；
+  - **HTTP 全链路 200**：Windows `curl http://127.0.0.1:<client 本地端口>/` → Windows client
+    → WSL relay → Windows agent → Windows 第三方 HTTP，正文 `<h1>crossos-ok</h1>`；
+  - **TCP echo** 回显 `crossos-tcp-echo-1`（agent 日志 `carrier=tcp bytes_in=18 bytes_out=18`）；
+  - **UDP native** 回显 `echo:probe-crossos-1`（agent 日志 `carrier=native remote=172.18.28.1:18153`）；
+  - WSL relay 收到 SIGTERM 后 `WSL relay exit=0`，日志 `event=server_shutdown` + `event=exit`。
+- **未修改 Windows 防火墙、未改 WSL 全局配置**（没动 `.wslconfig`、没加 `netsh portproxy`）。
+
+#### 13.15.5 Linux 上的 TLS 再验（openssl 自签）
+
+用 WSL 自带 `openssl` 生成 CA 与 relay 服务端证书（`SAN=IP:127.0.0.1, DNS:localhost`，
+`openssl verify` 通过），relay 配 `tls_cert/tls_key`、agent/client 配 `tls_ca`：
+
+| 场景 | 结果 |
+| --- | --- |
+| TLS relay + `tls_ca` 的 agent/client | **PASS**：relay 日志 `隧道使用 TLS 监听`（`tls_min_version=1.2`）；`服务注册表（1）`；TCP echo 回显 `tls-echo-1`；三者 SIGTERM 退出码 0 |
+| agent 不配 `tls_ca` 连 TLS relay | **PASS（必须失败）**：退出码 **1**，`err="agent: 等待 MsgHelloOK: protocol: 读取帧头: EOF"` |
+| client 不配 `tls_ca` 连 TLS relay | **PASS（必须失败）**：退出码 **1**，`err="client: 读取 hello 应答: protocol: 读取帧头: EOF"` |
+| TLS agent 连明文 relay | **PASS（必须失败）**：退出码 **1**，`err="agent: 连接 relay 127.0.0.1:18061: TLS 握手: read tcp …: read: connection reset by peer"` |
+
+脚本 21 条断言、0 失败。错误都带 `agent:` / `client:` 前缀并落在 `event=exit` 日志的 `err=`
+字段里，现场可直接定位。证书 SAN：
+
+```text
+证书 SAN: IP Address:127.0.0.1, DNS:localhost
+```
+
+#### 13.15.6 为跨平台改的测试代码 + Windows 回归
+
+**生产代码未改**：Linux 上没有发现平台相关的崩溃 / 路径 / 信号问题（`main.go` 已用
+`signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)`，
+`-service` 在非 Windows 上直接给出可读错误并退出 1）。只动了两个测试文件（4 处，
+其中 1 处是补强），断言强度未降、没有用例被跳过：
+
+| 文件 | 改动 | 理由 |
+| --- | --- | --- |
+| `test/binary_test.go` | `childProc.kill` 去掉 `taskkill /F /T /PID` 分支，统一 `os.Process.Kill()` | `taskkill` 是 Windows 专有命令；`Process.Kill()` 两端语义一致（Unix 为 SIGKILL）。顺带去掉"等 2s 再 Kill"的回退，Linux e2e 从 161.6s 降到 12.9s |
+| `test/binary_test.go` | 新增 `exeName()` / `exeNameFor()`，`TestMain` 与 `TestCrossCompile` 不再硬编码 `.exe` | 产物名由运行平台 / 目标平台决定：Windows 得 `.exe`，Linux 得无后缀 |
+| `test/binary_test.go` | 新增 `TestSubprocessGracefulShutdown`：Unix 发 `os.Interrupt`，断言三个子进程退出码 **0** + 日志 `event=exit` + 4 个端口释放；Windows 因 Go 无法向子进程投递 Ctrl+C，回退 `Process.Kill` 并只断言"进程已退出" | **补强**：把优雅关停从进程内 `Run` 提升到真实二进制三进程层面 |
+| `test/e2e_goroutine_test.go` + `wslAvailable()` | Linux 上直接判为"可用（原生运行）"，Windows 上仍执行 `wsl -l -q` | 原实现把"非 Windows"一律判成"不可用"，在 Linux 上会记录错误结论 |
+| `test/e2e_goroutine_test.go` | `TestE2EWSLOrCrossCompileNote` 的日志文案随平台区分（原生 Linux / WSL 可用 / 不可用） | 结论要如实反映当前环境 |
+
+**Windows 回归**（改完之后在本机 `E:\BizWorks\pairlink` 重跑，全绿）：
+
+```text
+gofmt -l .                      # 无输出
+go vet ./...                    # 通过（无输出）
+go build ./...                  # 通过（无输出）
+go test ./... -count=1          # 15 个包全 ok；test 包 20.894s（改前 131.008s）
+go test ./test/... -v -count=1  # ok 21.701s；27 个顶层 --- PASS、0 个 --- FAIL
+```
+
+其中 `TestSubprocessGracefulShutdown` 在 Windows 上按设计走 Kill 分支（日志会说明原因），
+三个进程退出码为 1，符合"被强杀"的预期；Linux 上同一用例断言退出码为 0。
+
+#### 13.15.7 阶段 6A 仍未验证（诚实清单）
+
+1. **Linux 服务化**：`systemd` unit 只有文档示例，未在 WSL2（默认不带 systemd）里
+   install / start / stop 过。
+2. **非 loopback 网络**：跨 OS 用的是 WSL vEthernet，仍未验证公网 NAT、多网卡、丢包/延迟。
+3. **Windows 服务完整生命周期**：仍缺管理员权限（见 §13.11 / §13.14 第 2 条）。
+4. **Windows 上子进程的优雅关停**：Go 不支持向子进程投递 Ctrl+C，
+   `TestSubprocessGracefulShutdown` 在 Windows 上只验证"进程退出"；优雅路径由 Unix 分支
+   与 §13.15.3 的 `SIGTERM` 实测覆盖。
+5. **WSL2 localhost 转发**：本机不可用，跨 OS 走 WSL IP；按约束未改 `.wslconfig`、
+   未加 `netsh portproxy`、未动防火墙，未做进一步调优。
+6. **长时间 soak**：同 §13.14 第 8 条，未做数小时压测。
 
 ## 14. 版本与许可证
 

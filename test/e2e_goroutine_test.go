@@ -127,12 +127,20 @@ func TestE2EGoroutineNoLeak(t *testing.T) {
 	t.Logf("pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|agent|client|forward 栈帧")
 }
 
-// TestE2EWSLOrCrossCompileNote 记录 WSL 可用性：本机若没有可用 WSL 发行版，
-// 只记录检测结果（Linux 二进制仅交叉编译验证，见 README 已知限制）。
+// TestE2EWSLOrCrossCompileNote 记录 Linux 真机 / WSL 可用性。
+//
+// 直接跑在 Linux（含 WSL2）上时，Linux 二进制就是本机产物并通过
+// TestSubprocessTCPEcho 真跑；在 Windows 上只探测 WSL 是否可用，
+// 不重复执行跨发行版联调（那部分由 README §13.15 的实测记录覆盖）。
 func TestE2EWSLOrCrossCompileNote(t *testing.T) {
-	if ok, detail := wslAvailable(); ok {
-		t.Logf("WSL 可用（%s）；本机未在 WSL 中额外执行三进程 echo（见 README 说明）", detail)
-	} else {
-		t.Logf("WSL 不可用（%s）；Linux 二进制仅做交叉编译验证", detail)
+	ok, detail := wslAvailable()
+	if !ok {
+		t.Logf("Linux 真机/WSL 不可用（%s）；Linux 二进制仅做交叉编译验证", detail)
+		return
 	}
+	if runtime.GOOS == "linux" {
+		t.Logf("原生 Linux 内核（%s）：本用例与 TestSubprocessTCPEcho 均在本机 Linux 上真实执行", detail)
+		return
+	}
+	t.Logf("WSL 可用（%s）；跨 OS 联调（WSL relay + Windows agent/client）与 Linux 三进程实测见 README §13.15", detail)
 }
