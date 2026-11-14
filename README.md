@@ -140,6 +140,14 @@ client 永久停留在旧视图，`MsgServiceEvent.revision` 仍然单调递增�
 `ConnectRequest` 的错误时填入该请求的 ID，client 据此**精确**关闭对应本地连接；旧 relay
 不填时 client 回退到"最早等待的连接"的 FIFO 近似匹配。
 
+**客户端连接ID 由 client 生成（设计选择）**：`client_conn_id` **不是** relay 分配的——
+client 每次本地接入都取 8 字节 `crypto/rand` 并转成 16 位小写 hex（字符集落在
+`[a-z0-9]`，满足配对键格式），随 `MsgConnectRequest` 上报；relay 只用
+`(service_id, client_conn_id)` 组成**配对键**并签发一次性令牌，自己不再生成 ID。
+这样 client 在请求发出前就已知自己的连接标识，重试、日志与管理页无需等 relay 回包即可定位；
+relay 也无需维护"请求 → ID"的反查表。重复 ID 会被 relay 的 `PairingTable` 拒绝
+（`already_paired`），8 字节随机的碰撞概率可忽略。
+
 `HelloOK` 还会携带 `udp_mode`（`native` / `tcp_tunnel`）与 `tcp_data_port` / `udp_data_port`，
 agent/client 据此选择 UDP 数据面承载方式并推导数据面拨号地址（无需在 agent/client 的 ini 里
 重复写 `[relay]` 端口）。
@@ -421,6 +429,14 @@ service.ssh = :2222
   它通过一次性 CSRF 令牌 + POST 提交，禁止 GET 触发写操作。
 - `pprof = true` 时额外提供 `/debug/pprof/`；生产环境建议关闭，或只监听 `127.0.0.1`。
 - 管理页无登录鉴权：**不要暴露到公网**，用 SSH 隧道/内网访问。
+
+**HTML 组织方式（设计选择）**：三种模式共用 `internal/admin` 的**一套内联布局**——统一的
+`<html lang="zh-CN">` 外壳、内联 CSS、顶栏（模式 / 版本 / 运行时长 / 刷新开关），不引用任何
+外部 JS、CSS 或 CDN，离线内网可用、也便于安全审计（e2e 会断言页面不含 `<script src=`）。
+每个模式只实现自己的**页面正文**（一个 `<section>`），不写 `<html>/<head>/<body>`；
+路径分别是 relay 的 `/relay`（另有 `/` 概览）、agent 的 `/status`、client 的 `/client`。
+表格数据取自各模式内存快照（注册表 / 配对表 / UDP 会话表 / 本地映射表），渲染时对来自配置与
+对端的字符串做 HTML 转义以防 XSS；新增页面只需 `admin.AddPage`，布局、CSRF 与刷新由框架统一处理。
 
 ---
 

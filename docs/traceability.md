@@ -25,10 +25,11 @@
 | task.md §1–§8（功能与约束） | 59 | 59 | 0 | 0 | 0 | 三模式、配对流程、ini、管理页、安全、日志、命名全部有实现+测试 |
 | task.md §9（交付物与 e2e） | 7 | 7 | 0 | 0 | 0 | 源码/README/e2e 五类验收项齐全 |
 | task.md §10（验收标准） | 6 | 5 | 0 | 0 | 1 | 唯一受限项是 Windows 服务完整生命周期（需管理员） |
-| task.md §11（五个自由度说明） | 5 | 3 | 2 | 0 | 0 | ①client_conn_id 生成方、②管理页 HTML 组织=README 未写 |
+| task.md §11（五个自由度说明） | 5 | 5 | 0 | 0 | 0 | ①client_conn_id 生成方、②管理页 HTML 组织=阶段 6E 已在 README 补齐 |
 | task.md §12（版本/许可） | 2 | 2 | 0 | 0 | 0 | tag `v0.1.0` 与 `v0.2.0` 均存在；Apache-2.0 |
 | task2.txt（UDP 承载模式改造） | 6 | 6 | 0 | 0 | 0 | `udp_mode` 三处下发、`carrier`、隧道帧、README 取舍全部落地 |
-| **合计** | **85** | **82** | **2** | **0** | **1** | 需求缺口 = 0；未了项 = 2 处 README 说明 + 1 处环境验证 |
+| **合计** | **85** | **84** | **0** | **0** | **1** | 需求缺口 = 0；唯一未了项 = Windows 服务完整生命周期（环境受限，需管理员） |
+| 工程增强（§5.2，不计入需求统计） | 8 | 7 | 0 | 1 | 0 | E1–E6 已落地（阶段 6C/6D）；E8 文档时点已标注；E7（TLS 强制开关）仍未做，非需求项 |
 | 工程增强（§5.2，不计入需求统计） | 8 | 7 | 0 | 1 | 0 | E1–E6 已落地（阶段 6C/6D）；E8 文档时点已标注；E7（TLS 强制开关）仍未做 |
 
 **一句话结论**：v0.2.0 对 `task.md` + `task2.txt` 的**功能需求已全部实现且可验证**；
@@ -167,8 +168,8 @@
 
 | 需求ID | 需求原文摘要 | 实现位置 | 测试证据 | 状态 | 差距说明 |
 | --- | --- | --- | --- | --- | --- |
-| task.md §11.1 | README 说明**客户端连接ID 的生成方** | 实现：[internal/client/client.go:383-390](../internal/client/client.go#L383-L390)（client 生成 8B hex）；文档：[docs/architecture.md:315-320](architecture.md#L315-L320)、[docs/protocol.md:190](protocol.md#L190) | [TestNewConnID](../internal/client/addr_test.go#L72)（长度/字符集/唯一性） | 🟡 部分实现 | **README 全文未出现「client_conn_id 由 client 生成」**（仅出现在 `docs/`）；task.md §11 明确要求"在 README 说明"。补 1 行即可闭环（§5 G1） |
-| task.md §11.2 | README 说明**管理页 HTML 组织方式** | 实现：统一布局/内联 CSS/无外部资源 [internal/admin/layout.go:1-140](../internal/admin/layout.go#L1-L140)、各模式只写 `<section>`（[relay/admin.go:17](../internal/relay/admin.go#L17)、[agent/adminpage.go:50-57](../internal/agent/adminpage.go#L50-L57)、[client/admin.go:47](../internal/client/admin.go#L47)）；文档：[docs/architecture.md:326-330](architecture.md#L326-L330) | [TestE2EAdminPagesThreeModes](../test/e2e_admin_test.go#L11)（断言 `html lang="zh-CN"`、无 `<script src=`） | 🟡 部分实现 | README §6 只描述**页面内容**，未说明 HTML 如何组织（统一布局/内联样式/各模式只写 section）。§5 G2 |
+| task.md §11.1 | README 说明**客户端连接ID 的生成方** | 实现：[internal/client/client.go:383-390](../internal/client/client.go#L383-L390)（client 生成 8B hex）；文档：[README.md:143](../README.md#L143)（阶段 6E 补齐：client 生成、relay 只组键）、[docs/architecture.md:315-320](architecture.md#L315-L320) | [TestNewConnID](../internal/client/addr_test.go#L72)（长度/字符集/唯一性） | ✅ 已实现 | 阶段 6E 在 README §3.2 补「客户端连接ID 由 client 生成（设计选择）」段后闭环（原 G1） |
+| task.md §11.2 | README 说明**管理页 HTML 组织方式** | 实现：统一布局/内联 CSS/无外部资源 [internal/admin/layout.go:1-140](../internal/admin/layout.go#L1-L140)、各模式只写 `<section>`（[relay/admin.go:17](../internal/relay/admin.go#L17)、[agent/adminpage.go:50-57](../internal/agent/adminpage.go#L50-L57)、[client/admin.go:47](../internal/client/admin.go#L47)）；文档：[README.md:433](../README.md#L433)（阶段 6E 补齐） | [TestE2EAdminPagesThreeModes](../test/e2e_admin_test.go#L11)（断言 `html lang="zh-CN"`、无 `<script src=`） | ✅ 已实现 | 阶段 6E 在 README §6 补「HTML 组织方式（设计选择）」段后闭环（原 G2） |
 | task.md §11.3 | README 说明**令牌有效期策略** | [README.md:416-417](../README.md#L416-L417)（默认 15s、用后即焚、只存 SHA-256、常量时间比较）；[README.md:309](../README.md#L309)（`token_ttl`）；[config.go:216](../internal/config/config.go#L216) | [TestDefaultTTL](../internal/token/token_test.go#L173)、[TestExpiry](../internal/token/token_test.go#L117)、[TestE2EFailureTokenExpiry](../test/e2e_failure_test.go#L77) | ✅ 已实现 | 策略已说明（短 TTL + Consume + 摘要存储） |
 | task.md §11.4 | README 说明 **UDP 会话超时阈值** | [README.md:308](../README.md#L308)（relay 60s）、[:324](../README.md#L324)（agent 60s）、[:339](../README.md#L339)（client 60s）；[config.go:215](../internal/config/config.go#L215)/[:221](../internal/config/config.go#L221)/[:228](../internal/config/config.go#L228) | [TestClientUDPSessionTimeout](../internal/config/client_timeout_test.go#L13)、[TestNativeUDP](../internal/client/udp_test.go#L81)（300ms 清理生效） | ✅ 已实现 | 三处默认值均已写明；**选择理由**未写（P3 可选补充，不算缺口） |
 | task.md §11.5 | README 说明**日志格式** | [README.md:534-541](../README.md#L534-L541)（slog、text/json、字段、事件、Windows 落盘）；[internal/logx/logx.go](../internal/logx/logx.go) | [TestNewText](../internal/logx/logx_test.go#L13)、[TestNewJSON](../internal/logx/logx_test.go#L29)、[TestNewFileLogger](../internal/logx/logx_test.go#L78) | ✅ 已实现 | — |
@@ -245,13 +246,14 @@
 > **口径**：`部分实现`/`仅环境受限` = 与 task.md 字面要求存在差距，计入需求侧；
 > `工程增强` = task.md/task2 未要求、属后续可用性与可运维性投入，**不计入需求缺口**。
 
-### 5.1 需求侧差距（3 项）
+### 5.1 需求侧差距（1 项）
 
-| ID | 差距 | 类型 | 影响 | 优先级 | 建议归属阶段 |
+| ID | 差距 | 类型 | 影响 | 优先级 | 处置 |
 | --- | --- | --- | --- | --- | --- |
-| G1 | README 未说明 `client_conn_id` 由 client 生成（§11.1） | 部分实现（文档） | §11 字面要求未闭环；联调/审计需翻 `docs/` 才能确认 ID 归属 | **P2** | 阶段 B（部署运维件，纯文档 1 段） |
-| G2 | README 未说明管理页 HTML 组织方式（§11.2） | 部分实现（文档） | 同上；后续改管理页时无 README 约定可依 | **P3** | 阶段 B（纯文档 1 段） |
-| G3 | Windows 服务完整生命周期未验证：`install → start → stop → uninstall` 的 SCM 状态迁移、`pairlink-<mode>.log` 落盘 | 🔒 仅环境受限 | §10.6 只能证明"代码在、错误路径正确"；交付验收存在"未证明"项 | **P1**（需管理员环境） | 阶段 B 收尾 + 人工管理员复核（非代码改动） |
+| G3 | Windows 服务完整生命周期未验证：`install → start → stop → uninstall` 的 SCM 状态迁移、`pairlink-<mode>.log` 落盘 | 🔒 仅环境受限 | §10.6 只能证明"代码在、错误路径正确"；交付验收存在"未证明"项 | **P1**（需管理员环境） | 人工管理员复核：`deploy/windows/install-service.ps1` → `sc query pairlink-relay` → `uninstall-service.ps1`（非代码改动） |
+
+> G1（README 未说明 `client_conn_id` 生成方）与 G2（README 未说明管理页 HTML 组织方式）
+> 已由阶段 6E 在 README §3.2 / §6 补齐并闭环，见 §1 表 `task.md §11.1`、`§11.2` 两行。
 
 ### 5.2 工程增强（task.md / task2 未要求，不计入需求缺失）
 
