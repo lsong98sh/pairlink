@@ -95,8 +95,8 @@ graph TD
   不 per-packet 起 goroutine。
 - UDP over TCP 模式（未配置 `udp_listen`）不需要 UDP socket：所有 UDP 会话都在
   `tcp_listen` 的连接上以隧道帧复用，relay 按会话标识转发到对端承载连接。
-- 管理页的"踢出"只调用 `registry.Agent.Control.Close()` 或数据连接 `Close()`，
-  清理走既有路径，不另写清理逻辑。
+- 管理页的"踢出"先写 `MsgKicked`（让被踢端知道原因，`event=kicked`），再关闭
+  `registry.Agent.Control` 或数据连接；会话/表项的清理仍走既有路径，不另写清理逻辑。
 
 ### 3.2 agent
 
@@ -234,15 +234,19 @@ type entry struct { hash [32]byte; issuedAt, expiresAt time.Time; consumed bool 
 
 ```go
 type carrierSession struct {
-    key          pairing.PairingKey
-    agentCarrier *carrier // 可为 nil（未报到）
-    clientCarrier *carrier
+    key       pairing.PairingKey
+    agent     *carrierConn // 可为 nil（未报到）
+    client    *carrierConn
+    full      bool
+    agentID   string
+    createdAt time.Time
+    lastSeen  time.Time
 }
-type carrier struct {
-    conn     net.Conn
-    out      *tunnelqueue.Queue // 阶段 6C：单 writer goroutine + 有界发送队列
+type carrierConn struct {
+    conn net.Conn
+    out  *tunnelqueue.Queue // 阶段 6C：单 writer goroutine + 有界发送队列
 }
-// session -> carrierSession、carrier -> 该连接上的 session 集合
+// session -> carrierSession、carrierConn -> 该连接上的 session 集合
 ```
 
 - 每 accept 一条 `carrier=udp-over-tcp` 的 TCP 连接，起一个读循环 goroutine + 一个 writer goroutine；

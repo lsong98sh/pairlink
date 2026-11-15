@@ -7,7 +7,7 @@ PairLink 是一个**协议无关的字节流中转**：同一套系统可以承�
 数据库、自定义 TCP/UDP 服务，中继不解析也不终止上层协议（HTTPS/SSH 的端到端加密由
 第三方客户端与真实服务自行完成，中继透明转发）。
 
-- 版本：`v0.5.0`
+- 版本：`v0.5.1`
 - 许可证：Apache-2.0
 - 语言：Go 1.24.4，单二进制三模式
 - 唯一第三方依赖：`golang.org/x/sys`（Windows 服务 SCM）
@@ -395,6 +395,7 @@ udp_session_timeout = 60s
 | `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
 | `udp_dtls` | bool | 否 | `true` | 原生 UDP 数据面的 DTLS-PSK 开关（v0.5.0）；**必须与 relay 一致**。`false` 时与 v0.4.0 明文互通，实际部署应保持 `true` |
 | `dial_timeout` | duration | 否 | `10s` | 连接 relay / 本地目标超时 |
+| `pair_timeout` | duration | 否 | `10s` | 等待 relay 数据面报到应答（`MsgBindOK`）的超时；v0.5.1 起从 `[server]` 读取（此前误读 `[relay] pair_timeout`，配置被静默忽略） |
 | `udp_session_timeout` | duration | 否 | `60s` | agent 侧本地 UDP 会话空闲清理 |
 | `reconnect` | bool | 否 | `true` | 控制连接断开后是否自动重连（指数退避：1s 起、每次 ×2、上限 `reconnect_max_backoff`、±20% 抖动）；`false` = 阶段 6C 之前的旧行为（断开即 `Run` 返回错误，由守护进程重启） |
 | `reconnect_max_backoff` | duration | 否 | `60s` | 自动重连退避上限，必须 > 0；重连成功后重新 Hello + 重新注册全部服务 + 重建心跳，重连期间关闭在途会话（`reason=reconnect`，不做迁移） |
@@ -494,7 +495,7 @@ service.ssh = :2222
 | --- | --- | --- |
 | relay | 服务注册表（服务ID、协议、在线状态、所属 agent）、在线 agent 列表、当前配对表、UDP 会话表 | **踢出**（agent / 配对 / 承载连接）+ **参数配置区**：`pair_timeout`、`idle_timeout`、`heartbeat_timeout`、`udp_session_timeout`、`token_ttl` 的修改 |
 | agent | 本机已注册服务列表、到 relay 的控制连接状态、当前活跃数据连接 | **服务表**：`service.<id>` 新增/修改/删除；**主服务** `protocol` + `local` 修改 |
-| client | relay 返回的可用服务列表、本地端口映射表、当前活跃配对 | **映射表**：`service.<id>` 本地监听地址的新增/修改/删除 |
+| client | relay 返回的可用服务列表、本地端口映射表、当前活跃配对 | **映射表**：`service.<id>` 本地监听地址的新增/修改/删除（含主服务 `default`，与 ini 写法一致；v0.5.1 前该行在页面上是只读的） |
 
 - 顶栏显示模式、版本、运行时长与刷新开关。**只读页默认 1 秒自动刷新**；
   **可写页（回环 `manage_listen`）或含写表单的页面默认暂停刷新**，避免整页重载清空正在输入的值（P1-2）；
@@ -1049,7 +1050,7 @@ HTTP 层完全不知道 PairLink 存在，符合“第三方客户端零改造�
 
 `TestE2EAdminPagesThreeModes` 同时启动三种模式的 `manage_listen` 并开启 `pprof = true`：
 
-- relay 页：`服务注册表`、`在线 agent`、`当前配对表`、`UDP 会话表`；
+- relay 页：`概览`（UDP 承载模式 / TCP 数据面 / UDP 数据面 / 服务数 / 配对占位 / UDP 会话数）、`服务注册表`、`在线 agent`、`当前配对表`、`UDP 会话表`；
 - agent 页：`本机已注册服务`、`控制连接`、`当前活跃数据连接`；
 - client 页：`relay 返回的可用服务列表`、`本地端口映射表`、`当前活跃配对`；
 - 三个页面均返回 200、`<html lang="zh-CN">`、中文标题，且不含任何 `<script src=`；
@@ -1171,6 +1172,25 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
    全仓日志（含 debug/错误路径）无明文 `pairing_token`。
    **仍需管理员/真机验证的只有：真实 Linux 运行、Windows 服务完整生命周期（本节第 1、2 条）。**
 8. **未做长时间 soak**：资源泄漏用 goleak（整包结束按栈帧判定）+ `pprof` 栈帧佐证，未做数小时压测。
+9. **v0.5.0 引入的新限制（原生 UDP DTLS / 日志 / ini）**：
+   - DTLS 与 v0.4.0 的明文原生 UDP **不互通**：三端须一起升到 ≥ v0.5.0，或临时
+     `udp_dtls = false`（启动 WARN，数据面回到明文）；
+   - DTLS 单条数据报受 pion/dtls 8192 字节入站缓冲限制（实测 8000 可通、8192 失败），
+     超过 MTU 的大报文建议改用 `tcp_tunnel`，不要指望 DTLS 分片；
+   - 日志文件名改为按日（`pairlink-<mode>-YYYY-MM-DD.log`），旧的 `pairlink-<mode>.log`
+     不再写入，采集/轮转/告警规则需要同步；`log_keep_days` 只清理**本程序按日命名的文件**；
+   - ini 写回改为 ini 库整份重写：注释、空行、对齐与换行会归一，不再逐字节保留原格式
+     （与用户明确确认的取舍一致），只保证"原子替换 + 权限位不变 + 写回后可读回目标值"。
+10. **v0.5.1 修掉的三个低危问题**（不改变协议与配置默认值）：
+    - agent 承载连接创建曾持状态锁跨网络拨号（慢拨号会拖住关停/状态查询），现拆成
+      `createMu`（创建）+ `mu`（状态）；
+    - agent 侧 `pair_timeout` 曾误读 `[relay]` 段（agent ini 通常没有该段 → 配置被静默
+      忽略、恒 10s），现读 `[server] pair_timeout`；
+    - client 管理页曾把 `default` 映射设为只读（与 ini 允许 `[client] service.default`
+      不一致），现允许改/删。
+    遗留细节：relay `pair_timeout` 改小后扫描 **ticker** 已会在每次 tick 重算跟随（v0.5.1），
+    但改值瞬间已在等待中的占位，其过期判定要等下一次 `Sweep` 才生效——延迟上限就是一个
+    扫描周期（`pair_timeout/2`，下限 100ms），属可接受延迟，不再单列。
 
 ### 13.15 阶段 6A：Linux / WSL2 真机验证
 
@@ -1490,16 +1510,81 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 > **不在当轮范围**；其中 T1/A2 已在 v0.4.0 修复，D3 已在 v0.5.0 用 DTLS-PSK 修复。
 > 历史记录与残差见 README §10.1、`docs/architecture.md` §7.10、`docs/review-security.md` §0。
 
+### 13.20 阶段 8E：v0.5.0 / v0.5.1 验证记录
+
+**Windows 11 / amd64（Go 1.24.4，18 个包）**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `gofmt -l .` / `go vet ./...` / `go build ./...` | clean / 0 / 0 |
+| `go test ./... -count=1` | 18 个包全部 `ok`（`internal/*` 17 个 + `test`；新增 `internal/udpdtls`） |
+| `go test -race ./... -count=1`（连续 2 轮） | 两轮全部 `ok`，0 data race（第 1 轮 relay 30.7s / test 52.7s） |
+| `go test ./test/... -count=2` | 全部 `ok`（两轮 e2e 合计 78s） |
+| `go vet -tags soak ./test` / `GOOS=linux GOARCH=amd64 go build ./...` / `GOOS=windows GOARCH=arm64 go build ./...` | 全部通过 |
+
+**WSL2 Ubuntu 26.04（Go 1.24.4 linux/amd64）**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `gofmt` / `go vet` / `go build` | clean / 通过 / 通过 |
+| `go test ./... -count=1` | 18 个包全部 `ok` |
+| `go test -race ./... -count=1` | 全部 `ok`（`CGO_ENABLED=1`，真 race） |
+| 关键 e2e（UDP DTLS / 数据面 TLS / 管理页） | 13 个用例全部 `PASS` |
+| `GOOS=linux` / `GOOS=windows GOARCH=arm64` 交叉编译 | 均通过 |
+
+**v0.5.1 新增/更新的回归用例**：
+
+| 项 | 用例 | 断言 |
+| --- | --- | --- |
+| P2-5 持锁拨号 | `TestCarrierCloseAllNotBlockedByCreation` | 创建阶段持 `createMu` 时 `closeAll` 仍在 2s 内返回 |
+| P2-5 关停后创建 | `TestCarrierCreateAfterClose` | 关停后 `createCarrier` 直接返回 `errCarrierClosed`，不拨号、不发布 |
+| P3-2 agent 超时来源 | `TestPairTimeoutUsesServerConfig` | 取 `[server] pair_timeout`；为零时回退 `[relay]`（兼容旧 ini） |
+| P3-2 配置解析 | `TestLoadValidAgent` | `[server] pair_timeout = 4s` 解析为 `4s` |
+| P3-3 扫描周期 | `TestPairSweepIntervalFollowsPairTimeout` | 10s→5s；改 200ms→下限 100ms；改 30s→15s |
+| P3-7 default 映射 | `TestValidateMappingForm` / client 页面测试 | `default` 允许新增/修改；页面渲染其写表单 |
+| C6 `udp_mode` 语义 | 文档 | 「必填」改为「否（relay 必发，`omitempty` 仅兼容旧 relay）」 |
+
+**v0.5.0 关键证据（同一轮，Windows + WSL2）**：
+
+- 日志按日切割：`TestFileLogger*`（同日追加、跨天切换、保留窗口、并发完整、`keep_days=0`、非法负数、目录创建、清理失败只 WARN）；
+- goleak：5 个内部包 + `test` 的 `TestMain` + `VerifyTestMain`，0 个 ignore，`-race` 两轮全绿；
+- `html/template`：4 类 XSS 载荷 × 各页面全部字符串字段被转义，渲染失败 500 + `admin_render_failed`；
+- ini + fsync：`ini.v1` 读写、临时文件 → fsync → Chmod → Rename → fsync(父目录)（Linux 实测 `fsync(<dirfd>)`）；
+- DTLS-PSK：`TestUDPDTLS*` 8 个用例（转发/回收、大报文边界、明文拒绝、篡改记录、错误 token、禁用回退）+ `TestE2EUDPModeNative`；
+- 按 IP 限速：`TestTokenRateLimiterBurstAndExpiry`、`TestTokenRateLimitConnectRequest`、`TestTokenRateLimitDisabled`。
+
+> 本轮仍未验证（环境所限，见 §13.14）：Windows SCM 完整生命周期（需管理员）、Docker 构建/compose、
+> 公网 CA 正向路径、非 loopback 真实网络、非 root `User=pairlink` 的 systemd 运行、长时间 soak。
+
 ## 14. 版本与许可证
 
-- 版本：`v0.5.0`
+- 版本：`v0.5.1`
 - 许可证：[Apache-2.0](LICENSE)
 
 ---
 
 ## 15. 变更记录（Changelog）
 
-### v0.5.0（当前）
+### v0.5.1（当前）
+
+**低危问题收口（阶段 8 代码审查遗留，P2-5 / P3-2 / P3-3 / P3-4 / P3-7）**
+
+- agent 承载连接创建不再持状态锁跨网络拨号：拆成 `createMu`（拨号 + 首帧 + 发布）
+  与 `mu`（状态），慢拨号/关停路径互不阻塞；拨号期间关停会直接放弃并返回
+  `errCarrierClosed`，不遗留无人管理的连接（新增 `TestCarrierCloseAllNotBlockedByCreation`、
+  `TestCarrierCreateAfterClose`）。
+- agent 侧 `pair_timeout` 改从 `[server]` 读取（此前读 `[relay]`，而 agent ini 通常没有
+  该段 → 配置被静默忽略、恒 10s）；零值时回退旧行为，兼容直接构造 Config 的测试。
+- relay 待配对表扫描周期改为**每次 tick 重算**：运行期把 `pair_timeout` 改小后 ticker
+  会跟随（下限 100ms），不再沿用启动时的间隔（新增 `TestPairSweepIntervalFollowsPairTimeout`）。
+- client 管理页允许新增/修改/删除 `default` 映射：与 ini 允许 `[client] service.default`
+  保持一致（此前页面只读，既无必要也易误解）；`default` 在 **agent** `[server]` 段仍禁止
+  显式写成 `service.default`（只能 `protocol` + `local`）。
+- 文档：`udp_mode` 的"必填"改为"否（relay 必发，`omitempty` 仅兼容旧 relay）"；
+  README §13.8 relay 页补「概览」块；architecture §4.6 carrier 结构体、§3.1 踢出流程
+  按实现改写；traceability D3/D4/D6 关闭；§13.14 增补 v0.5.0 新限制与 v0.5.1 修复说明。
+
+### v0.5.0
 
 **日志（按日期分文件，替换按大小切割）**
 
@@ -1655,7 +1740,7 @@ v0.4.0 时原生 UDP 数据面（`udp_mode = native`）没有 DTLS、仍是明�
 - **管理页动态配置（阶段 7）**：relay 可在页面修改 `pair_timeout` / `idle_timeout` /
   `heartbeat_timeout` / `udp_session_timeout` / `token_ttl`；agent 可新增/修改/删除
   `[server] service.<id>` 并修改主服务 `protocol`/`local`；client 可新增/修改/删除本地映射。
-  写操作同时改运行时并**写回 ini**（只替换值、保留注释与格式、原子替换）。
+  写操作同时改运行时并**写回 ini**（v0.5.0 起用 ini 库重写整份文件：注释/排版/换行会归一，不承诺逐字节保留；写入走"临时文件 → fsync → 原子 Rename → fsync 父目录"）。
   **仅 `manage_listen` 绑定回环地址时可写**，非回环页面只读且写 Action 返回 403，
   可写时仍保留一次性 CSRF 与 `admin_action` 审计日志。
   协议新增 `MsgUnregisterService`(0x13) / `MsgServiceUnregistered`(0x14)，不提升

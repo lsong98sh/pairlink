@@ -153,7 +153,7 @@ UDP 隧道帧解析模式**；此后该 TCP 连接上传输的就是 UDP 隧道�
 | `client_id` | string | role=client 时是 | relay 分配的会话 ID |
 | `version` | int | 是 | relay 协议版本 |
 | `heartbeat_seconds` | int | 否 | 建议心跳间隔（秒）；双方取 `min(本地 heartbeat, 本字段)` |
-| `udp_mode` | string | 是（relay v0.3.0+ 必发；旧 relay 缺省时按 `native` 回退并 WARN） | `native` / `tcp_tunnel`；agent/client 据此选择 UDP 数据面接入方式 |
+| `udp_mode` | string | 否（relay v0.3.0+ 必发；JSON 带 `omitempty`，仅用于兼容旧 relay） | `native` / `tcp_tunnel`；agent/client 据此选择 UDP 数据面接入方式。**缺省（旧 relay）= 按 `native` 回退并 WARN**，与"必填"无关：新 relay 恒发，旧 relay 缺失时靠回退而不是拒绝 |
 | `tcp_data_port` | int | 是 | relay `tcp_listen` 的端口，用于推导数据面拨号地址 |
 | `udp_data_port` | int | 否 | relay `udp_listen` 的端口；`0`/缺省表示未启用原生 UDP |
 | `data_tls` | bool | 否 | relay v0.4.0+ 必发，表示 TCP 数据面是否要求 TLS；agent/client `data_tls = auto` 时跟随该值。**缺省 = 旧 relay（≤ v0.3.1）**：按明文处理并 WARN，S 端显式 `data_tls = true` 时报永久错误 |

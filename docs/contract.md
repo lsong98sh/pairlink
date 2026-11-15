@@ -282,6 +282,7 @@ type ServerConfig struct {
     TLSCA string
     TLSInsecureSkipVerify bool
     Heartbeat, DialTimeout, UDPSessionTimeout time.Duration
+    PairTimeout time.Duration // v0.5.1：[server] pair_timeout，默认 10s（此前误读 [relay]）
     UDPDTLS bool // v0.5.0：[server] udp_dtls，默认 true，必须与 relay 一致
 }
 func (c ServerConfig) All() []ServerService   // 主服务 default 在前

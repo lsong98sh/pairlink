@@ -312,9 +312,13 @@ func (a *agent) dialTimeout() time.Duration {
 
 // pairTimeout 返回等待数据面报到应答的超时。
 //
-// agent 的 ini 没有 pair_timeout 字段，使用 [relay] pair_timeout（config 默认 10s；
-// agent 的 ini 通常没有 [relay] 段，因此等价于默认值），见 docs/protocol.md §8。
+// 优先用 agent 自己的 [server] pair_timeout（P3-2：以前读 [relay] pair_timeout，
+// 而 agent 的 ini 根本没有 [relay] 段，导致配置被静默忽略、恒为 10s）；为零时
+// 退回 [relay] 的旧行为，兼容直接构造 Config 的测试与历史 ini，见 docs/protocol.md §8。
 func (a *agent) pairTimeout() time.Duration {
+	if d := a.cfg.Server.PairTimeout; d > 0 {
+		return d
+	}
 	return positiveDuration(a.cfg.Relay.PairTimeout, defaultPairTimeout)
 }
 

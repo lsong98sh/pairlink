@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/config"
 	"github.com/lsong98sh/pairlink/internal/logx"
+	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
 )
 
@@ -267,5 +269,39 @@ func TestLogsDoNotContainToken(t *testing.T) {
 	}
 	if strings.Contains(out, cfg.Server.Token) {
 		t.Fatalf("日志中出现了接入密钥明文")
+	}
+}
+
+// TestCarrierCloseAllNotBlockedByCreation 覆盖 P2-5：
+// 承载连接的创建阶段（拨号 + 首帧）只持 createMu，不能占着状态锁 mu，
+// 否则 closeAll/current 会被一次慢拨号整个拖住（关停路径最敏感的正是它）。
+func TestCarrierCloseAllNotBlockedByCreation(t *testing.T) {
+	m := &carrierManager{}
+	// 模拟"正在拨号"：创建锁被占住，状态锁必须仍然可用。
+	m.createMu.Lock()
+	defer m.createMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		m.closeAll()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closeAll 被承载连接创建阶段阻塞（状态锁与创建锁未分离）")
+	}
+	if !m.isClosed() {
+		t.Fatal("closeAll 之后 closed 应为 true")
+	}
+}
+
+// TestCarrierCreateAfterClose 覆盖 P2-5：关停后才开始创建，必须直接失败，
+// 不能把连接拨出去再发布（否则关停后遗留一条无人管理的承载连接）。
+func TestCarrierCreateAfterClose(t *testing.T) {
+	m := &carrierManager{}
+	m.closeAll()
+	if _, _, err := m.createCarrier("127.0.0.1:1", &protocol.Bind{}, pairing.PairingKey{}, nil, nil); !errors.Is(err, errCarrierClosed) {
+		t.Fatalf("createCarrier 关停后应返回 errCarrierClosed，实际 %v", err)
 	}
 }

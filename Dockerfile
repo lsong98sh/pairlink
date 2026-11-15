@@ -44,7 +44,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 # 版本号与 internal/version.Version 保持一致（升级版本时同步修改）。
 LABEL org.opencontainers.image.title="PairLink" \
       org.opencontainers.image.description="PairLink 配对式中继系统（relay / agent / client）" \
-      org.opencontainers.image.version="v0.5.0" \
+      org.opencontainers.image.version="v0.5.1" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/lsong98sh/pairlink"
 

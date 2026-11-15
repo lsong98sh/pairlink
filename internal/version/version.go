@@ -9,7 +9,7 @@
 package version
 
 // Version 是完整版本号（含 "v" 前缀，与 git tag 一致）。
-const Version = "v0.5.0"
+const Version = "v0.5.1"
 
 // Number 是不带 "v" 前缀的版本号，供需要语义化版本格式的场景使用。
-const Number = "0.5.0"
+const Number = "0.5.1"

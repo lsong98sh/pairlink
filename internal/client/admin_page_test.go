@@ -170,9 +170,10 @@ func TestClientAdminWriteFormsStructure(t *testing.T) {
 			t.Fatalf("client 管理页缺少结构片段 %q:\n%s", want, body)
 		}
 	}
-	// 主服务（default）在映射表里只读：不得渲染针对 default 的写表单。
-	if strings.Contains(body, `<input type="hidden" name="service_id" value="default">`) {
-		t.Fatalf("default 映射行不应渲染修改/删除表单:\n%s", body)
+	// default 是 agent 主服务的固定 ID，对客户端来说只是普通映射（ini 里
+	// [client] service.default 合法且常见），因此管理页同样允许改/删。
+	if !strings.Contains(body, `<input type="hidden" name="service_id" value="default">`) {
+		t.Fatalf("default 映射行应渲染修改/删除表单:\n%s", body)
 	}
 
 	// 含表单的可写页默认暂停 1s 自动刷新；?refresh=1 才显式开启。

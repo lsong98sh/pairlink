@@ -52,6 +52,7 @@ var knownKeys = map[string]map[string]bool{
 		"tls_insecure_skip_verify": true,
 		"heartbeat":                true,
 		"dial_timeout":             true,
+		"pair_timeout":             true,
 		"udp_session_timeout":      true,
 		"udp_dtls":                 true,
 		"reconnect":                true,

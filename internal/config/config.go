@@ -200,6 +200,11 @@ type ServerConfig struct {
 	Reconnect bool
 	// ReconnectMaxBackoff 是自动重连指数退避的上限，默认 60s，必须 > 0。
 	ReconnectMaxBackoff time.Duration
+	// PairTimeout 是等待数据面报到应答（MsgBindOK）的超时，默认 10s。
+	//
+	// P3-2：此前 agent 侧读的是 [relay] pair_timeout，而 agent 的 ini 通常没有
+	// [relay] 段，配置被静默忽略、恒为 10s。现在改为 [server] pair_timeout。
+	PairTimeout time.Duration
 }
 
 // All 返回主服务（ID 恒为 default，排在最前）与附加服务组成的完整列表。
@@ -300,6 +305,7 @@ func newDefault() *Config {
 			UDPDTLS:             true,
 			Reconnect:           true,
 			ReconnectMaxBackoff: 60 * time.Second,
+			PairTimeout:         10 * time.Second,
 		},
 		Client: ClientConfig{
 			TLS:                 TLSAuto,
@@ -612,6 +618,9 @@ func (b *builder) loadServer() error {
 		return err
 	}
 	if s.DialTimeout, err = b.duration("server", "dial_timeout", s.DialTimeout); err != nil {
+		return err
+	}
+	if s.PairTimeout, err = b.duration("server", "pair_timeout", s.PairTimeout); err != nil {
 		return err
 	}
 	if s.UDPSessionTimeout, err = b.duration("server", "udp_session_timeout", s.UDPSessionTimeout); err != nil {

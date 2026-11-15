@@ -27,6 +27,16 @@ type carrierManager struct {
 	a   *agent
 	mu  sync.Mutex
 	cur *carrier
+
+	// createMu 串行化承载连接的**创建阶段**（拨号 + 首帧 + 发布）。
+	//
+	// P2-5：拨号最坏要等 dial_timeout，不能占着 mu——否则 closeAll/current 这类
+	// 只读状态的操作会被一次慢拨号整个拖住（关停时尤其明显）。创建期间其它
+	// 会话在 createMu 上排队，拿到锁后先复查 m.cur，避免各建一条承载连接。
+	createMu sync.Mutex
+	// closed 由 closeAll 置位：拨号期间如果进程开始关停，创建完成后立刻放弃，
+	// 不再把连接发布出去（否则关停后遗留一条无人管理的承载连接）。
+	closed bool
 }
 
 // newCarrierManager 创建承载连接管理器。
@@ -46,10 +56,30 @@ func (m *carrierManager) closeAll() {
 	m.mu.Lock()
 	c := m.cur
 	m.cur = nil
+	m.closed = true
 	m.mu.Unlock()
 	if c != nil {
 		c.fail(errCarrierClosed)
 	}
+}
+
+// acquire 返回当前可用的承载连接（不存在或已关闭返回 nil）。
+func (m *carrierManager) acquire() *carrier {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.cur
+	if c != nil && c.isClosed() {
+		m.cur = nil
+		return nil
+	}
+	return c
+}
+
+// isClosed 报告管理器是否已进入关停状态。
+func (m *carrierManager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
 }
 
 // openSession 把一个 UDP 会话挂到承载连接上，必要时先创建承载连接。
@@ -67,70 +97,94 @@ func (m *carrierManager) openSession(sess *localSession, key pairing.PairingKey,
 		Carrier:      protocol.CarrierUDPOverTCP,
 	}
 
-	m.mu.Lock()
-	c := m.cur
-	if c != nil && c.isClosed() {
-		c = nil
-		m.cur = nil
-	}
+	c := m.acquire()
+	first := false
 	if c == nil {
-		conn, err := m.a.dialDataPlane(m.a.ctx, tcpDataAddr, m.a.dialTimeout())
+		var err error
+		c, first, err = m.createCarrier(tcpDataAddr, bind, key, sess, localConn)
 		if err != nil {
-			m.mu.Unlock()
-			return nil, "", fmt.Errorf("连接 relay TCP 数据面（UDP 承载）: %w", err)
-		}
-		c = newCarrier(m.a, conn, tcpDataAddr)
-		m.cur = c
-		// 首帧必须在任何后续会话帧之前写出（此时发送队列尚未启动，直接同步写），
-		// 这样 relay 才能把这条连接切换到「UDP 隧道帧」模式。
-		if err := c.writeFirstFrame(protocol.MsgBind, bind); err != nil {
-			m.cur = nil
-			m.mu.Unlock()
-			c.fail(err)
-			return nil, "", fmt.Errorf("发送承载首帧 MsgBind: %w", err)
-		}
-		c.startWriter()
-		m.a.wg.Add(1)
-		go func() {
-			defer m.a.wg.Done()
-			c.readLoop()
-		}()
-		if !c.addSession(key, sess, localConn) {
-			m.mu.Unlock()
-			return nil, "", errCarrierClosed
-		}
-		m.mu.Unlock()
-
-		// 等承载连接就绪（relay 回 session="" 的 MsgBindOK 控制帧）。
-		if err := c.waitReady(m.a.pairTimeout()); err != nil {
-			c.removeSession(key)
-			c.fail(err)
 			return nil, "", err
 		}
-		m.a.log.Info("UDP over TCP 承载连接已就绪", "event", "bind",
+	}
+	if !first {
+		// 后续会话：隧道帧 session=<配对键>，payload 是完整的 MsgBind 帧。
+		frame, err := protocol.EncodeFrame(protocol.MsgBind, bind)
+		if err != nil {
+			return nil, "", fmt.Errorf("编码承载会话报到帧: %w", err)
+		}
+		if !c.addSession(key, sess, localConn) {
+			return nil, "", errCarrierClosed
+		}
+		if !c.writeTunnelFrame(key.String(), frame) {
+			c.removeSession(key)
+			if c.isClosed() {
+				return nil, "", errCarrierClosed
+			}
+			return nil, "", errors.New("承载连接发送队列已满，本次会话登记被丢弃")
+		}
+		m.a.log.Info("UDP over TCP 会话已挂到既有承载连接", "event", "bind",
 			"pairing_key", key.String(), "carrier", carrierUDPOverTCP, "remote", c.addr)
 		return c, c.addr, nil
 	}
-	m.mu.Unlock()
 
-	// 后续会话：隧道帧 session=<配对键>，payload 是完整的 MsgBind 帧。
-	frame, err := protocol.EncodeFrame(protocol.MsgBind, bind)
-	if err != nil {
-		return nil, "", fmt.Errorf("编码承载会话报到帧: %w", err)
-	}
-	if !c.addSession(key, sess, localConn) {
-		return nil, "", errCarrierClosed
-	}
-	if !c.writeTunnelFrame(key.String(), frame) {
+	// 新建路径：本会话就是首帧会话，等承载连接就绪（relay 回 session="" 的 MsgBindOK）。
+	if err := c.waitReady(m.a.pairTimeout()); err != nil {
 		c.removeSession(key)
-		if c.isClosed() {
-			return nil, "", errCarrierClosed
-		}
-		return nil, "", errors.New("承载连接发送队列已满，本次会话登记被丢弃")
+		c.fail(err)
+		return nil, "", err
 	}
-	m.a.log.Info("UDP over TCP 会话已挂到既有承载连接", "event", "bind",
+	m.a.log.Info("UDP over TCP 承载连接已就绪", "event", "bind",
 		"pairing_key", key.String(), "carrier", carrierUDPOverTCP, "remote", c.addr)
 	return c, c.addr, nil
+}
+
+// createCarrier 在 createMu 保护下建立承载连接并挂上首个会话。
+//
+// 返回的 first 为 true 表示 c 是本会话新建的（首帧由它写出）；为 false 表示
+// 排队期间别的会话已经把承载连接建好了，调用方应按"后续会话"处理。
+func (m *carrierManager) createCarrier(addr string, bind *protocol.Bind, key pairing.PairingKey, sess *localSession, localConn *net.UDPConn) (*carrier, bool, error) {
+	m.createMu.Lock()
+	defer m.createMu.Unlock()
+
+	if c := m.acquire(); c != nil {
+		return c, false, nil
+	}
+	if m.isClosed() {
+		return nil, false, errCarrierClosed
+	}
+
+	conn, err := m.a.dialDataPlane(m.a.ctx, addr, m.a.dialTimeout())
+	if err != nil {
+		return nil, false, fmt.Errorf("连接 relay TCP 数据面（UDP 承载）: %w", err)
+	}
+	c := newCarrier(m.a, conn, addr)
+	// 首帧必须在任何后续会话帧之前写出（此时发送队列尚未启动，直接同步写），
+	// 这样 relay 才能把这条连接切换到「UDP 隧道帧」模式。
+	if err := c.writeFirstFrame(protocol.MsgBind, bind); err != nil {
+		c.fail(err)
+		return nil, false, fmt.Errorf("发送承载首帧 MsgBind: %w", err)
+	}
+	c.startWriter()
+	m.a.wg.Add(1)
+	go func() {
+		defer m.a.wg.Done()
+		c.readLoop()
+	}()
+	if !c.addSession(key, sess, localConn) {
+		c.fail(errCarrierClosed)
+		return nil, false, errCarrierClosed
+	}
+
+	// 发布指针前再查一次关停标记：拨号期间 closeAll 可能已经跑过。
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		c.fail(errCarrierClosed)
+		return nil, false, errCarrierClosed
+	}
+	m.cur = c
+	m.mu.Unlock()
+	return c, true, nil
 }
 
 // tunnelSession 是承载连接上的一个 UDP 会话。

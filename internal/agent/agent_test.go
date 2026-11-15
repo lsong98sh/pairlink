@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -291,5 +292,28 @@ func TestListenPortFallback(t *testing.T) {
 		if got := listenPort(c.addr); got != c.want {
 			t.Fatalf("listenPort(%q) = %d，期望 %d", c.addr, got, c.want)
 		}
+	}
+}
+
+// TestPairTimeoutUsesServerConfig 覆盖 P3-2：
+// agent 的 ini 是 [server] 段，pair_timeout 必须从 cfg.Server 取；
+// 零值（直接构造 Config / 历史 ini）时回退 [relay] 的旧行为，保持兼容。
+func TestPairTimeoutUsesServerConfig(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Server.PairTimeout = 3 * time.Second
+	cfg.Relay.PairTimeout = 11 * time.Second
+	a := newAgent(context.Background(), cfg, nil)
+	t.Cleanup(a.cancel)
+	if got, want := a.pairTimeout(), 3*time.Second; got != want {
+		t.Fatalf("pairTimeout 应取 [server] 配置 = %v，实际 %v", want, got)
+	}
+
+	cfg2 := &config.Config{}
+	cfg2.Server.PairTimeout = 0
+	cfg2.Relay.PairTimeout = 11 * time.Second
+	a2 := newAgent(context.Background(), cfg2, nil)
+	t.Cleanup(a2.cancel)
+	if got, want := a2.pairTimeout(), 11*time.Second; got != want {
+		t.Fatalf("[server] 为零时应回退 [relay] = %v，实际 %v", want, got)
 	}
 }

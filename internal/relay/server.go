@@ -398,14 +398,23 @@ func (s *server) startAdmin() error {
 	return nil
 }
 
+// pairSweepInterval 返回待配对表的扫描周期（pair_timeout/2，下限 minSweepInterval）。
+//
+// P3-3：每次 tick 都重新计算，运行期把 pair_timeout 改小后扫描周期会跟着变，
+// 而不是一直沿用启动时的值（旧实现只在启动时算一次）。
+func (s *server) pairSweepInterval() time.Duration {
+	d := s.pairTimeout() / 2
+	if d < minSweepInterval {
+		return minSweepInterval
+	}
+	return d
+}
+
 // runTickers 是唯一的后台清理循环，所有超时清理都由它驱动。
 func (s *server) runTickers() {
 	defer s.wg.Done()
 
-	pairInterval := s.pairTimeout() / 2
-	if pairInterval < minSweepInterval {
-		pairInterval = minSweepInterval
-	}
+	pairInterval := s.pairSweepInterval()
 	pairTicker := time.NewTicker(pairInterval)
 	tokenTicker := time.NewTicker(time.Second)
 	udpTicker := time.NewTicker(time.Second)
@@ -422,6 +431,10 @@ func (s *server) runTickers() {
 		case <-s.ctx.Done():
 			return
 		case <-pairTicker.C:
+			if want := s.pairSweepInterval(); want != pairInterval {
+				pairTicker.Reset(want)
+				pairInterval = want
+			}
 			s.pairs.Sweep(time.Now())
 		case <-tokenTicker.C:
 			s.tokens.Sweep()

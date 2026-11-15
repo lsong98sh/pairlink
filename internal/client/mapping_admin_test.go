@@ -177,7 +177,7 @@ func TestValidateMappingForm(t *testing.T) {
 		{"web", ":8080", true},
 		{"web", "127.0.0.1:8080", true},
 		{"WEB", "8080", false},
-		{"default", "8080", false},
+		{"default", "8080", true},
 		{"web", "127.0.0.1:0", false},
 		{"web", "127.0.0.1", false},
 		{"", "8080", false},

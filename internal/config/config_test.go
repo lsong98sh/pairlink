@@ -134,6 +134,9 @@ func TestLoadValidAgent(t *testing.T) {
 	if got, want := s.UDPSessionTimeout, 45*time.Second; got != want {
 		t.Errorf("udp_session_timeout = %v, want %v", got, want)
 	}
+	if got, want := s.PairTimeout, 4*time.Second; got != want {
+		t.Errorf("pair_timeout = %v, want %v（P3-2：agent 侧读 [server] 段）", got, want)
+	}
 	if want := filepath.Join(filepath.Dir(cfg.Path), "ca.pem"); s.TLSCA != want {
 		t.Errorf("tls_ca = %q, want %q", s.TLSCA, want)
 	}

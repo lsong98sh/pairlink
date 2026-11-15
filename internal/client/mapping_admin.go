@@ -91,9 +91,7 @@ func validateMappingForm(id, listen string) (string, string, error) {
 	if err := config.ValidateServiceID(id); err != nil {
 		return "", "", err
 	}
-	if strings.EqualFold(id, config.DefaultServiceID) {
-		return "", "", fmt.Errorf("service_id default 不允许在页面上新增/修改")
-	}
+
 	addr, err := config.NormalizeListenAddr(listen)
 	if err != nil {
 		return "", "", fmt.Errorf("本地监听地址非法: %w", err)
@@ -261,9 +259,7 @@ func (c *client) deleteMapping(id string) error {
 	if err := config.ValidateServiceID(id); err != nil {
 		return err
 	}
-	if strings.EqualFold(id, config.DefaultServiceID) {
-		return fmt.Errorf("service_id default 不允许在页面上删除")
-	}
+
 	c.mappingOpMu.Lock()
 	defer c.mappingOpMu.Unlock()
 	if c.ctx.Err() != nil {
@@ -348,7 +344,7 @@ func (c *client) clientMappingRows() []clientMappingRow {
 			Actual:    orDash(m.Actual),
 			Proto:     m.Proto,
 		}
-		if writable && m.ServiceID != config.DefaultServiceID {
+		if writable {
 			row.Forms = clientMappingForms{
 				Show:        true,
 				SaveToken:   c.csrfToken(),

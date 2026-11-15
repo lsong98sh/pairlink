@@ -2,14 +2,15 @@
 
 > **生成方式**：逐条对照 `task.md`（150 行，§1–§12）与 `task2.txt`（11 行）到当前实现与测试；
 > 所有「实现位置」均来自本轮 `grep`/读码取证（非凭印象），行号为**当前工作区**真实行号。
-> 取证基线：v0.5.0（v0.4.0 + 日志按日切割 / goleak / html/template / ini.v1+目录 fsync / DTLS-PSK+限速）、`go1.24.4 windows/amd64`。
+> 取证基线：v0.5.1（v0.5.0 + 阶段 8 遗留 P2-5/P3-2/P3-3/P3-4/P3-7 收口）、`go1.24.4 windows/amd64`。
 > 阶段 6E 更新 §5 工程增强状态、版本号与 §6 复核结论；
 > 阶段 6G 追加 E7（TLS 显式开关）的实现、测试与文档，不改需求侧判定；
 > 阶段 7 追加 E9（管理页动态配置：回环门禁 + 写回 ini + 运行时生效 + 审计）；
 > 阶段 8C 修复 P0-1/SEC-D1、SEC-A1、SEC-T2、P1-1、P1-2、SEC-M1、SEC-M2、SEC-M4、
 > SEC-D2，并**用脚本重新生成全部 `Test*` 锚点**（45 处行号修正，0 缺失）；
 > 阶段 8D 追加 SEC-T1（数据面 TLS）与 SEC-A2（服务名归属）的实现/测试锚点（§1.6.1）；
-> v0.5.0（阶段 8E）追加 SEC-D3（原生 UDP DTLS-PSK）与 E10–E13，并更新 §5 工程增强统计。
+> v0.5.0（阶段 8E）追加 SEC-D3（原生 UDP DTLS-PSK）与 E10–E13，并更新 §5 工程增强统计；
+> v0.5.1 关闭 §6 的 D3/D4/D6 描述性漂移，并按实现修正 carrier 结构体/踢出流程/relay 页块。
 >
 > **锚点维护约定**：测试锚点由脚本按 `func Test...` 起始行生成，可重复执行；
 > 实现位置锚点（`文件#Lx-Ly`）指向功能片段，8C 修改过的文件（`internal/protocol`、
@@ -301,16 +302,16 @@
 
 ## 6. 文档与实现不一致之处（阶段 6E 复核）
 
-> D1/D2/D5 已在阶段 6E 关闭；D3/D4/D6 仍为描述性漂移，不影响语义。
+> D1/D2/D5 在阶段 6E 关闭；D3/D4/D6 为纯描述性漂移，已于 **v0.5.1** 全部按实现改写并关闭（下表保留原始记录）。
 
 | # | 位置 | 现象 | 事实 | 影响 |
 | --- | --- | --- | --- | --- |
 | D1 | [README.md:841](../README.md#L841)（§13.10 `TestSubprocessTCPEcho` 条目） | 曾写"最后 `taskkill /PID` 清理" | **阶段 6E 已修**：改为跨平台 `os.Process.Kill()`，与 [test/binary_test.go](../test/binary_test.go) 现状一致 | 已关闭 |
 | D2 | [README.md:705](../README.md#L705)（§13.1 实测）、[:862](../README.md#L862)（§13.12） | 写"33 个 `--- PASS`" | **阶段 6E 已标注时点**：两处均写明「阶段 4 收尾」；当前 `test` 包顶层用例为 **29** 个（Windows，含 1 个 windows-only）/28 个（Linux），见 §13.15.6 | 已关闭（保留历史快照） |
-| D3 | [docs/architecture.md:230-252](architecture.md#L230-L252)（§4.6 carrier 表） | 草图字段为 `agentCarrier/clientCarrier`、`carrier{conn,writeMu}` | 实际实现为 `carrierSession{key,agent,client,full,agentID,createdAt,lastSeen}` + `carrierConn{...,writeMu,closeOnce,closed}`（[carrier.go:28-61](../internal/relay/carrier.go#L28-L61)） | 仅示意性漂移，不影响语义；写作"建议结构"即可 |
-| D4 | [docs/architecture.md:98-99](architecture.md#L98-L99)（§3.1 末条） | 写踢出"只调用 `Control.Close()` 或数据连接 `Close()`" | 实际踢出还会先写 `MsgKicked`（[relay/admin.go:212](../internal/relay/admin.go#L212)）再关闭；清理仍走既有路径，符合 task.md §5 意图 | 语义仍成立（"只关句柄、不另写清理"），描述可更精确 |
+| D3 | [docs/architecture.md:230-252](architecture.md#L230-L252)（§4.6 carrier 表） | 草图字段为 `agentCarrier/clientCarrier`、`carrier{conn,writeMu}` | 实际实现为 `carrierSession{key,agent,client,full,agentID,createdAt,lastSeen}` + `carrierConn{...,writeMu,closeOnce,closed}`（[carrier.go:28-61](../internal/relay/carrier.go#L28-L61)） | **v0.5.1 已关闭**：结构体改为与 `carrierSession{key,agent,client,full,agentID,createdAt,lastSeen}` + `carrierConn{conn,out}` 一致 |
+| D4 | [docs/architecture.md:98-99](architecture.md#L98-L99)（§3.1 末条） | 写踢出"只调用 `Control.Close()` 或数据连接 `Close()`" | 实际踢出还会先写 `MsgKicked`（[relay/admin.go:212](../internal/relay/admin.go#L212)）再关闭；清理仍走既有路径，符合 task.md §5 意图 | **v0.5.1 已关闭**：§3.1 已改写为"先写 `MsgKicked` 再关闭，清理仍走既有路径" |
 | D5 | [README.md:551](../README.md#L551)（§10 #1） | 曾把"客户端自动重连缺失"与"协议热切换缺失"写在一起 | **阶段 6C/6E 已重写**：§10 #1 只讲自动重连（已实现），§10 #6 单列热切换（已实现） | 已关闭 |
-| D6 | [README.md:742-748](../README.md#L742-L748)（§13.8） | 列 relay 页四块内容 | 实际 relay 页还有「概览」块（含 `UDP 承载模式`/`TCP 数据面`/`UDP 数据面`/`服务数`/`配对占位`/`UDP 会话数`，[admin.go:18-34](../internal/relay/admin.go#L18-L34)），task2 的验收正是靠这块 | 文档少列一块，非错误但漏了 task2 的关键证据 |
+| D6 | [README.md:742-748](../README.md#L742-L748)（§13.8） | 列 relay 页四块内容 | 实际 relay 页还有「概览」块（含 `UDP 承载模式`/`TCP 数据面`/`UDP 数据面`/`服务数`/`配对占位`/`UDP 会话数`，[admin.go:18-34](../internal/relay/admin.go#L18-L34)），task2 的验收正是靠这块 | **v0.5.1 已关闭**：§13.8 已补「概览」块（含 UDP 承载模式等 6 项） |
 
 ---
 
