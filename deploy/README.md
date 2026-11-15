@@ -326,7 +326,8 @@ docker compose -f deploy/docker-compose.yml down
 | 幂等 / 重复卸载（6F） | ✅ 通过 | 第二次 install 跳过二进制复制与配置覆盖；重复 `--uninstall` 退出 0；`--purge` 只删本模式 ini/证书 |
 | `--dry-run` / `--no-systemd`（6F） | ✅ 通过 | 非 root dry-run 只打印且不出现其它模式 unit 操作；`--no-systemd` 不放 unit、只放二进制与 ini |
 | Docker 镜像构建 / compose | ✅ **通过（v0.5.1）** | WSL2 + Docker Engine 29.1.3 / Compose 2.40.3：多阶段构建成功（21.4MB，nonroot），`read_only`+`cap_drop:ALL` 可运行，compose 四容器 Up、三管理页 200、18080 经隧道取到 nginx 首页；镜像经 daocloud 镜像源拉取，`golang` 基础镜像因上游限流用本地 Go 1.24.4 组装同 tag 替身 |
-| Windows SCM 完整生命周期 | ✅ **通过（v0.5.1）** | 管理员提权会话实测 install/start/stop/uninstall、按日日志落盘、管理页 200、卸载后 `sc query` 1060（README §13.20）；`install-*.ps1` 脚本本身仍建议首次 `-WhatIf` |
+| Windows SCM 完整生命周期 | ✅ **通过（v0.5.1）** | 管理员提权会话实测 install/start/stop/uninstall、按日日志落盘、管理页 200、卸载后 `sc query` 1060（README §13.20） |
+| Windows `install-*.ps1` 脚本自身 | ✅ **通过（v0.5.1）** | 三脚本各自独立进程真跑：三个服务同时 Running、三管理页 200、relay 页同时列出 agent/client；`-Force` / `-NoStart` / 幂等重装 / `-Uninstall` / `-Uninstall -KeepLogs` 全部 exit 0；实测修掉 `common.ps1` 的 `.Count` 异常（卸载成功却 exit 1） |
 
 WSL 验证环境：Ubuntu（内核 6.18 WSL2）、systemd 259（`is-system-running` 报 `degraded`，
 但 unit 可正常启停）、Go 1.24.4。阶段 6D 的三 unit 验证使用 `git archive HEAD`（`65f7064`）

@@ -132,6 +132,7 @@ agent/client 一般只需出站，不需要入站规则。
 | 端口被占 | `Get-NetTCPConnection -LocalPort 7000,7001 -ErrorAction SilentlyContinue` |
 | 卸载后服务仍显示 | SCM 停止需要时间；稍后 `sc.exe query`，必要时重启后删除 |
 | 中文乱码 | 四个 `.ps1` 已保存为 UTF-8 with BOM，兼容 Windows PowerShell 5.1；仍乱码时优先用 PowerShell 7（`pwsh`） |
+| `pairlink.exe` 自身输出的中文乱码（如 `-service install` 的提示） | v0.5.1 的 Go 程序以 **UTF-8** 写 stdout，中文 Windows 控制台默认 CP936 会显示成乱码（重定向/管道时尤其明显）。临时解法：`chcp 65001`，或 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`；根治需程序启动时切换控制台代码页（v0.5.2 候选） |
 
 ## 7. 脚本自身检查（开发机）
 
@@ -144,10 +145,32 @@ Get-ChildItem .\*.ps1 | ForEach-Object {
 }
 ```
 
-注意：解析通过只证明语法正确。**v0.5.1 已用 `-service` 子命令在管理员提权会话实测 SCM 全流程**
-（install→start→stop→uninstall、按日日志落盘、管理页 200、卸载后 `sc query` 1060，见仓库
-README §13.20）；但本目录的 `install-*.ps1` 脚本本身仍未逐个在 SCM 下跑过（它们调用同一套
-`-service` 操作），首次在目标机使用时建议先 `-WhatIf` 观察一遍。
+注意：解析通过只证明语法正确。**v0.5.1 已在管理员提权会话里把三个脚本的完整生命周期真跑了一遍**
+（每个脚本独立进程、隔离目录 `C:\ProgramData\pairlink`）：
+
+| 场景 | 结果 |
+| --- | --- |
+| `install-relay.ps1 -Config ... -Binary ...` | exit 0；`Running/Automatic`；`/relay` 200 |
+| `install-agent.ps1` / `install-client.ps1` | 各自 exit 0；`Running/Automatic`；`/status`、`/client` 200 |
+| 三服务同时运行 | relay 日志同时出现 `role=agent`/`role=client` 的 `hello_ok`；agent 注册 2 个服务、client 起 2 个本地监听 |
+| 重复安装（无 `-Force`） | exit 0，提示"已存在…未做任何修改"，服务状态不变 |
+| `-Force` 重装 | exit 0；先 stop+uninstall 再 install+start，页面恢复 200 |
+| `-NoStart` | exit 0；服务注册为 `Stopped/Automatic`，`sc.exe start` 后可正常启动 |
+| `-Uninstall` | exit 0；服务消失、日志被删除（每个角色单独卸载均验证） |
+| `-Uninstall -KeepLogs` | exit 0；服务消失、`pairlink-relay-*.log` 保留 |
+| 日志命名 | 只有 `pairlink-<mode>-YYYY-MM-DD.log`，无 v0.4.x 的旧单文件 |
+
+> 这一轮实测抓出并修掉一个真实 bug：`common.ps1` 的 `Remove-PairLinkLog` 里
+> `$files.Count` 在"0 个或 1 个日志文件"时会抛 `找不到属性"Count"`（函数返回的数组在赋值时
+> 被展开成 `$null`/单个 `FileInfo`，StrictMode 下没有 `.Count`），导致**卸载成功却 exit 1**。
+> 已改为 `@(Get-PairLinkLogFiles ...)` 强制数组。
+
+运维注意：relay 停机时会向 agent/client 下发 `server_shutdown`，两者**按设计主动退出**；
+SCM 未配置 recovery，所以 **relay 重启后 agent/client 会停在 `Stopped`，需要再启动一次**
+（或给这两个服务配 `sc.exe failure` 恢复动作）。
+
+脚本不支持 `-WhatIf`（未实现 `ShouldProcess`）：首次在目标机使用建议用 `-NoStart` 装好、
+检查配置与日志后再 `sc.exe start`。
 
 ## 8. 从旧脚本迁移
 

@@ -322,7 +322,7 @@ udp_session_timeout = 60s
 | --- | --- |
 | `-relay` / `-agent` / `-client` | 必须且只能指定一个模式 |
 | `-config <path>` | ini 配置文件路径（必填） |
-| `-version` | 打印 `pairlink v0.4.0` 并退出（退出码 0） |
+| `-version` | 打印 `pairlink v0.5.1` 并退出（退出码 0） |
 | `-service <op>` | 仅 Windows：`install` / `start` / `stop` / `uninstall`（另有内部使用的 `run`） |
 
 退出码：`0` 正常；`1` 运行/配置错误；`2` 参数用法错误（会打印帮助）。
@@ -754,12 +754,15 @@ docker compose -f deploy/docker-compose.yml down
     （真跑，非 `CGO_ENABLED=0` 降级）与真实三进程端到端（HTTP / TCP echo / UDP 两种承载 /
     三个管理页 / 踢出 / SIGTERM 优雅关停 / 端口释放），并做了跨 OS 联调与 TLS 复核，
     详见 §13.15。systemd 真实托管已由阶段 6D 在 WSL2 验证（见 §13.16）；仍未覆盖非 loopback 多网卡、长时间 soak、非 root `User=pairlink` 运行。
-12. **Windows 服务生命周期已验证（v0.5.1）**：此前因本机非管理员只验证了
-    `-service install` 的权限错误路径与服务命名 `pairlink-<mode>`；v0.5.1 在管理员提权会话里
-    实测 install→start→stop→uninstall：`AUTO_START`/`LocalSystem`、`RUNNING`/`STOPPED` 状态迁移、
-    `pairlink-<mode>-YYYY-MM-DD.log` 落盘、管理页 200、停后无残留进程、卸载后 `sc query` 1060，
-    证据见 §13.20。阶段 6F 的 `deploy/windows/install-{relay,agent,client}.ps1` 仍未在 SCM 下逐个跑过
-    （验证走的是 `-service` 子命令直连 SCM），这属于脚本自身的冒烟项。
+12. **Windows 服务生命周期与部署脚本均已验证（v0.5.1）**：此前因本机非管理员只验证了
+    `-service install` 的权限错误路径与服务命名 `pairlink-<mode>`；v0.5.1 先在管理员提权会话里
+    实测 `-service` 全流程（install→start→stop→uninstall、`AUTO_START`/`LocalSystem`、
+    `RUNNING`/`STOPPED`、`pairlink-<mode>-YYYY-MM-DD.log` 落盘、管理页 200、停后无残留进程、
+    卸载后 `sc query` 1060），随后又把 `deploy/windows/install-{relay,agent,client}.ps1`
+    三个脚本逐个真跑（安装/`-Force`/`-NoStart`/幂等重装/`-Uninstall`/`-KeepLogs`，
+    并让三服务同时在线、relay 页面同时列出 agent 与 client），证据见 §13.20。
+    这轮实测还修掉一个脚本 bug：`common.ps1` 在「0 或 1 个日志文件」时 `.Count` 抛异常，
+    导致卸载成功却 exit 1（已用 `@()` 强制数组修复）。
 13. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；广域网下的
     TCP/UDP 行为（尤其 UDP over TCP 的队头阻塞）可能不同。
 14. **TLS 公网 CA 正向路径仍未实测**：e2e 覆盖自签 CA（`tls_ca`）、`tls_insecure_skip_verify`、
@@ -1177,7 +1180,7 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
    关停期间不再启动新 goroutine（三个模式分别由 `sync.WaitGroup` / `taskGroup` 约束）；
    管理页所有用户可控字段（服务ID/地址/agent_id/配对键）均 `html` 转义；
    全仓日志（含 debug/错误路径）无明文 `pairing_token`。
-   **仍需管理员/真机验证的只有：真实 Linux 运行、Windows 服务完整生命周期（本节第 1、2 条）。**
+   **仍需管理员/真机验证的只有：真实 Linux 运行、Windows 服务完整生命周期（本节第 1、2 条）。**（两者 v0.5.1 均已由 WSL2 与管理员提权会话补齐，见 §13.16 / §13.20。）
 8. **未做长时间 soak**：资源泄漏用 goleak（整包结束按栈帧判定）+ `pprof` 栈帧佐证，未做数小时压测。
 9. **v0.5.0 引入的新限制（原生 UDP DTLS / 日志 / ini）**：
    - DTLS 与 v0.4.0 的明文原生 UDP **不互通**：三端须一起升到 ≥ v0.5.0，或临时
@@ -1392,7 +1395,7 @@ go test ./test/... -v -count=1  # ok 21.701s；27 个顶层 --- PASS、0 个 ---
 1. **Linux 服务化**：阶段 6D 已用 `deploy/systemd` 三个 unit 在 WSL2（systemd 259）上实测
    install / start / stop / uninstall（见 §13.16）；仍未验证非 root `User=pairlink` 运行与真实公网防火墙。
 2. **非 loopback 网络**：跨 OS 用的是 WSL vEthernet，仍未验证公网 NAT、多网卡、丢包/延迟。
-3. **Windows 服务完整生命周期**：仍缺管理员权限（见 §13.11 / §13.14 第 2 条）。
+3. **Windows 服务完整生命周期**：仍缺管理员权限（见 §13.11 / §13.14 第 2 条）。**v0.5.1 已补**：管理员提权会话实测 `-service` 全流程与三个 `install-*.ps1` 脚本，见 §13.20。
 4. **Windows 上子进程的优雅关停**：Go 不支持向子进程投递 Ctrl+C，
    `TestSubprocessGracefulShutdown` 在 Windows 上只验证"进程退出"；优雅路径由 Unix 分支
    与 §13.15.3 的 `SIGTERM` 实测覆盖。
@@ -1581,6 +1584,34 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 | `-service uninstall` | exit 0；`sc query` → **1060**（服务不存在），2s 内生效 |
 | 重复 `install` | exit **1**，提示"服务已存在，请先 uninstall"（幂等错误路径符合预期） |
 | 再 `uninstall` | exit 0，服务再次消失 |
+
+**Windows 部署脚本 `install-{relay,agent,client}.ps1`（v0.5.1，管理员提权会话实测）**：
+
+隔离目录 `C:\ProgramData\pairlink\`（`pairlink.exe` 副本 + 三份 ini），三个脚本各自**独立进程**
+调用（脚本卸载分支末尾是 `exit 0`，同进程调用会连带终止调用方）。
+
+| 场景 | 结果 |
+| --- | --- |
+| `install-relay.ps1 -Config -Binary` | exit 0 → `Running/Automatic`，`/relay` 200 |
+| `install-agent.ps1` / `install-client.ps1` | exit 0 → `Running/Automatic`，`/status`、`/client` 200 |
+| 三服务同时在线 | relay 日志同时含 `role=agent`/`role=client` 的 `hello_ok`；agent 注册 2 个服务、client 2 个本地监听；relay 页面同时列出 `a-…` 与 `c-…` |
+| 重复安装（无 `-Force`） | exit 0，提示"已存在…未做任何修改"，状态保持 `Running` |
+| `-Force` 重装 | exit 0；stop+uninstall→install+start，页面恢复 200 |
+| `-NoStart` | exit 0；`Stopped/Automatic`，`sc.exe start` 后可启动 |
+| `-Uninstall`（三个角色各自） | exit 0；服务消失、日志删除（每个角色 1 个日文件均被删） |
+| `-Uninstall -KeepLogs` | exit 0；服务消失、`pairlink-relay-*.log` 保留 |
+| 日志命名 | 只有 `pairlink-<mode>-YYYY-MM-DD.log`，`old_single_file=False` |
+
+> **实测抓出的脚本 bug（已修）**：`common.ps1` 的 `Remove-PairLinkLog` 用 `$files.Count` 判空，
+> 但 `Get-PairLinkLogFiles` 返回的数组在赋值时被展开——0 个文件是 `$null`、1 个文件是单个
+> `FileInfo`，在 `Set-StrictMode -Version Latest` 下都没有 `.Count`，于是**卸载完成后脚本抛异常
+> exit 1**（服务其实已卸载）。修复：`$files = @(Get-PairLinkLogFiles ...)`。脚本不含在二进制内，
+> 因此 v0.5.1 二进制无需重建。
+
+> 运维注意：relay 停机时会下发 `server_shutdown`，agent/client **按设计主动退出**；SCM 未配置
+> recovery，故 **relay 重启后这两个服务会停在 `Stopped`，需要再启动一次**（或配 `sc.exe failure`）。
+> 另外三个脚本**不支持 `-WhatIf`**（未实现 `ShouldProcess`），首次部署建议 `-NoStart` + 手工
+> `sc.exe start` 观察。
 
 **Docker 镜像构建 + compose 编排（v0.5.1，WSL2 Ubuntu 26.04）**：
 

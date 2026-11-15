@@ -131,7 +131,9 @@ function Remove-PairLinkLog {
         [Parameter(Mandatory = $true)][string]$ServiceName,
         [bool]$KeepLogs
     )
-    $files = Get-PairLinkLogFiles -BinaryPath $BinaryPath -ServiceName $ServiceName
+    # 注意：函数返回的数组在赋值时会被展开，0 个文件变 $null、1 个文件变单个 FileInfo，
+    # 两者都没有 .Count 属性（StrictMode 下会抛异常）。必须用 @() 强制成数组。
+    $files = @(Get-PairLinkLogFiles -BinaryPath $BinaryPath -ServiceName $ServiceName)
     if ($files.Count -eq 0) {
         Write-Host ("  日志文件 : 不存在（{0}-YYYY-MM-DD.log）" -f $ServiceName)
         return
