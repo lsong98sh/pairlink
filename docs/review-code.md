@@ -11,7 +11,7 @@
 > 已修复，P2-8 部分修复（连接/令牌/在途配额 + agent 并发上限，仍无按 client 的令牌签发速率）；
 > P2-4（Windows ACL/目录 fsync）与 P2-5（锁内 IO）**未修**，原因见 README §15 / 交付报告；
 > P3-1/P3-4/P3-5/P3-6/P3-8/P3-10 已顺手修复，其余 P3 保留。逐项证据与回归数字见 README §15、
-> `docs/architecture.md` §7.10、`docs/review-security.md` §0。
+> `docs/architecture.md` §7.10（完整安全审查报告含攻击步骤，不随仓库发布）。
 
 ---
 

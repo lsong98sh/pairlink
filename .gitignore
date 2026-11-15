@@ -12,6 +12,9 @@ dist/
 build/
 coverage.txt
 
+# 安全审查报告：含可复现的攻击/利用步骤，只在本地保留，不随仓库发布
+docs/review-security.md
+
 # 日志与运行时产物
 *.log
 logs/

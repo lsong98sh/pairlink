@@ -1508,7 +1508,7 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 
 > 说明：该轮（v0.3.0）验收时 SEC-T1（数据面 TLS）、SEC-A2（服务名归属）、SEC-D3（UDP 反伪造）
 > **不在当轮范围**；其中 T1/A2 已在 v0.4.0 修复，D3 已在 v0.5.0 用 DTLS-PSK 修复。
-> 历史记录与残差见 README §10.1、`docs/architecture.md` §7.10、`docs/review-security.md` §0。
+> 历史记录与残差见 README §10.1、`docs/architecture.md` §7.10；完整安全审查报告（含可复现攻击步骤）不随仓库发布，本地保留在 `docs/review-security.md`。
 
 ### 13.20 阶段 8E：v0.5.0 / v0.5.1 验证记录
 
@@ -1678,7 +1678,7 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
   原 owner 离线 → 允许接管（`service_takeover`，WARN 记录旧/新 owner）；拒绝原因用稳定
   `detail` 代码下发，agent 日志与管理页显示可读提示。relay 新增 `service_denied` 事件。
 
-**安全修复（阶段 8C，对应 `docs/review-security.md` / `docs/review-code.md`）**
+**安全修复（阶段 8C，对应 `docs/review-code.md` 与本地安全审查报告）**
 
 - **P0-1 / SEC-D1 帧长度预分配放大**：所有**网络入口**（隧道控制面、TCP 数据面报到、UDP
   报到嗅探、agent/client 控制连接）改用 `ReadFrameWithLimit(conn, 64 KiB)`，对端只发 5 字节

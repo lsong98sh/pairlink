@@ -600,7 +600,7 @@ POST /action/<name> + 一次性 CSRF
 **日志限速**：`conn_reject`、UDP 鉴权失败 `bind_fail` 均 5 秒最多一条 WARN（其余降 Debug），
 避免未认证流量放大日志（P2-1/P2-2）。
 
-**阶段 8C/8D 的安全边界**（详见 README §10.1，`docs/review-security.md` 顶部）：
+**阶段 8C/8D 的安全边界**（详见 README §10.1；完整安全审查报告含攻击步骤，不随仓库发布）：
 
 | 编号 | 风险 | 状态 | 说明 |
 | --- | --- | --- | --- |
