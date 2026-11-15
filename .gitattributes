@@ -1,0 +1,12 @@
+# 统一换行，避免 Windows 检出（core.autocrlf=true）把 CRLF 带进 Linux 脚本，
+# 导致 ./build.sh 报 "bad interpreter: /usr/bin/env bash^M"。
+*.sh            text eol=lf
+build.sh        text eol=lf
+deploy/linux/*  text eol=lf
+
+# Go / 文档按文本处理，仓库内统一 LF
+*.go            text eol=lf
+*.md            text eol=lf
+*.ini           text eol=lf
+*.yml           text eol=lf
+*.service       text eol=lf
