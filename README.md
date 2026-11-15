@@ -211,16 +211,50 @@ WARN 便于定位。
 
 ### 4.1 编译
 
-```bash
-# 任意平台构建当前平台二进制
-go build -o pairlink .
+两个脚本按主机选一个即可，产物与发行包布局一致（`dist/`，已 gitignore）：
 
-# 交叉编译（Linux / Windows）
-GOOS=linux   GOARCH=amd64 go build -o pairlink-linux .
-GOOS=windows GOARCH=amd64 go build -o pairlink.exe .
+| 主机 | 命令 | 默认产物 |
+| --- | --- | --- |
+| Windows | `.\build.ps1` | `dist/pairlink-windows-{amd64,arm64}.exe` + `pairlink-v0.5.1-windows-amd64.zip` |
+| Linux / macOS | `./build.sh` | `dist/pairlink-linux-{amd64,arm64}` + `pairlink-v0.5.1-linux-amd64.zip` |
+
+```powershell
+# Windows：默认两个架构；需要跨平台/断言版本/只出二进制时
+.\build.ps1 -OS all -Version v0.5.1        # windows + linux 四个产物
+.\build.ps1 -Arch amd64 -NoZip             # 单个产物、不打包
+.\build.ps1 -WhatIf                        # 只打印命令，不落盘
 ```
 
-要求 Go 1.24.4+；依赖只有 `golang.org/x/sys`（`go mod tidy` 已生成 `go.sum`）。
+```bash
+# Linux / macOS：同样的开关（长参数）
+./build.sh                                 # linux/amd64 + linux/arm64（amd64 打 zip）
+./build.sh --os all --version v0.5.1
+./build.sh --arch amd64 --no-zip --dry-run
+./build.sh --help
+```
+
+两个脚本做同一套事：
+
+- **版本只读源码**：从 `internal/version/version.go` 的 `Version` 常量取值，`-Version` / `--version`
+  只做断言（不一致直接失败），**不会改写任何文件**；二进制里 `-version`、管理页、日志因此天然一致。
+- **统一构建参数**：`CGO_ENABLED=0` + `-trimpath` + `-ldflags "-s -w"`，产出静态单文件。
+- **构建后自检**：文件大小下限 → 读 `go version -m` 校验 `GOOS/GOARCH/trimpath/CGO_ENABLED=0`
+  → 本机可执行的目标直接跑 `-version` 与源码版本比对 → 打印 SHA256。
+- **打包**：`<name>/pairlink(.exe)`、`LICENSE`、`README.md`、`deploy/**`、`examples/**`
+  （默认只为 amd64 打 zip，`-ZipAll` / `--zip-all` 让 arm64 也打包；`-NoZip` / `--no-zip` 只出二进制）。
+- **VCS 印章**：保留 Go 默认的 `vcs.revision` / `vcs.modified`（便于溯源）；`-NoVCS` / `--no-vcs` 可关闭。
+  若 git 不可用（tarball 副本、`dubious ownership`、未装 git），脚本**自动回退** `-buildvcs=false` 并告警，
+  不会让 `go build` 卡在 "error obtaining VCS status"。
+
+等价的手工命令（脚本内部就是它）：
+
+```bash
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pairlink-linux .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o pairlink.exe .
+```
+
+要求 Go 1.24.4+（纯 Go，无 CGO）。首次构建需要拉依赖：中国大陆网络建议
+`export GOPROXY=https://goproxy.cn,direct`（`proxy.golang.org` 常超时）。
 
 ### 4.2 三份示例 ini
 
@@ -837,7 +871,9 @@ SEC-D3（原生 UDP 会话反伪造）在 **v0.5.0 已修复**（DTLS-PSK，见�
 pairlink/
 ├── main.go                  # 命令行入口（模式选择 / 服务子命令 / signal）
 ├── main_test.go             # 模式选择 / 版本常量单测
-├── go.mod / go.sum          # module github.com/lsong98sh/pairlink（唯一第三方依赖 x/sys）
+├── build.ps1                # Windows 主机：构建 windows/amd64+arm64（可跨平台）并打 zip
+├── build.sh                 # Linux/macOS 主机：构建 linux/amd64+arm64（可跨平台）并打 zip
+├── go.mod / go.sum          # module github.com/lsong98sh/pairlink（Go 1.24.4，纯 Go 无 CGO）
 ├── Dockerfile               # 多阶段镜像（CGO_ENABLED=0，distroless nonroot）
 ├── .dockerignore            # 构建上下文裁剪
 ├── LICENSE                  # Apache-2.0
@@ -1613,6 +1649,24 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 > 另外三个脚本**不支持 `-WhatIf`**（未实现 `ShouldProcess`），首次部署建议 `-NoStart` + 手工
 > `sc.exe start` 观察。
 
+**构建脚本 `build.ps1` / `build.sh`（v0.5.1 验证）**：
+
+两个脚本与发行布局对齐：`CGO_ENABLED=0` + `-trimpath` + `-ldflags "-s -w"`，版本只读
+`internal/version/version.go`，构建后自动校验 buildinfo 并跑 `-version` 比对。
+
+| 项 | 结果 |
+| --- | --- |
+| `.\build.ps1`（Windows，默认两架构） | windows/amd64 **11,287,552 B**、windows/arm64 **10,447,360 B**；`-version` = `pairlink v0.5.1` |
+| `bash build.sh`（WSL2 Ubuntu 26.04） | linux/amd64 **10,809,528 B**、linux/arm64 **10,223,800 B** —— 与 v0.5.1 已发布 `dist/` 的**字节数完全一致** |
+| zip 布局 | 顶层目录 `pairlink-v0.5.1-<os>-amd64/`，28 个文件：二进制 + `LICENSE` + `README.md` + `deploy/**`（4 个 `.ps1`、4 个 `.sh`、3 个 unit、compose、说明）+ `examples/**`（7 份主机 ini + docker 3 份）；Linux 包保留 `pairlink` 可执行位；构建脚本自身不入包 |
+| 解压后运行 | 两个 zip 解压出来的二进制 `-version` 均为 `pairlink v0.5.1` |
+| VCS 印章 | `vcs=git`、`vcs.revision=d727620`、`vcs.modified=true`（当时工作区有未提交改动） |
+| 无 VCS 回退 | 移除 `safe.directory`（root 访问 `/opt/build-src` 报 dubious ownership）与"无 `.git` 的副本"两种场景：脚本告警并自动加 `-buildvcs=false`，产物 buildinfo 无 `vcs.*`，哈希与带印章版本不同 |
+| 静态检查 | `shellcheck 0.11.0 -x build.sh` **0 告警**、`bash -n` 通过、`build.ps1` PSParser 无语法错误 |
+| 干跑 | `build.ps1 -WhatIf` / `build.sh --dry-run` 只打印命令，不落盘 |
+
+> 说明：二进制大小与已发布 `dist/` 一致，但 zip 哈希不同——包内文档已随本轮更新（脚本说明、
+> 部署文档等）。脚本不写入任何源文件，`-Version` 只做断言。
 **Docker 镜像构建 + compose 编排（v0.5.1，WSL2 Ubuntu 26.04）**：
 
 环境：WSL2 Ubuntu 26.04 / Docker Engine **29.1.3** / Compose **2.40.3**（`apt install docker.io
