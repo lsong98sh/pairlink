@@ -1516,6 +1516,11 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 > 说明：该轮（v0.3.0）验收时 SEC-T1（数据面 TLS）、SEC-A2（服务名归属）、SEC-D3（UDP 反伪造）
 > **不在当轮范围**；其中 T1/A2 已在 v0.4.0 修复，D3 已在 v0.5.0 用 DTLS-PSK 修复。
 > 历史记录与残差见 README §10.1、`docs/architecture.md` §7.10；完整安全审查报告（含可复现攻击步骤）不随仓库发布，本地保留在 `docs/review-security.md`。
+>
+> 该文件的**入库历史已于 v0.5.1 之后整体改写**（`git filter-branch` 从全部提交移除后
+> force-push，tag 一并重写，所有 commit hash 已变化）。注意两点：① 改写前 clone/fork 过的
+> 副本仍保有旧对象；② GitHub 对**悬空对象**按 SHA 的保留有一段时间（实测旧 SHA 仍可
+> `git fetch`），要彻底清除需让 GitHub Support 回收，或删除仓库后同名重建。
 
 ### 13.20 阶段 8E：v0.5.0 / v0.5.1 验证记录
 
