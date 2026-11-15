@@ -661,7 +661,7 @@ sudo journalctl -u pairlink-relay -f
 ### 8.4 容器（Docker）
 
 ```bash
-docker build -t pairlink:v0.4.0 .
+docker build -t pairlink:v0.5.1 .
 docker compose -f deploy/docker-compose.yml up -d --build
 curl -fsS http://127.0.0.1:18080/ | grep -qi 'welcome to nginx' && echo 'e2e OK'
 docker compose -f deploy/docker-compose.yml down
@@ -669,12 +669,18 @@ docker compose -f deploy/docker-compose.yml down
 
 - 运行时 `gcr.io/distroless/static-debian12:nonroot`（uid 65532），`CGO_ENABLED=0` 静态编译；
 - 容器内 `127.0.0.1` 是容器自己，不是宿主机；`examples/docker/*.ini` 管理页绑 `0.0.0.0`，宿主机用 `127.0.0.1:端口:端口` 限制来源；
-- **配置目录以读写方式挂载**（`../examples/docker:/etc/pairlink:rw`）：管理页写回 ini 需要
-  「临时文件 + rename」，单文件 `:ro` 挂载做不到。容器以 uid 65532 运行，宿主机需
-  `sudo chown -R 65532:65532 examples/docker`（或 `chmod 0775` + 同组），否则页面保存报权限错误；
-  根文件系统仍保持 `read_only: true`（P1-1）；
+- **容器里管理页是只读的**（v0.5.1 实测）：`manage_listen=0.0.0.0` 属于"非回环 → 只读"策略，
+  页面显示红色横幅，写接口一律 **403**（`admin_action_denied`）。改容器配置请改宿主机
+  `examples/docker/*.ini` 后 `docker compose restart <服务>`；
+- compose 仍以**目录读写挂载**（`../examples/docker:/etc/pairlink:rw`）提供配置：这不是当前
+  只读页面的必需项，而是为 `--network host` + `manage_listen=127.0.0.1` 这类可写场景保留
+  （管理页写回走「临时文件 + rename」，单文件 `:ro` 挂载做不到）；该场景下宿主机需
+  `sudo chown -R 65532:65532 examples/docker`。根文件系统始终 `read_only: true`（P1-1）；
 - 只映射管理页 17090/17091/17092 与演示入口 18080；
-- **镜像未在开发机验证（无容器运行时）**，验证命令与限制见 `deploy/README.md`。
+- **已在 WSL2 + Docker Engine 29.1.3 / Compose 2.40.3 实跑（v0.5.1）**：镜像 21.4MB、
+  `nonroot`、四容器 Up、三管理页 200、18080 取到 nginx 首页；Docker Hub 直连不可用，
+  镜像经 daocloud 源拉取，`golang:1.24-alpine` 因上游限流改用本地 Go 1.24.4 组装同 tag 替身。
+  细节与复现命令见 `deploy/README.md` §5.4。
 
 ---
 
@@ -766,9 +772,9 @@ docker compose -f deploy/docker-compose.yml down
     完整命令与数字见 §13.17；30–60 分钟长时间稳定性仍需在目标环境复跑。
 16. **端口分配**：e2e 使用"bind :0 → 关闭 → 重新绑定"策略，存在极小的 TOCTOU 窗口；
     真实部署请固定端口。
-17. **容器镜像未在本仓库开发机验证**：本机无 Docker/Podman，`Dockerfile` 与
-    `deploy/docker-compose.yml` 只做了静态审查与 `CGO_ENABLED=0` 等价编译；首次
-    `docker build` / `docker compose up` 需在有容器运行时的机器按 `deploy/README.md` 复核。
+17. **容器镜像已验证（v0.5.1，WSL2 + Docker 29.1.3）**：此前本机无容器运行时，`Dockerfile` 与
+    `deploy/docker-compose.yml` 只做过静态审查；v0.5.1 实测多阶段构建 + compose 四容器编排通过
+    （镜像 21.4MB / nonroot / 三管理页 200 / 18080 取到 nginx 首页）。注意 Docker Hub 直连不可用，
 18. **容器内 127.0.0.1 不是宿主机**：容器模板把管理页绑 `0.0.0.0` 以配合端口映射，
     宿主机侧用 `127.0.0.1:端口` 限制来源；不要把管理页映射到 `0.0.0.0` 公网。
 
@@ -1407,7 +1413,7 @@ go test ./test/... -v -count=1  # ok 21.701s；27 个顶层 --- PASS、0 个 ---
   - WSL2：只装 relay 时 `pairlink-agent` 报 `could not be found`、`agent.ini` 不存在；
     管理页 17090 返回 200；无残留 unit 才删共享二进制；agent unit 仍在时卸载 relay 保留二进制。
   - 逐条断言与命令见 §13.18。
-- 未验证：Docker/Podman 构建与 compose、systemd 非 root `User=pairlink`、真实证书 TLS
+- 未验证：systemd 非 root `User=pairlink`、真实证书 TLS
   （Windows 管理员 SCM 生命周期已于 v0.5.1 补齐，见 §13.20）。
 
 ### 13.17 阶段 6C：运行期健壮性验证
@@ -1571,7 +1577,28 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 | 重复 `install` | exit **1**，提示"服务已存在，请先 uninstall"（幂等错误路径符合预期） |
 | 再 `uninstall` | exit 0，服务再次消失 |
 
-> 仍属环境限制、本轮未验证：Docker 构建/compose、公网 CA 正向路径、非 loopback 真实网络、
+**Docker 镜像构建 + compose 编排（v0.5.1，WSL2 Ubuntu 26.04）**：
+
+环境：WSL2 Ubuntu 26.04 / Docker Engine **29.1.3** / Compose **2.40.3**（`apt install docker.io
+docker-compose-v2`，systemd 托管）。仓库副本拷到 ext4（`/opt/pl-src`）后构建。
+
+| 步骤 | 结果 |
+| --- | --- |
+| 基础镜像 | Docker Hub 直连不可用（`registry-1.docker.io` 超时）；经 `docker.m.daocloud.io` 拉通 `nginx:1.27-alpine`、`gcr.m.daocloud.io` 拉通 `distroless/static-debian12:nonroot`；`golang:1.24-alpine` 因**上游限流**（`error from registry: 上游限流，请稍后重试`）三源均未拉通，改用本地 Go 1.24.4 工具链 + alpine 基座组装的**同 tag 替身镜像** |
+| `docker build -t pairlink:v0.5.1 .` | **成功**（13 步，含 `go mod download` 与 `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`；构建器为 legacy builder，本机未装 buildx） |
+| 镜像属性 | 大小 **21.4MB**；`user=nonroot:nonroot`；`entrypoint=[/pairlink]`；`STOPSIGNAL=SIGTERM`；label `version=v0.5.1` |
+| 运行 | `docker run --rm pairlink:v0.5.1 -version` → `pairlink v0.5.1`；再加 `--read-only --cap-drop ALL --security-opt no-new-privileges` 仍正常 |
+| compose config | `docker compose config` 通过（4 处 `image: pairlink:v0.5.1`） |
+| compose up | 4 容器全部 Up；`docker top` 显示运行期 uid **65532**；`read_only=true`、`cap_drop=[ALL]`、`init=true` |
+| 三个管理页 | `/relay` `/status` `/client` 均 **200**，标题正确 |
+| 隧道端到端 | `curl 127.0.0.1:18080/` → **200** + `<title>Welcome to nginx!`；relay 日志 `pair_issue → pair_complete → data_open → data_close`，agent/client 双向字节数一致 |
+| 容器内管理页 | **只读**：横幅 ×10，`POST /action/kick` → **403** + 日志 `admin_action_denied`（`0.0.0.0` 绑定属"非回环即只读"策略，符合设计） |
+| `compose down` | 容器与网络清理干净 |
+
+> 局限：唯一未按上游原样使用的是 `golang:1.24-alpine` 基础镜像（限流所致）；Dockerfile 文本、
+> 构建步骤、distroless 运行时、compose 编排与端口映射均按仓库原样执行。
+
+> 本轮另补验了 Windows SCM 生命周期与 Docker 构建 + compose（见上两节）。仍属环境限制未验证：公网 CA 正向路径、非 loopback 真实网络、
 > 非 root `User=pairlink` 的 systemd 运行、长时间 soak（见 §13.14）。
 
 ## 14. 版本与许可证

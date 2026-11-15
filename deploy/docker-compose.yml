@@ -10,15 +10,16 @@
 # 说明：
 #   - 三个 PairLink 容器共用一个镜像（anchor x-pairlink），只读根文件系统、
 #     丢弃全部 Linux capabilities，以 distroless 的 nonroot（uid 65532）运行。
-#   - 配置从 examples/docker/*.ini **以目录方式读写挂载**：管理页的写操作
-#     （修改参数 / 服务增删改）用「临时文件 + rename」原地写回 ini，
-#     单文件 :ro 挂载不支持 rename，只能目录挂载。根文件系统仍保持只读。
-#     容器以 uid 65532 运行，宿主机目录必须对该 uid 可写（见下面各服务的注释）。
+#   - 配置从 examples/docker/*.ini **以目录方式挂载**：容器内 manage_listen 只能绑
+#     0.0.0.0，按既有策略页面是只读的（写接口 403），当前不需要写回；保留目录挂载
+#     是为了 `--network host` + manage_listen=127.0.0.1 这类可写场景（写回用
+#     「临时文件 + rename」，单文件 :ro 挂载做不到）。根文件系统仍保持只读。
 #   - 容器内 manage_listen 必须绑 0.0.0.0，再用下面的
 #     "127.0.0.1:宿主端口:容器端口" 把管理页限制为仅本机访问。
 #   - 只发布演示必需端口：三个管理页 + client 的 18080。
 #     要让宿主机外的 agent/client 接入 relay，再放开 17000/17001/17002。
-#   - 镜像未在本仓库开发机验证（无 Docker/Podman），详见 deploy/README.md。
+#   - v0.5.1 已在 WSL2 + Docker Engine 29.1.3 / Compose 2.40.3 实跑通过
+#     （四容器 Up / 三管理页 200 / 18080 经隧道取到 nginx 首页），详见 deploy/README.md §5.4。
 
 name: pairlink
 
@@ -42,8 +43,8 @@ services:
     container_name: pairlink-relay
     command: ['-relay', '-config', '/etc/pairlink/relay.ini']
     volumes:
-      # 目录读写挂载（管理页写回需要 rename）；宿主机先执行：
-      #   sudo chown -R 65532:65532 examples/docker
+      # 目录挂载（只为可写场景保留；容器内页面只读，当前无需 chown）
+      #   若用 --network host + 回环管理页，需先 sudo chown -R 65532:65532 examples/docker
       - ../examples/docker:/etc/pairlink:rw
       # 生产启用 TLS 时挂载证书，并确保容器用户 uid 65532 可读（建议 0644）：
       # - ../certs:/etc/pairlink/tls:ro
@@ -72,7 +73,7 @@ services:
     container_name: pairlink-agent
     command: ['-agent', '-config', '/etc/pairlink/agent.ini']
     volumes:
-      # 同上：目录读写挂载，便于管理页写回 agent.ini
+      # 同上：目录挂载（可写场景才需要，容器内页面只读）
       - ../examples/docker:/etc/pairlink:rw
     ports:
       - '127.0.0.1:17091:17091'
@@ -85,7 +86,7 @@ services:
     container_name: pairlink-client
     command: ['-client', '-config', '/etc/pairlink/client.ini']
     volumes:
-      # 同上：目录读写挂载，便于管理页写回 client.ini
+      # 同上：目录挂载（可写场景才需要，容器内页面只读）
       - ../examples/docker:/etc/pairlink:rw
     ports:
       # 管理页

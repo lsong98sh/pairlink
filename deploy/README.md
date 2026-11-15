@@ -263,22 +263,32 @@ docker compose down
 - 可选健康检查（不放进镜像）：用宿主机 curl 管理页，或在编排层加一个
   `curlimages/curl` sidecar 定期请求 `http://relay:17090/`；不要依赖 distroless 内的 shell。
 
-### 5.4 用户侧验证命令（本机未执行）
+### 5.4 用户侧验证命令（v0.5.1 已在 WSL2 + Docker Engine 29.1.3 实跑）
 
-> **未在本仓库开发机验证：本机没有 Docker/Podman 等任何容器运行时，镜像未构建、
-> compose 未启动。** 下面命令需在装有 Docker Engine + Compose v2 的机器上执行。
+> **实测环境（v0.5.1）**：WSL2 Ubuntu 26.04 + Docker Engine 29.1.3 / Compose v2.40.3。
+> Docker Hub 直连被墙，镜像经 `docker.m.daocloud.io` / `gcr.m.daocloud.io` 拉取；
+> `golang:1.24-alpine` 因上游限流未能拉通，改用**本地 Go 1.24.4 工具链组装的同 tag 替身镜像**
+> 完成构建验证（Dockerfile 的 `go mod download` / `go build` / distroless 阶段均真实执行）。
+> 结果：镜像 21.4MB、`user=nonroot:nonroot`、`-version` = `pairlink v0.5.1`、
+> `read_only` + `cap_drop: ALL` + `no-new-privileges` 下可运行；compose 四容器全部 `Up`，
+> 三个管理页 200，`http://127.0.0.1:18080/` 经 client→relay→agent 拿到 nginx 欢迎页。
 
 ```bash
-docker build -t pairlink:v0.3.1 .
-docker run --rm pairlink:v0.3.1 -version
-docker image inspect pairlink:v0.3.1 --format '{{.Config.User}} {{.Config.Entrypoint}}'
+docker build -t pairlink:v0.5.1 .
+docker run --rm pairlink:v0.5.1 -version
+docker image inspect pairlink:v0.5.1 --format '{{.Config.User}} {{.Config.Entrypoint}}'
 # 期望：nonroot:nonroot [/pairlink]
 
 docker compose -f deploy/docker-compose.yml up -d --build
-curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:17090/
+curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:17090/relay
 curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/
 docker compose -f deploy/docker-compose.yml down
 ```
+
+> **容器内管理页是只读的**（实测）：容器里 `manage_listen` 必须绑 `0.0.0.0`，而"非回环即只读"
+> 是既有安全策略，页面会显示红色横幅，所有写接口返回 **403**（日志 `admin_action_denied`）。
+> 因此 compose 的目录读写挂载目前**用不上**（保留只为将来可能的回环模式）；
+> 改容器配置请直接改宿主机 `examples/docker/*.ini`，然后 `docker compose restart <服务>`。
 
 ---
 
@@ -315,8 +325,8 @@ docker compose -f deploy/docker-compose.yml down
 | 按模式卸载与共享二进制（6F） | ✅ 通过 | 无残留 unit 才删 `/usr/local/bin/pairlink`；卸载 relay 时 agent unit 仍在 → 二进制保留、agent 仍 enabled |
 | 幂等 / 重复卸载（6F） | ✅ 通过 | 第二次 install 跳过二进制复制与配置覆盖；重复 `--uninstall` 退出 0；`--purge` 只删本模式 ini/证书 |
 | `--dry-run` / `--no-systemd`（6F） | ✅ 通过 | 非 root dry-run 只打印且不出现其它模式 unit 操作；`--no-systemd` 不放 unit、只放二进制与 ini |
-| Docker 镜像构建 / compose | ❌ **未验证** | 本机无 Docker/Podman；Dockerfile 仅做静态审查与 `CGO_ENABLED=0` 等价编译验证 |
-| Windows SCM 完整生命周期 | ❌ **未验证** | 开发机非管理员；仅验证了脚本语法、`#Requires` 拦截与 `-service` 错误路径 |
+| Docker 镜像构建 / compose | ✅ **通过（v0.5.1）** | WSL2 + Docker Engine 29.1.3 / Compose 2.40.3：多阶段构建成功（21.4MB，nonroot），`read_only`+`cap_drop:ALL` 可运行，compose 四容器 Up、三管理页 200、18080 经隧道取到 nginx 首页；镜像经 daocloud 镜像源拉取，`golang` 基础镜像因上游限流用本地 Go 1.24.4 组装同 tag 替身 |
+| Windows SCM 完整生命周期 | ✅ **通过（v0.5.1）** | 管理员提权会话实测 install/start/stop/uninstall、按日日志落盘、管理页 200、卸载后 `sc query` 1060（README §13.20）；`install-*.ps1` 脚本本身仍建议首次 `-WhatIf` |
 
 WSL 验证环境：Ubuntu（内核 6.18 WSL2）、systemd 259（`is-system-running` 报 `degraded`，
 但 unit 可正常启停）、Go 1.24.4。阶段 6D 的三 unit 验证使用 `git archive HEAD`（`65f7064`）
