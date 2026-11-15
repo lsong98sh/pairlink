@@ -21,6 +21,7 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -70,6 +71,14 @@ const (
 
 // errSessionExists 表示同一配对键已有活跃会话（重复 MsgIncoming）。
 var errSessionExists = errors.New("agent: 该配对键已有活跃会话")
+
+const (
+	// maxConcurrentIncoming 是 agent 同时处理的 MsgIncoming 数量上限（SEC-D2）。
+	//
+	// relay 可能一次性下发大量接入通知（正常并发配对或恶意洪泛）；超过后本期
+	// 通知直接丢弃并记 WARN，不无限起 goroutine、不 panic。
+	maxConcurrentIncoming = 256
+)
 
 // registeredService 是一条本机已注册服务的快照（管理页展示用）。
 type registeredService struct {
@@ -122,6 +131,13 @@ type agent struct {
 	tcpDataAddr string
 	udpDataAddr string
 
+	// dataMu 保护数据面 TLS 状态：握手阶段按 [server] data_tls 与
+	// HelloOK.data_tls 协商后写入，数据面 goroutine 与重连并发读取。
+	// dataTLSCfg 在 useTLS 时非 nil，且只读可复用。
+	dataMu     sync.RWMutex
+	dataTLS    bool
+	dataTLSCfg *tls.Config
+
 	// svcStore 是运行期可变的本地服务表（阶段 7：管理页可增删改）。
 	svcStore *serviceStore
 	// regMu 串行化管理页的服务变更（注册/注销是请求-应答事务，不能交错）。
@@ -132,6 +148,9 @@ type agent struct {
 
 	sessions *sessionTable
 	carrier  *carrierManager
+
+	// incomingSem 是并发处理 MsgIncoming 的信号量（容量 maxConcurrentIncoming）。
+	incomingSem chan struct{}
 
 	adminSrv *admin.Server
 
@@ -182,6 +201,8 @@ func newAgent(ctx context.Context, cfg *config.Config, log *slog.Logger) *agent 
 		cancel:   cancel,
 		sessions: newSessionTable(),
 		svcStore: newServiceStore(cfg.Server.All()),
+		// SEC-D2：限制并发处理的 MsgIncoming 数量（信号量容量即上限）。
+		incomingSem: make(chan struct{}, maxConcurrentIncoming),
 	}
 	a.carrier = newCarrierManager(a)
 	return a
@@ -338,6 +359,21 @@ func (a *agent) setDataAddrs(tcpAddr, udpAddr string) {
 	a.tcpDataAddr = tcpAddr
 	a.udpDataAddr = udpAddr
 	a.addrMu.Unlock()
+}
+
+// dataTLSSnapshot 返回数据面是否 TLS 及对应配置（明文时 cfg 为 nil）。
+func (a *agent) dataTLSSnapshot() (bool, *tls.Config) {
+	a.dataMu.RLock()
+	defer a.dataMu.RUnlock()
+	return a.dataTLS, a.dataTLSCfg
+}
+
+// setDataTLS 发布本次连接协商出的数据面 TLS 状态。
+func (a *agent) setDataTLS(useTLS bool, cfg *tls.Config) {
+	a.dataMu.Lock()
+	a.dataTLS = useTLS
+	a.dataTLSCfg = cfg
+	a.dataMu.Unlock()
 }
 
 // resetRegisteredServices 清空已注册服务快照（每次（重）连接重新注册前调用）。
@@ -497,7 +533,8 @@ func (a *agent) handleIncoming(msg *protocol.Incoming) {
 	}
 	key, err := pairing.ParsePairingKey(msg.PairingKey)
 	if err != nil {
-		a.log.Warn("接入通知的配对键非法，已忽略", "event", "incoming", "pairing_key", msg.PairingKey, "err", err)
+		a.log.Warn("接入通知的配对键非法，已忽略", "event", "incoming",
+			"pairing_key", logx.CleanN(msg.PairingKey, logx.MaxAttrLen), "err", err)
 		return
 	}
 	svc, ok := a.svcStore.get(key.ServiceID)
@@ -508,7 +545,7 @@ func (a *agent) handleIncoming(msg *protocol.Incoming) {
 	}
 	if msg.Role != "" && msg.Role != protocol.RoleAgent {
 		a.log.Warn("接入通知的角色不是 agent，已忽略", "event", "incoming",
-			"pairing_key", key.String(), "detail", "role="+msg.Role)
+			"pairing_key", key.String(), "detail", "role="+logx.CleanN(msg.Role, logx.MaxAttrLen))
 		return
 	}
 	if msg.PairingToken == "" {
@@ -521,7 +558,7 @@ func (a *agent) handleIncoming(msg *protocol.Incoming) {
 	if msg.Proto != "" && msg.Proto != proto {
 		// 本地目标协议由 ini 决定（决定怎么拨号），因此按本机配置处理并告警。
 		a.log.Warn("接入通知的协议与本机服务配置不一致，按本机配置处理", "event", "incoming",
-			"pairing_key", key.String(), "detail", msg.Proto+" != "+proto)
+			"pairing_key", key.String(), "detail", logx.CleanN(msg.Proto, logx.MaxAttrLen)+" != "+proto)
 	}
 
 	sess := newLocalSession(key, proto, svc.Addr)
@@ -533,7 +570,7 @@ func (a *agent) handleIncoming(msg *protocol.Incoming) {
 		"pairing_key", key.String(),
 		"service_id", svc.ID,
 		"proto", proto,
-		"remote", msg.ClientAddr,
+		"remote", logx.CleanN(msg.ClientAddr, logx.MaxAttrLen),
 		"detail", "local="+svc.Addr,
 	)
 

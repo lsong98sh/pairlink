@@ -1,10 +1,12 @@
 package relay
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,9 +99,41 @@ func (l *TCPDataListener) acceptLoop() {
 		l.srv.wg.Add(1)
 		go func() {
 			defer l.srv.wg.Done()
+			host, ok, reason := l.srv.conns.acquire(conn.RemoteAddr())
+			if !ok {
+				// SEC-D2：TCP 数据面同样受 max_conns / max_conns_per_ip 限制。
+				if !l.srv.conns.warnLimited(l.srv.log, conn.RemoteAddr(), reason) {
+					l.srv.log.Debug("TCP 数据面连接被连接上限拒绝",
+						"event", "conn_reject", "reason", reason,
+						"remote", conn.RemoteAddr().String())
+				}
+				_ = conn.Close()
+				return
+			}
+			defer l.srv.conns.release(host)
 			l.srv.handleDataConn(conn)
 		}()
 	}
+}
+
+// isTLSHandshakeError 报告 err 是否来自 TLS 握手（含"明文连 TLS 端口"）。
+//
+// data_tls 生效时，旧 agent/client 会用明文连数据面；crypto/tls 在这种情况下
+// 返回 tls.RecordHeaderError（首字节不是 TLS 记录）或对端 alert。
+func isTLSHandshakeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var record tls.RecordHeaderError
+	if errors.As(err, &record) {
+		return true
+	}
+	var alert tls.AlertError
+	if errors.As(err, &alert) {
+		return true
+	}
+	msg := err.Error()
+	return strings.HasPrefix(msg, "tls:") || strings.Contains(msg, "tls: first record")
 }
 
 // handleDataConn 处理一条 TCP 数据面连接。
@@ -128,8 +162,20 @@ func (s *server) handleDataConn(conn net.Conn) {
 		log.Debug("设置数据面读超时失败", "event", "bind_fail", "err", err)
 		return
 	}
-	typ, payload, err := protocol.ReadFrame(conn)
+	// 报到帧只有 ~200 字节；这里用 64 KiB 网络上限而不是 MaxPayload(1 MiB)，
+	// 避免对端只发 5 字节帧头声明 1 MiB 就让本端按声明值预分配（SEC-D1 / P0-1）。
+	typ, payload, err := protocol.ReadFrameWithLimit(conn, protocol.NetworkPayloadLimit)
 	if err != nil {
+		if isTLSHandshakeError(err) {
+			// data_tls 生效时，旧 agent/client（忽略 HelloOK.data_tls）会用明文
+			// 连 TLS 端口：这里必须留下明确 WARN，便于运维定位"为什么旧端连不上"。
+			log.Warn("数据面 TLS 握手失败（对端可能是忽略 data_tls 的旧 agent/client，或用明文连了 TLS 端口）",
+				"event", "data_plane_tls_handshake_fail",
+				"err", err,
+				"detail", "启用 data_tls 要求 relay/agent/client 三端 ≥ v0.4.0",
+			)
+			return
+		}
 		log.Debug("数据面报到读取失败",
 			"event", "bind_fail",
 			"err", err,
@@ -206,7 +252,10 @@ func (s *server) handleTCPBind(conn net.Conn, bind *protocol.Bind, log *slog.Log
 		// 对端先到，本条连接完成配对；由本 goroutine 负责双向转发。
 		if !w.claim() {
 			// 等待方已超时/被取消：它已经或即将关闭自己的连接，这里直接放弃。
+			// P3-8：同时移除配对占位，避免该键在最长 pair_timeout 内继续返回
+			// already_paired（Remove 幂等，超时分支也会调用）。
 			s.releaseWait(key, w)
+			s.pairs.Remove(key)
 			closePairPeers(pair)
 			return false
 		}

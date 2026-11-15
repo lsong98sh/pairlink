@@ -47,10 +47,25 @@ type Event struct {
 	At time.Time
 }
 
+// maxRecentOwners 是"最近断开归属"表的容量上限；超出后淘汰最旧记录（SEC-A2）。
+const maxRecentOwners = 1024
+
+// recentOwner 是某个服务名最后一个已知归属（含断开时间）。
+//
+// 在线表仍是"注销即删除"的原有语义；本表只在服务被移除/换主时留下痕迹，
+// 供 relay 判定"异 owner 接管"是抢占（原 owner 在线）还是自愈（原 owner 已离线）。
+type recentOwner struct {
+	// AgentID 是最后一个注册该服务的 agent 会话 ID。
+	AgentID string
+	// At 是记录时间（服务被注销或改属的时刻）。
+	At time.Time
+}
+
 // ServiceRegistry 是并发安全的服务注册表，键为服务ID。
 type ServiceRegistry struct {
 	mu        sync.RWMutex
 	services  map[string]ServiceEntry
+	recent    map[string]recentOwner
 	revision  uint64
 	subs      map[int]func(Event)
 	nextSubID int
@@ -61,6 +76,7 @@ type ServiceRegistry struct {
 func NewServiceRegistry() *ServiceRegistry {
 	return &ServiceRegistry{
 		services: make(map[string]ServiceEntry),
+		recent:   make(map[string]recentOwner),
 		subs:     make(map[int]func(Event)),
 		now:      time.Now,
 	}
@@ -90,7 +106,12 @@ func (r *ServiceRegistry) Register(e ServiceEntry) error {
 	if e.RegisteredAt.IsZero() {
 		e.RegisteredAt = now
 	}
-	_, existed := r.services[e.ID]
+	old, existed := r.services[e.ID]
+	// 换主时保留旧归属痕迹（跨 owner 覆盖只可能发生在 relay 已判定"原 owner
+	// 离线、允许接管"之后），供审计/管理页显示"最近归属"。
+	if existed && old.AgentID != "" && old.AgentID != e.AgentID {
+		r.rememberLocked(e.ID, old.AgentID, now)
+	}
 	r.services[e.ID] = e
 	r.revision++
 	rev := r.revision
@@ -121,14 +142,74 @@ func (r *ServiceRegistry) Unregister(serviceID, agentID string) error {
 		return ErrServiceOwnerMismatch
 	}
 	delete(r.services, serviceID)
+	now := r.now()
+	if e.AgentID != "" {
+		r.rememberLocked(serviceID, e.AgentID, now)
+	}
 	r.revision++
 	rev := r.revision
-	now := r.now()
 	subs := r.subscribersLocked()
 	r.mu.Unlock()
 
 	r.dispatch(subs, Event{Type: EventRemoved, Service: e, Revision: rev, At: now})
 	return nil
+}
+
+// rememberLocked 记录某服务名的最近归属；容量满时淘汰最旧记录。
+//
+// 调用方必须持有 r.mu。重复记录同一服务即刷新时间并保留最新 owner。
+func (r *ServiceRegistry) rememberLocked(serviceID, agentID string, at time.Time) {
+	if serviceID == "" || agentID == "" {
+		return
+	}
+	if r.recent == nil {
+		r.recent = make(map[string]recentOwner)
+	}
+	if _, exists := r.recent[serviceID]; !exists && len(r.recent) >= maxRecentOwners {
+		oldestID := ""
+		var oldestAt time.Time
+		for id, rec := range r.recent {
+			if oldestID == "" || rec.At.Before(oldestAt) {
+				oldestID, oldestAt = id, rec.At
+			}
+		}
+		delete(r.recent, oldestID)
+	}
+	r.recent[serviceID] = recentOwner{AgentID: agentID, At: at}
+}
+
+// RecentOwner 返回某服务名最后一个已知归属与记录时间。
+//
+// ok=false 表示没有历史记录（从未注册过，或记录已被容量淘汰）。
+// 该表只用于 relay 的归属判定与审计，不参与在线服务列表。
+func (r *ServiceRegistry) RecentOwner(serviceID string) (agentID string, at time.Time, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.recent[serviceID]
+	if !ok {
+		return "", time.Time{}, false
+	}
+	return rec.AgentID, rec.At, true
+}
+
+// RecentOwnerCount 返回"最近归属"表的记录数（管理页/测试用）。
+func (r *ServiceRegistry) RecentOwnerCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.recent)
+}
+
+// RememberOwner 补记某服务名的最近归属（at 为零时取当前时间）。
+//
+// relay 在"在线表仍有记录但历史表没有"的接管路径上补一条，保证 service_takeover
+// 事件与审计有来源。容量语义与 Unregister 的记录一致。
+func (r *ServiceRegistry) RememberOwner(serviceID, agentID string, at time.Time) {
+	if at.IsZero() {
+		at = r.now()
+	}
+	r.mu.Lock()
+	r.rememberLocked(serviceID, agentID, at)
+	r.mu.Unlock()
 }
 
 // UnregisterAgent 注销某个 agent 的全部服务，返回被移除的服务ID（升序）。

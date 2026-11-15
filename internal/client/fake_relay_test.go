@@ -31,6 +31,8 @@ type fakeRelayOptions struct {
 	// listFn 非 nil 时按「第几条隧道连接」（从 1 开始）返回服务列表，
 	// 用于模拟 relay 重启后 revision 归零/服务变化。
 	listFn func(connIndex int) (services []protocol.ServiceInfo, revision uint64)
+	// dataTLS 是 HelloOK.data_tls；nil 表示模拟 v0.3.1 旧 relay（未下发该字段）。
+	dataTLS *bool
 }
 
 // relayFrame 是假 relay 收到的控制面消息。
@@ -215,6 +217,7 @@ func (r *fakeRelay) serveTunnel(conn net.Conn) {
 		Version:          r.opts.helloVersion,
 		HeartbeatSeconds: 30,
 		UDPMode:          r.opts.udpMode,
+		DataTLS:          r.opts.dataTLS,
 	}
 	if !r.opts.noDataPorts {
 		helloOK.TCPDataPort = portOf(r.dataLn.Addr().String())

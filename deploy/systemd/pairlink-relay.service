@@ -25,6 +25,12 @@ Type=simple
 #   sudo chown -R root:pairlink /etc/pairlink && sudo chmod 0750 /etc/pairlink
 #   sudo chmod 0640 /etc/pairlink/*.ini /etc/pairlink/tls/* 2>/dev/null || true
 # 然后取消下面两行注释。relay 端口 7000/7001/7002 均 > 1024，普通用户可直接绑定。
+#
+# 需要管理页写回 ini（修改参数/服务增删改）时，服务用户必须对配置目录可写：
+#   sudo chown -R pairlink:pairlink /etc/pairlink   # 或保持 root:pairlink 并把目录设为 2775
+#   sudo chmod 2775 /etc/pairlink && sudo chmod 0660 /etc/pairlink/*.ini
+# 否则页面保存会因 rename 失败报错（配置目录只读）。
+# 注意：组可写 + ReadWritePaths 只放宽到 /etc/pairlink，不放开整个文件系统。
 #User=pairlink
 #Group=pairlink
 ExecStart=/usr/local/bin/pairlink -relay -config /etc/pairlink/relay.ini
@@ -42,8 +48,11 @@ SyslogIdentifier=pairlink-relay
 
 # ---- 适度加固（如需排障可临时 systemctl edit 覆盖）----
 NoNewPrivileges=true
-# 整个文件系统只读；/etc/pairlink 依然可读，证书无需额外放行。
+# 整个文件系统只读；/etc/pairlink 需可读写：管理页的'修改参数/服务增删改'会把 ini
+# 原地写回（写临时文件 + rename），只读会让页面保存失败（P1-1）。
+# 未启用写页面时可把下一行改成 #ReadWritePaths=/etc/pairlink。
 ProtectSystem=strict
+ReadWritePaths=/etc/pairlink
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

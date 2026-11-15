@@ -1,11 +1,13 @@
 package client
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // dataAddr 按 docs/contract.md §4.5 推导 relay 数据面拨号地址。
@@ -33,7 +35,11 @@ func dataAddr(host string, port int, fallbackListen string) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
-// dialTCPData 连接 relay 的 TCP 数据面（明文哑管道，永远不包 TLS）。
+// dialTCPData 连接 relay 的 TCP 数据面。
+//
+// 本次连接是否包 TLS 由握手阶段协商（[client] data_tls × HelloOK.data_tls），
+// 使用与隧道相同的 CA / insecure / SNI 规则；明文场景与 v0.3.1 行为一致。
+// TCP 透传与 UDP over TCP 承载都走这里，保证两条路径加密语义一致。
 func (c *client) dialTCPData() (net.Conn, error) {
 	neg := c.negotiated()
 	if neg.tcpDataErr != nil {
@@ -42,10 +48,29 @@ func (c *client) dialTCPData() (net.Conn, error) {
 	if neg.tcpDataAddr == "" {
 		return nil, errors.New("client: TCP 数据面地址未解析")
 	}
-	d := &net.Dialer{Timeout: c.dialTimeout()}
-	conn, err := d.DialContext(c.ctx, "tcp", neg.tcpDataAddr)
+	if neg.dataTLS && neg.dataTLSCfg == nil {
+		return nil, permanent(errors.New("client: 数据面要求 TLS 但本端 TLS 配置缺失（内部状态异常）"))
+	}
+	timeout := c.dialTimeout()
+	d := &net.Dialer{Timeout: timeout}
+	raw, err := d.DialContext(c.ctx, "tcp", neg.tcpDataAddr)
 	if err != nil {
 		return nil, fmt.Errorf("client: 连接 relay TCP 数据面 %s: %w", neg.tcpDataAddr, err)
 	}
-	return conn, nil
+	if !neg.dataTLS {
+		return raw, nil
+	}
+	tconn := tls.Client(raw, neg.dataTLSCfg)
+	_ = tconn.SetDeadline(time.Now().Add(timeout))
+	if err := tconn.HandshakeContext(c.ctx); err != nil {
+		_ = raw.Close()
+		// 数据面握手失败几乎总是配置不匹配（CA/SNI 不对，或 relay 实际未开 TLS）。
+		return nil, permanent(fmt.Errorf(
+			"client: 数据面 TLS 握手失败（relay 要求数据面 TLS：请检查本端 data_tls / tls_ca / tls_insecure_skip_verify 是否与 relay 证书匹配，relay 日志中可见 data_plane_tls_handshake_fail）: %w", err))
+	}
+	if err := tconn.SetDeadline(time.Time{}); err != nil {
+		_ = tconn.Close()
+		return nil, err
+	}
+	return tconn, nil
 }

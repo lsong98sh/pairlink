@@ -296,6 +296,12 @@ type carrier struct {
 | `component` | string | `logx.Component` 附加，如 `tunnel`/`tcp-data`/`udp-data`/`admin` |
 | `detail` | string | 补充信息（配置警告等） |
 
+**SEC-M2 日志卫生（阶段 8C）**：任何**对端可控**的字符串（`MsgHello.client_name`、对端声明的
+`agent_id`/`client_name`、`MsgError.code/message/detail`、`MsgKicked.reason`、管理页 `Host`/`Origin`）
+写日志前必须经 `logx.CleanN(s, 64)`：替换非法 UTF-8 → `?`、删除 `unicode.IsControl`（含 `\n\r\t\0`）、
+按 rune 截断到 64 字符并追加 `…`。这样 1 MiB 的 `client_name` 只会产生一行 < 512 B 的日志，
+既防日志放大，也防 `\n` 伪造日志行。**不要**把原始值直接交给 `slog`。
+
 建议事件名（阶段 2 沿用，保持可检索）：
 
 `start`、`exit`、`config_warning`、`admin_start`、`tunnel_accept`、`hello_ok`、`auth_failed`、
@@ -303,7 +309,10 @@ type carrier struct {
 `subscribe`、`service_resync`、`connect_request`、`pair_issue`、`bind_ok`、`bind_fail`、
 `pair_complete`、`pair_timeout`、`pair_replay`、`data_addr`、`data_open`、`data_close`、
 `idle_timeout`、`udp_session_open`、`udp_session_close`、`udp_evict`、`heartbeat_timeout`、
-`kick`、`server_shutdown`、`service_start`、`service_stop`。
+`kick`、`server_shutdown`、`service_start`、`service_stop`、
+`conn_reject`（SEC-D2 超限，5s 限速）、`incoming_drop`（agent 并发通知超限）、
+`bind_dup_drop`（重复报到丢弃）、`carrier_read_timeout`（承载半帧读超时）、
+`admin_denied`（Host/Origin/CSRF 校验失败）、`admin_action`/`admin_action_failed`（审计）。
 
 日志级别约定：
 
@@ -327,9 +336,20 @@ type carrier struct {
 
 ### 7.3 管理页 HTML 组织
 
-`internal/admin` 提供统一布局（内联 CSS、utf-8、顶栏 mode/version/运行时长、1s 自动刷新
-可关闭）与页面注册机制；每个模式只写主体 HTML（`<section>` 片段），不重复写 `<html>`。
+`internal/admin` 提供统一布局（内联 CSS、utf-8、顶栏 mode/version/运行时长、刷新开关）与页面
+注册机制；每个模式只写主体 HTML（`<section>` 片段），不重复写 `<html>`。
 写操作只有 `Action`（默认 POST + 一次性 CSRF 令牌），第一阶段唯一写操作是 relay 的踢出。
+
+**P1-2 刷新策略**：只读页默认 `1s` 自动刷新；**可写实例或页面正文含 `<form` 时默认暂停**
+（否则整页重载会清空正在输入的表单），顶栏链接 `?refresh=1` 恢复、`?refresh=0` 强制关闭。
+
+**SEC-M1 写 Action 门禁**（`internal/admin/guard.go`）：在任何写 Action 执行前校验
+`Host` ∈ {`127.0.0.1[:port]`, `[::1][:port]`, `localhost[:port]`}，且 `Origin`（若存在）
+必须等于 `http://` + 同一 Host；失败回 403 并记 `admin_denied`。所有响应（含 404）统一加
+CSP `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`、
+`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、
+`Cache-Control: no-store`。`/debug/pprof/*` 单独放宽 `script-src 'unsafe-inline'`/`img-src`
+（否则 pprof 图表不可用），业务页面策略不变。这层与"manage_listen 必须回环"共同构成管理页边界（没有账号体系）。
 
 ### 7.4 令牌与超时策略
 
@@ -357,8 +377,9 @@ TLS 是否启用由**三层**决定，优先级从高到低：
 | `tls` | 证书材料 | 结果 |
 | --- | --- | --- |
 | `auto`（默认） | `tls_cert` + `tls_key` 均非空 | `tls.Listen`（TLS 1.2+） |
-| `auto` | 都为空 | 明文 + WARN |
-| `auto` | 只有一个 | 明文 + WARN（必须成对） |
+| `auto` | 都为空，且监听**非回环** | **启动校验失败**（SEC-T2：必须配置证书或显式 `tls = false`） |
+| `auto` | 都为空，且监听回环 | 明文 + WARN（仅本机调试） |
+| `auto` | 只有一个 | 明文 + WARN（必须成对）；非回环时同样是**启动校验失败** |
 | `true` | `tls_cert` + `tls_key` 均非空 | `tls.Listen`（TLS 1.2+） |
 | `true` | 任一为空 | **启动校验失败**（配置错误，提示补 `tls_cert`/`tls_key`） |
 | `false` | 任意（含已配证书） | 明文；配了证书则 WARN（"证书被忽略"） |
@@ -384,7 +405,49 @@ TLS 是否启用由**三层**决定，优先级从高到低：
 - 两侧配置不匹配（relay 明文而 agent/client TLS，或反之）→ TLS 握手失败（relay 侧表现为
   读帧失败），agent/client 的 `Run` 返回可读错误并退出；TLS 握手失败按永久错误处理（不重连），
   不做协议探测/自动降级。
-- 数据面永远是明文哑管道（端到端加密由第三方协议自己完成）。
+- 数据面 TLS 由 `data_tls` 三态控制（阶段 8D / SEC-T1，见下一节）：默认跟随隧道判定，
+  TCP 数据面（含 `MsgBind`/`pairing_token`/业务字节/udp-over-tcp 承载）复用隧道证书；
+  原生 UDP 仍是明文（无 DTLS）。端到端加密仍由第三方协议自己完成。
+- **SEC-A1**：`auth_token` 为空时只允许回环来源接入（`127.0.0.0/8`/`::1`），非回环回
+  `auth_failed`；非回环 `tunnel_listen` + 空 token 启动校验失败。比较用 SHA-256 + 常量时间。
+- **SEC-T2**：`auto`/未写 + 非回环 `tunnel_listen` + 无成对证书 = 启动失败，错误信息明确给出
+  "配置证书"或"显式 `tls = false` 承担明文风险"两个选项；回环监听保持 WARN。
+- agent/client 的 `auto` 无 CA 明文路径会 WARN："当前明文连接 relay；公网部署请 tls = true"。
+  这是刻意的可见降级，不能静默。
+
+#### 数据面 TLS 连接建立路径（阶段 8D / SEC-T1）
+
+```
+relay 启动:
+  prepareTLS()
+    tunnelTLS = tls=true || (auto && cert+key)
+    dataTLS   = auto ? tunnelTLS : data_tls
+    tlsCfg    = 证书 + MinVersion 1.2（隧道与数据面共用）
+  tcp_listen → plain listener 或 tls.Listen(tlsCfg)
+  HelloOK{data_tls: dataTLS}（始终下发，含 false）
+
+agent/client 握手:
+  tls 决定隧道（auto/true/false，沿用 §7.6）
+  HelloOK.data_tls:
+    auto  → 跟随（nil = 旧 relay → 明文 + WARN）
+    true  → 必须 TLS；nil/false → permanent error
+    false → 强制明文；true → permanent error
+  dataTLSCfg = config.ClientTLSConfig(tls_ca, insecure, host)（与隧道同一份）
+
+数据面拨号:
+  tcpDataAddr（HelloOK.tcp_data_port）
+  dataTLS ? tls.Client(handshake, MinVersion 1.2) : 裸 TCP
+  → MsgBind 报到 / 业务字节 / udp-over-tcp 承载帧都在同一 TLS 连接内
+```
+
+- relay 的 accept 循环不做握手（`tls.Listener` 语义），明文连接在 `handleDataConn` 首次读帧时
+  握手失败 → 关闭并 WARN `event=data_plane_tls_handshake_fail`；该日志是"旧端连新 relay"的
+  主要诊断信号。
+- 原生 UDP（`udp_mode = native`）不受 `data_tls` 影响，仍是明文（无 DTLS）；需要加密 UDP
+  时应使用 `udp_mode = tcp_tunnel`，其承载帧随 TCP 数据面 TLS 一起加密。
+- 归属状态来源（SEC-A2）：在线 owner 取 `ServiceRegistry`（`AgentID`）；在线判定取
+  `AgentRegistry.Get` + 心跳判死；最近归属取 `ServiceRegistry.recent`（注销/换主时记录，
+  容量 1024、最旧淘汰）。三者都在 relay 内存中，重启即丢失（与既有内存态语义一致）。
 
 > **兼容性**：默认 `auto` 与阶段 6 之前 100% 一致，旧 ini 不改一个字也能跑。
 > 注意 `auto` 下"没配 `tls_ca` = 明文"仍是历史行为；新部署建议显式写 `tls = true`，
@@ -465,6 +528,34 @@ POST /action/<name> + 一次性 CSRF
 **协议**：agent 增删服务新增 0x13/0x14（`docs/protocol.md` §4.15），不升版本；
 `agent.controlConn` 用"单在途请求 + 确认通道"把 relay 的注册/注销确认从 `controlLoop`
 交给管理页 goroutine（`agent.regMu` 串行化），控制连接关闭/重连时唤醒等待方并回滚。
+
+### 7.10 安全边界与阶段 8C 的限流/配额
+
+**帧长度**（SEC-D1/P0-1）：网络入口统一 `ReadFrameWithLimit(conn, NetworkPayloadLimit=64 KiB)`；
+`ParseFrameLimit(data, limit)` 只用于"已完整读入内存的 UDP 数据报"，要求声明长度 == 实际长度；
+`MaxPayload=1 MiB` 只用于 `EncodeFrame` 等内存路径。对端用 5 字节帧头声明大长度不会触发分配。
+
+**连接/配额**（SEC-D2，`internal/relay/connlimit.go`、`internal/agent/control.go`）：
+
+| 限制 | 默认 | 作用点 | 超限行为 |
+| --- | --- | --- | --- |
+| `max_conns` | 1024 | 隧道 accept + TCP 数据面 accept | 立即 `Close`，WARN `conn_reject`（5s 限速） |
+| `max_conns_per_ip` | 128 | 同上（按 `remoteHost` 归一） | 同上 |
+| `max_pending_pairs` | 4096 | `ConnectRequest`（配对占位 `pairs.Len()` + 未消费令牌 `tokens.Len()`） | `MsgError{code:"too_many_pending"}` |
+| 单连接未完成请求 | 64 | `tunnelConn.pending`（按配对键占用，消费/超时释放） | `too_many_pending` |
+| agent 并发 `MsgIncoming` | 256 | `agent.incomingSem` | 丢弃通知，WARN `incoming_drop` |
+| 承载帧读超时 | `max(30s, 2×udp_session_timeout)` | `carrierConn.readLoop` 逐帧 deadline | 关连接 + 清理该连接全部会话（SEC-M4） |
+
+**日志限速**：`conn_reject`、UDP 鉴权失败 `bind_fail` 均 5 秒最多一条 WARN（其余降 Debug），
+避免未认证流量放大日志（P2-1/P2-2）。
+
+**阶段 8C/8D 的安全边界**（详见 README §10.1，`docs/review-security.md` 顶部）：
+
+| 编号 | 风险 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| SEC-T1 | 数据面（TCP）无 TLS，公网明文 | **已修复（v0.4.0）** | `data_tls` 三态，TCP 数据面复用隧道证书与 TLS 1.2；原生 UDP 仍无 DTLS（`udp_mode=native` 明文，建议 `tcp_tunnel`） |
+| SEC-A2 | 服务名先注册者得，可被抢占 | **已修复（v0.4.0）** | `service_allow` 白名单 + `max_services_per_agent` + 在线归属/离线接管；未配白名单仅 WARN |
+| SEC-D3 | 原生 UDP 会话可被源地址伪造/抢注 | 未修复 | 缩短 `token_ttl`；敏感场景改用 `udp_mode = tcp_tunnel`；UDP 端口 ACL；计划引入 UDP cookie/DTLS |
 
 ## 8. 可观测性
 

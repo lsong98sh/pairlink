@@ -87,6 +87,10 @@ sudo journalctl -u pairlink-relay -f
   `PrivateDevices`、`ProtectKernel*`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK`、
   `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` 等。`/etc/pairlink` 在 `strict` 下仍可读，
   证书无需额外 `ReadOnlyPaths`。
+- **P1-1 配置目录写回**：unit 在 `ProtectSystem=strict` 旁加了 `ReadWritePaths=/etc/pairlink`，
+  因为管理页写回 ini 用「同目录临时文件 + rename」，全只读会失败。启用 `User=pairlink` 时
+  还需要 `/etc/pairlink` 对该用户可写（`chmod 2775` 或 `chown -R pairlink:pairlink`）；
+  不用页面写回时可注释掉 `ReadWritePaths` 恢复全盘只读。
 - `User=pairlink` / `Group=pairlink` 默认**注释掉**（即 root 运行）；启用方法与权限要求见
   [`deploy/systemd/README.md`](systemd/README.md)。unit 保留了 `CAP_NET_BIND_SERVICE`，
   非 root 绑低端口也能用。
@@ -208,20 +212,24 @@ sudo ./deploy/linux/install-relay.sh --uninstall --purge
 
 ```bash
 # 仓库根目录
-docker build -t pairlink:v0.3.0 .
+docker build -t pairlink:v0.3.1 .
 
 # 冒烟：版本
-docker run --rm pairlink:v0.3.0 -version
+docker run --rm pairlink:v0.3.1 -version
 
-# 前台跑 relay（配置从宿主机只读挂载；容器内管理页需绑 0.0.0.0）
+# 前台跑 relay（配置目录读写挂载；容器内管理页需绑 0.0.0.0）
+sudo chown -R 65532:65532 examples/docker   # 管理页写回需要 uid 65532 可写
 docker run --rm --read-only --cap-drop ALL \
   -p 127.0.0.1:17090:17090 \
-  -v "$PWD/examples/docker/relay.ini:/etc/pairlink/relay.ini:ro" \
-  pairlink:v0.3.0 -relay -config /etc/pairlink/relay.ini
+  -v "$PWD/examples/docker:/etc/pairlink:rw" \
+  pairlink:v0.3.1 -relay -config /etc/pairlink/relay.ini
 ```
 
 > 挂载的 ini/证书必须让容器内 uid 65532 可读：主机上 `chmod 0644`（或
 > `chmod 0640` + `--user` 调整）。`0600 root` 的文件容器读不到。
+> **管理页写回需要目录可写**：写回是「同目录临时文件 + rename」，单文件 `:ro` 挂载既不可写
+> 也无法 rename，因此挂载**目录**（`-v …:/etc/pairlink:rw`）并让 uid 65532 拥有/可写该目录；
+> 根文件系统仍可 `--read-only`（P1-1）。
 
 ### 5.3 Compose 演示（relay + agent + nginx + client）
 
@@ -249,6 +257,8 @@ docker compose down
   `127.0.0.1:17090:17090` 限制访问来源。这是容器网络与主机网络的关键差异：
   **容器内的 `127.0.0.1` 是容器自己，不是宿主机**。
 - 三个 PairLink 服务只读根文件系统、`cap_drop: ALL`、`no-new-privileges`；
+  **配置目录按读写挂载**（`../examples/docker:/etc/pairlink:rw`），否则管理页写回会因
+  rename 失败而报错；宿主机先 `sudo chown -R 65532:65532 examples/docker`（P1-1）。
   nginx 演示服务用 tmpfs 提供可写缓存目录。
 - 可选健康检查（不放进镜像）：用宿主机 curl 管理页，或在编排层加一个
   `curlimages/curl` sidecar 定期请求 `http://relay:17090/`；不要依赖 distroless 内的 shell。
@@ -259,9 +269,9 @@ docker compose down
 > compose 未启动。** 下面命令需在装有 Docker Engine + Compose v2 的机器上执行。
 
 ```bash
-docker build -t pairlink:v0.3.0 .
-docker run --rm pairlink:v0.3.0 -version
-docker image inspect pairlink:v0.3.0 --format '{{.Config.User}} {{.Config.Entrypoint}}'
+docker build -t pairlink:v0.3.1 .
+docker run --rm pairlink:v0.3.1 -version
+docker image inspect pairlink:v0.3.1 --format '{{.Config.User}} {{.Config.Entrypoint}}'
 # 期望：nonroot:nonroot [/pairlink]
 
 docker compose -f deploy/docker-compose.yml up -d --build

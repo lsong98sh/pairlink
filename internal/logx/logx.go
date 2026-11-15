@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // Config 是日志构造参数。
@@ -90,6 +91,42 @@ func Component(log *slog.Logger, name string) *slog.Logger {
 		return log
 	}
 	return log.With(slog.String("component", name))
+}
+
+// MaxAttrLen 是日志中来自对端（不可信）的字符串字段的最大长度（按 rune 计）。
+//
+// SEC-M2：client_name / agent_id / 错误信息 / 踢出原因等字段由对端控制，
+// 先在调用点用 CleanN(s, MaxAttrLen) 清洗，避免：
+//   - 1 MiB client_name 让每条日志放大成 1 MiB（日志放大/磁盘打满）；
+//   - 值里的 \n / \r 伪造额外日志行（日志注入）。
+const MaxAttrLen = 64
+
+// CleanN 把外部字符串清洗为可安全写入单行日志的形式：
+//   - 去掉全部控制字符（含 \n \r \t \0）；
+//   - 非法 UTF-8 字节替换为 '?'；
+//   - 按 rune 截断到最多 max 个字符，被截断时追加 '…'。
+//
+// max <= 0 时只做清洗、不截断。
+func CleanN(s string, max int) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ToValidUTF8(s, "?")
+	var b strings.Builder
+	b.Grow(len(s))
+	count := 0
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			continue
+		}
+		if max > 0 && count >= max {
+			b.WriteString("…")
+			break
+		}
+		b.WriteRune(r)
+		count++
+	}
+	return b.String()
 }
 
 // NewFileLogger 构造写入 path 的 logger（追加模式，目录不存在时自动创建）。

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/logx"
@@ -20,6 +21,8 @@ import (
 type UDPDataListener struct {
 	srv  *server
 	conn *net.UDPConn
+	// lastAuthWarn 是上一次令牌校验失败 WARN 的 UnixNano（限速用）。
+	lastAuthWarn atomic.Int64
 }
 
 // loop 是唯一读循环。
@@ -88,7 +91,11 @@ func (l *UDPDataListener) handleDatagram(data []byte, from *net.UDPAddr, log *sl
 	}
 
 	// 未知端点：只接受 MsgBind 数据报。
-	typ, payload, err := protocol.ParseFrame(data)
+	//
+	// 数据报是不可信输入：ParseFrameLimit 先要求「声明长度 == 实际数据报长度」，
+	// 再切出 payload；声明 1 MiB 的 5 字节数据报在这里直接被拒绝且不分配
+	// 1 MiB（SEC-D1 / P0-1）。
+	typ, payload, err := protocol.ParseFrameLimit(data, protocol.NetworkPayloadLimit)
 	if err != nil || typ != protocol.MsgBind {
 		log.Debug("丢弃未登记端点的非 Bind 数据报",
 			"event", "udp_evict",
@@ -117,12 +124,9 @@ func (l *UDPDataListener) handleDatagram(data []byte, from *net.UDPAddr, log *sl
 		return
 	}
 	if err := l.srv.tokens.Validate(key, bind.PairingToken); err != nil {
-		log.Warn("UDP 报到令牌校验失败",
-			"event", "bind_fail",
-			"pairing_key", key.String(),
-			"remote", ep.String(),
-			"err", err,
-		)
+		// 未认证端点可以在任何鉴权之前每包触发一次校验失败：每条都打 WARN
+		// 会形成日志放大（≈200 B/包）。这里降为限速 WARN + Debug（P2-1 / SEC-M2）。
+		l.warnAuthFail(log, ep, key, err)
 		return
 	}
 
@@ -153,6 +157,35 @@ func (l *UDPDataListener) handleDatagram(data []byte, from *net.UDPAddr, log *sl
 	)
 }
 
+// authFailWarnInterval 是 UDP 令牌校验失败 WARN 的最小间隔（其余降为 Debug）。
+const authFailWarnInterval = 5 * time.Second
+
+// warnAuthFail 以限速方式记录 UDP 报到令牌校验失败。
+//
+// UDP 数据面在读循环内处理未认证数据报；攻击者可用每包一条 WARN 打满日志。
+// 这里每个 listener 每 5 秒最多一条 WARN，其余走 Debug（仍可排障）。
+func (l *UDPDataListener) warnAuthFail(log *slog.Logger, ep registry.UDPEndpoint, key pairing.PairingKey, err error) {
+	now := time.Now().UnixNano()
+	last := l.lastAuthWarn.Load()
+	if last == 0 || now-last >= int64(authFailWarnInterval) {
+		if l.lastAuthWarn.CompareAndSwap(last, now) {
+			log.Warn("UDP 报到令牌校验失败",
+				"event", "bind_fail",
+				"pairing_key", key.String(),
+				"remote", ep.String(),
+				"err", err,
+			)
+			return
+		}
+	}
+	log.Debug("UDP 报到令牌校验失败",
+		"event", "bind_fail",
+		"pairing_key", key.String(),
+		"remote", ep.String(),
+		"err", err,
+	)
+}
+
 // sendBindOK 向指定端点回一个 MsgBindOK 数据报。
 func (l *UDPDataListener) sendBindOK(ep registry.UDPEndpoint, key pairing.PairingKey, log *slog.Logger, detail string) {
 	bindOK, err := protocol.EncodeFrame(protocol.MsgBindOK, &protocol.BindOK{PairingKey: key.String()})
@@ -175,7 +208,8 @@ func parseBindKey(data []byte) (pairing.PairingKey, bool) {
 	if len(data) < protocol.HeaderSize || protocol.MessageType(data[0]) != protocol.MsgBind {
 		return pairing.PairingKey{}, false
 	}
-	typ, payload, err := protocol.ParseFrame(data)
+	// 数据报按实际长度解析：声明长度必须与收到的字节数一致（不做任何预分配）。
+	typ, payload, err := protocol.ParseFrameLimit(data, protocol.NetworkPayloadLimit)
 	if err != nil || typ != protocol.MsgBind {
 		return pairing.PairingKey{}, false
 	}

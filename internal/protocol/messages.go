@@ -68,6 +68,25 @@ type HelloOK struct {
 	// UDPDataPort 是 relay 原生 UDP 数据面（udp_listen）端口；
 	// 0 表示未启用原生 UDP（此时 udp_mode 应为 tcp_tunnel）。
 	UDPDataPort int `json:"udp_data_port,omitempty"`
+	// DataTLS 告诉 agent/client relay 的 TCP 数据面（tcp_listen）是否要求 TLS。
+	//
+	// 用指针是为了区分「未下发」（旧 relay < v0.4.0，nil）与「显式 false」
+	// （新 relay 明确不要求数据面 TLS）：前者 auto 需按明文回退并 WARN，后者是
+	// 确定的明文。线格式仍是 JSON bool，旧端会忽略该字段。
+	//
+	// 旧 agent/client 忽略该字段、用明文连 TLS 数据面 → 握手失败（relay 记
+	// data_plane_tls_handshake_fail WARN）。因此启用数据面 TLS 要求三端 ≥ v0.4.0。
+	DataTLS *bool `json:"data_tls,omitempty"`
+}
+
+// DataTLSEnabled 返回 relay 是否要求数据面 TLS，以及该字段是否已下发。
+//
+// advertised=false 表示对端是旧 relay（未下发字段），调用方应按明文回退并 WARN。
+func (h *HelloOK) DataTLSEnabled() (enabled, advertised bool) {
+	if h == nil || h.DataTLS == nil {
+		return false, false
+	}
+	return *h.DataTLS, true
 }
 
 // RegisterService 是 agent 注册服务的请求（0x03）。
@@ -198,6 +217,18 @@ type Heartbeat struct{}
 type HeartbeatAck struct{}
 
 // Error 是错误响应（0x10），Code 取 ErrCode* 常量。
+//
+// Error.Detail 的稳定取值之一：服务注册被拒绝的原因（SEC-A2，v0.4.0+）。
+// relay 在 Detail 中下发下列常量，agent 据此给出可读提示；旧 agent 忽略该字段。
+const (
+	// ErrDetailServiceDenied 表示服务名不在 [relay] service_allow 白名单。
+	ErrDetailServiceDenied = "service_denied"
+	// ErrDetailServiceConflict 表示服务已由另一个**在线** agent 注册。
+	ErrDetailServiceConflict = "service_conflict"
+	// ErrDetailServiceLimit 表示该 agent 注册的服务数超过 max_services_per_agent。
+	ErrDetailServiceLimit = "service_limit"
+)
+
 type Error struct {
 	// Code 是机器可读错误码。
 	Code string `json:"code"`
@@ -205,6 +236,8 @@ type Error struct {
 	Message string `json:"message"`
 	// Detail 是可选的补充信息。约定（docs/protocol.md §4.12）：
 	//   - UDP over TCP 承载连接上的会话级错误：Detail 是配对键字符串；
+	//   - 服务注册被拒绝（SEC-A2，v0.4.0+）：Detail 是稳定原因码
+	//     service_denied / service_conflict / service_limit，供 agent 映射可读提示；
 	//   - 其它场景不保证稳定，不应被程序解析。
 	Detail string `json:"detail,omitempty"`
 	// ClientConnID 是可选关联 ID：relay 针对某个 MsgConnectRequest 回错误时

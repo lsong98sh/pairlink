@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/config"
+	"github.com/lsong98sh/pairlink/internal/logx"
 	"github.com/lsong98sh/pairlink/internal/protocol"
 )
 
@@ -115,7 +117,7 @@ func (c *controlConn) readFrame(timeout time.Duration) (protocol.MessageType, []
 		}
 		defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
 	}
-	return protocol.ReadFrame(c.conn)
+	return protocol.ReadFrameWithLimit(c.conn, protocol.NetworkPayloadLimit)
 }
 
 // close 关闭控制连接（幂等）。
@@ -176,6 +178,25 @@ func (a *agent) handshake(ctrl *controlConn) error {
 		return permanent(fmt.Errorf("agent: relay 协议版本不兼容: %w", err))
 	}
 
+	// 数据面 TLS（SEC-T1）：本地 [server] data_tls × relay 的 HelloOK.data_tls。
+	// 不兼容属永久错误（不重连、不静默降级）；旧 relay 未下发时按明文 + WARN。
+	negotiation := config.NegotiateDataTLS(a.cfg.Server.DataTLS, ok.DataTLS)
+	if negotiation.Err != nil {
+		return permanent(fmt.Errorf("agent: %w", negotiation.Err))
+	}
+	if negotiation.Warning != "" {
+		a.log.Warn(negotiation.Warning, "event", "data_tls", "detail", "old_relay_or_missing_field")
+	}
+	var dataTLSCfg *tls.Config
+	if negotiation.UseTLS {
+		cfg, cfgErr := dataTLSConfig(&a.cfg.Server, a.relayHost)
+		if cfgErr != nil {
+			return permanent(cfgErr)
+		}
+		dataTLSCfg = cfg
+	}
+	a.setDataTLS(negotiation.UseTLS, dataTLSCfg)
+
 	mode := normalizeUDPMode(ok.UDPMode, a.log, "hello_ok")
 	a.ctrlMu.Lock()
 	a.agentID = ok.AgentID
@@ -190,10 +211,42 @@ func (a *agent) handshake(ctrl *controlConn) error {
 
 	a.log.Info("接入 relay 成功", "event", "hello_ok",
 		"agent_id", ok.AgentID,
-		"detail", fmt.Sprintf("version=%d udp_mode=%s tcp_data_port=%d udp_data_port=%d heartbeat_seconds=%d",
-			ok.Version, mode, ok.TCPDataPort, ok.UDPDataPort, ok.HeartbeatSeconds),
+		"data_tls", negotiation.UseTLS,
+		"detail", fmt.Sprintf("version=%d udp_mode=%s tcp_data_port=%d udp_data_port=%d heartbeat_seconds=%d data_tls=%v",
+			ok.Version, mode, ok.TCPDataPort, ok.UDPDataPort, ok.HeartbeatSeconds, negotiation.UseTLS),
 	)
+	a.logDataPlaneTLS(negotiation.UseTLS, ok.DataTLS)
+
+	// 原生 UDP 数据面不引入 DTLS：relay 要求数据面 TLS 时明确提示 UDP 仍明文。
+	if negotiation.UseTLS && mode == protocol.UDPModeNative {
+		a.log.Warn("udp_mode = native：原生 UDP 数据面仍为明文（不引入 DTLS），只有 TCP 数据面走 TLS；如需加密请让 relay 移除 udp_listen 使用 udp_mode = tcp_tunnel",
+			"event", "config_warning", "detail", "data_tls 不覆盖原生 UDP")
+	}
 	return nil
+}
+
+// logDataPlaneTLS 打印本次连接的数据面加密状态（SEC-T1 可见性要求）。
+func (a *agent) logDataPlaneTLS(useTLS bool, advertised *bool) {
+	if useTLS {
+		verify := "系统根证书"
+		if strings.TrimSpace(a.cfg.Server.TLSCA) != "" {
+			verify = "tls_ca=" + a.cfg.Server.TLSCA
+		}
+		if a.cfg.Server.TLSInsecureSkipVerify {
+			verify = "跳过证书校验（tls_insecure_skip_verify = true，仅建议测试环境）"
+		}
+		a.log.Info("数据面: TLS（TCP）", "event", "data_tls", "detail", "数据面: TLS（"+verify+"）")
+		return
+	}
+	reason := "relay 未启用数据面 TLS"
+	switch {
+	case advertised == nil:
+		reason = "旧 relay 未下发 data_tls（< v0.4.0）"
+	case a.cfg.Server.DataTLS == config.TLSFalse:
+		reason = "data_tls = false（本端强制明文）"
+	}
+	a.log.Warn("数据面: 明文（业务数据与 pairing_token 不加密）",
+		"event", "data_tls", "detail", "数据面: 明文（"+reason+"）")
 }
 
 // registerServices 依次注册 cfg.Server.All() 的全部服务。
@@ -258,7 +311,7 @@ func (a *agent) awaitRegistered(ctrl *controlConn, svc config.ServerService, tim
 			}
 			return normalizeUDPMode(reg.UDPMode, a.log, "service_registered"), nil
 		case protocol.MsgError:
-			return "", permanent(fmt.Errorf("agent: relay 拒绝注册服务 %s: %s", svc.ID, protocolErrText(payload)))
+			return "", permanent(serviceRegisterError(svc.ID, payload))
 		case protocol.MsgHeartbeat:
 			if err := ctrl.write(protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil {
 				return "", fmt.Errorf("agent: 回复心跳: %w", err)
@@ -319,7 +372,8 @@ func (a *agent) resolveDataAddrs() {
 // MsgServerShutdown，返回 errKicked（包装后）表示被踢出。
 func (a *agent) controlLoop(ctrl *controlConn) error {
 	for {
-		typ, payload, err := protocol.ReadFrame(ctrl.conn)
+		// 网络入口上限 64 KiB（SEC-D1 / P0-1），与服务列表的实际规模一致。
+		typ, payload, err := protocol.ReadFrameWithLimit(ctrl.conn, protocol.NetworkPayloadLimit)
 		if err != nil {
 			// 只有「我们自己关停」才算正常结束；对端关闭连接属于运行中可恢复错误。
 			if a.ctx.Err() != nil || a.controlConn() != ctrl {
@@ -340,10 +394,24 @@ func (a *agent) controlLoop(ctrl *controlConn) error {
 				continue
 			}
 			a.wg.Add(1)
-			go func() {
-				defer a.wg.Done()
-				a.handleIncoming(msg)
-			}()
+			select {
+			case a.incomingSem <- struct{}{}:
+				go func() {
+					defer a.wg.Done()
+					defer func() { <-a.incomingSem }()
+					a.handleIncoming(msg)
+				}()
+			default:
+				// SEC-D2：并发 MsgIncoming 超过 256 时丢弃本次通知并记 WARN。
+				// 丢弃是安全的：client 侧数据面报到会因令牌校验/超时而失败，
+				// 不会产生半开会话；绝不因此 panic 或无限起 goroutine。
+				a.wg.Done()
+				a.log.Warn("并发接入通知已达上限，丢弃本次通知",
+					"event", "incoming_drop",
+					"pairing_key", logx.CleanN(msg.PairingKey, logx.MaxAttrLen),
+					"limit", maxConcurrentIncoming,
+				)
+			}
 		case protocol.MsgHeartbeat:
 			if err := ctrl.write(protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil {
 				a.log.Warn("回复 relay 心跳失败", "event", "heartbeat", "err", err)
@@ -455,6 +523,9 @@ func normalizeUDPMode(mode string, log *slog.Logger, where string) string {
 }
 
 // protocolErrText 把 MsgError 的负载转成可读错误文本（不含任何令牌）。
+//
+// code / message 都由对端（relay）控制，返回前清洗控制字符并截断到
+// logx.MaxAttrLen，避免日志注入/放大（SEC-M2）。
 func protocolErrText(payload []byte) string {
 	decoded, err := protocol.Decode(protocol.MsgError, payload)
 	if err != nil {
@@ -464,13 +535,46 @@ func protocolErrText(payload []byte) string {
 	if !ok || e == nil {
 		return "错误响应类型异常"
 	}
-	if e.Message == "" {
-		return e.Code
-	}
-	return e.Code + ": " + e.Message
+	return errTextOf(e)
 }
 
-// decodeReason 解析 MsgKicked / MsgServerShutdown 的 reason 字段。
+// errTextOf 把 protocol.Error 转成清洗后的 "code: message" 文本。
+func errTextOf(e *protocol.Error) string {
+	code := logx.CleanN(e.Code, logx.MaxAttrLen)
+	msg := logx.CleanN(e.Message, logx.MaxAttrLen)
+	if msg == "" {
+		return code
+	}
+	return code + ": " + msg
+}
+
+// serviceRegisterError 把 relay 的服务注册拒绝映射成可读、可执行的错误（SEC-A2）。
+//
+// relay 在 MsgError.Detail 中下发稳定原因码（v0.4.0+）；旧 relay 没有该字段时
+// 退化为通用的 code + message，不解析中文文本。
+func serviceRegisterError(serviceID string, payload []byte) error {
+	decoded, err := protocol.Decode(protocol.MsgError, payload)
+	if err != nil {
+		return fmt.Errorf("agent: relay 拒绝注册服务 %s: %s", serviceID, protocolErrText(payload))
+	}
+	e, ok := decoded.(*protocol.Error)
+	if !ok || e == nil {
+		return fmt.Errorf("agent: relay 拒绝注册服务 %s: %s", serviceID, protocolErrText(payload))
+	}
+	detail := logx.CleanN(e.Message, logx.MaxAttrLen)
+	switch e.Detail {
+	case protocol.ErrDetailServiceDenied:
+		return fmt.Errorf("agent: relay 拒绝注册服务 %s：服务名不在 relay 的 [relay] service_allow 白名单（%s）；请在 relay 端加入该服务名，或改用允许的名字", serviceID, detail)
+	case protocol.ErrDetailServiceConflict:
+		return fmt.Errorf("agent: relay 拒绝注册服务 %s：服务名已被另一个在线 agent 占用（%s）；同一服务名同时只允许一个 agent 提供，请确认是否重复部署或原 agent 尚未下线", serviceID, detail)
+	case protocol.ErrDetailServiceLimit:
+		return fmt.Errorf("agent: relay 拒绝注册服务 %s：本 agent 注册的服务数已达 relay 上限（%s）；请减少服务数量或调大 relay 的 max_services_per_agent", serviceID, detail)
+	default:
+		return fmt.Errorf("agent: relay 拒绝注册服务 %s: %s", serviceID, protocolErrText(payload))
+	}
+}
+
+// decodeReason 解析 MsgKicked / MsgServerShutdown 的 reason 字段（清洗+截断）。
 func decodeReason(typ protocol.MessageType, payload []byte) string {
 	decoded, err := protocol.Decode(typ, payload)
 	if err != nil {
@@ -478,9 +582,9 @@ func decodeReason(typ protocol.MessageType, payload []byte) string {
 	}
 	switch v := decoded.(type) {
 	case *protocol.Kicked:
-		return v.Reason
+		return logx.CleanN(v.Reason, logx.MaxAttrLen)
 	case *protocol.ServerShutdown:
-		return v.Reason
+		return logx.CleanN(v.Reason, logx.MaxAttrLen)
 	}
 	return ""
 }

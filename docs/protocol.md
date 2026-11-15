@@ -43,8 +43,18 @@ UDP 数据面承载模式由 relay 决定并通过 `udp_mode` 下发：
 
 约束（`internal/protocol` 已强制）：
 
-- `payload_len` 上限 **1 MiB**（`protocol.MaxPayload`），超限立即返回 `ErrPayloadTooLarge`，
-  不分配对应内存，防内存放大。
+- **内存上限** `payload_len` 上限 **1 MiB**（`protocol.MaxPayload`），超限立即返回
+  `ErrPayloadTooLarge`，不分配对应内存，防内存放大。
+- **网络入口上限 64 KiB**（`protocol.NetworkPayloadLimit`）：隧道控制面、TCP/UDP 数据面
+  报到帧、agent/client 控制连接一律用 `ReadFrameWithLimit(r, NetworkPayloadLimit)` 读取，
+  远小于 `MaxPayload`。对端只发 5 字节帧头声明 1 MiB 时，读取方在**读完帧头后立即**
+  返回 `ErrPayloadTooLarge` 并关闭连接，不会按声明长度预分配（SEC-D1 / P0-1）。
+  `MaxPayload` 仅用于 `EncodeFrame`（内存编码）等非网络入口。
+- **UDP 数据报用 `ParseFrameLimit(data, limit)`**：先要求 `len(data) >= 5`，再要求
+  「`payload_len` 与数据报实际剩余字节数**完全相等**」，任何截断/多帧拼接都返回
+  `ErrFrameLengthMismatch`（或超限时的 `ErrPayloadTooLarge`）；校验通过后才切出 payload
+  （零拷贝子切片）。网络数据报**禁止**直接用 `ParseFrame`，否则 5 字节数据报声明
+  1 MiB 就能触发内存放大。
 - 写帧使用**单次 `Write`**（帧头与负载拼在一个 buffer 中），避免并发写导致帧交错。
 - 读帧先读 5 字节帧头，校验长度后再分配负载。
 - 未知 `type` 在帧层**不报错**（前向兼容），由 `protocol.Decode` 返回 `ErrUnknownType`；
@@ -69,7 +79,7 @@ UDP 隧道帧解析模式**；此后该 TCP 连接上传输的就是 UDP 隧道�
 | 字段 | 长度 | 说明 |
 | --- | --- | --- |
 | `len` | 4 字节 | 其后字节数：`1 + s + n`；范围 `1..MaxUDPTunnelFrameLen`（65665） |
-| `sess_len` | 1 字节 | 会话标识长度 `s`（0..129） |
+| `sess_len` | 1 字节 | 会话标识长度 `s`（0..129）；**读侧同样校验**，`s > 129` 返回 `ErrBadUDPTunnelFrame` 并关闭承载连接 |
 | `session` | s 字节 | 会话标识 = 配对键 `"serviceID/clientConnID"`；**空串表示控制帧** |
 | `payload` | n 字节 | 数据报字节（n ≤ 65535）；控制帧时是一个完整 PairLink 帧 |
 
@@ -143,9 +153,13 @@ UDP 隧道帧解析模式**；此后该 TCP 连接上传输的就是 UDP 隧道�
 | `client_id` | string | role=client 时是 | relay 分配的会话 ID |
 | `version` | int | 是 | relay 协议版本 |
 | `heartbeat_seconds` | int | 否 | 建议心跳间隔（秒）；双方取 `min(本地 heartbeat, 本字段)` |
-| `udp_mode` | string | 是 | `native` / `tcp_tunnel`；agent/client 据此选择 UDP 数据面接入方式 |
+| `udp_mode` | string | 是（relay v0.3.0+ 必发；旧 relay 缺省时按 `native` 回退并 WARN） | `native` / `tcp_tunnel`；agent/client 据此选择 UDP 数据面接入方式 |
 | `tcp_data_port` | int | 是 | relay `tcp_listen` 的端口，用于推导数据面拨号地址 |
 | `udp_data_port` | int | 否 | relay `udp_listen` 的端口；`0`/缺省表示未启用原生 UDP |
+| `data_tls` | bool | 否 | relay v0.4.0+ 必发，表示 TCP 数据面是否要求 TLS；agent/client `data_tls = auto` 时跟随该值。**缺省 = 旧 relay（≤ v0.3.1）**：按明文处理并 WARN，S 端显式 `data_tls = true` 时报永久错误 |
+
+`data_tls` 使用指针语义（Go 侧 `*bool` + `omitempty`）区分"未下发"与"显式 false"：
+旧 relay 不下发该字段，新端按明文回退并 WARN；新 relay 始终下发（哪怕值为 `false`）。
 
 ### 4.3 `MsgRegisterService`（0x03）/ `MsgServiceRegistered`（0x04）
 
@@ -158,6 +172,19 @@ UDP 隧道帧解析模式**；此后该 TCP 连接上传输的就是 UDP 隧道�
 
 `MsgServiceRegistered` 回显 `service_id` 与 `proto`。同一 agent 重复注册同一 ID 视为更新，
 relay 推送 `updated` 事件。
+
+**注册被拒绝（v0.4.0 / SEC-A2）**：relay 回 `MsgError{code: "bad_request", detail: <code>}`，
+`detail` 是稳定机器码，agent 据此给出可读提示：
+
+| `detail` | 触发条件 | 消息要点 |
+| --- | --- | --- |
+| `service_denied` | 服务名不在 `[relay] service_allow` | 提示白名单未列出该服务名 |
+| `service_limit` | 该 agent 已注册服务数达到 `max_services_per_agent`（默认 64，0 = 不限） | 消息带上限数值 |
+| `service_conflict` | 同名服务已由**另一个在线** agent 注册 | 提示原 owner 在线、拒绝抢占 |
+
+归属规则：同 owner 重复注册 = 覆盖（不计数、不事件冲突）；异 owner 且原 owner 离线 =
+允许接管，relay 记录 `service_takeover` WARN（含旧/新 owner）并推送 `updated` 事件。
+主动 `MsgUnregisterService` 视为释放服务名，不产生接管事件。
 
 ### 4.4 `MsgListServices`（0x05）/ `MsgServiceList`（0x06）
 
@@ -269,7 +296,10 @@ relay 推送 `updated` 事件。
      且该会话存在 → 只关闭该会话，**不关闭整条承载连接**；
    - 解析失败/找不到会话 → 只记日志、保留全部会话（UDP 允许丢包，最终由超时收敛）；
    - peers **不解析** `detail` 里的其它内容，也不把 `message` 当协议字段。
-2. 其它场景（握手/注册/踢出等）的 `detail` 不保证稳定，不应被程序解析。
+2. **服务注册拒绝（v0.4.0 / SEC-A2）**：`code = "bad_request"`，`detail` 是稳定机器码
+   `service_denied` / `service_limit` / `service_conflict`（见 §4.3）；agent 可据此显示
+   白名单/上限/归属冲突的可读提示。
+3. 其它场景（握手/踢出等）的 `detail` 不保证稳定，不应被程序解析。
 
 `client_conn_id` 的约定：
 
@@ -324,6 +354,8 @@ sequenceDiagram
    由 `udp_session_timeout`/配对超时最终清理。
 5. 会话令牌与原生 UDP 一致：第一次登记时 `Validate`，两侧都登记后 `Consume`；
    已完成会话的重复 `MsgBind` 视为幂等（不改变会话状态），不中断承载连接。
+   **已登记会话再收到同一配对键的 `MsgBind` 帧时，relay 直接丢弃该帧（记 `bind_dup_drop`），
+   绝不转发给对端**（与原生 UDP 的重复报到处理一致，P2-7）。
 6. 单会话错误（令牌无效/会话不存在/已配对）用控制帧 `session=""` + `MsgError` 回报，
    **不要关闭整条承载连接**（除非帧结构本身非法）。
 7. 一条承载连接上的帧是**串行**的：写方必须保证整帧原子写出（`WriteUDPTunnelFrame` 已保证），
@@ -331,7 +363,8 @@ sequenceDiagram
 
 ### 4.15 `MsgUnregisterService`（0x13）/ `MsgServiceUnregistered`（0x14）
 
-阶段 7 新增，用于 agent 管理页删除/修改服务时主动注销旧注册。
+阶段 7 新增，用于 agent 管理页**删除**服务时主动注销旧注册。
+修改服务不走注销：直接重新发送 `MsgRegisterService`（relay 按 update 处理并推送 `updated` 事件）。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -572,6 +605,21 @@ stateDiagram-v2
 - `MsgUnregisterService`（0x13）/ `MsgServiceUnregistered`（0x14，阶段 7）是**新增消息类型**：
   旧端遇到未知类型只记日志并忽略，因此可混跑；但**服务的新增/删除/修改需要 relay v0.3.0+**
   （旧 relay 不会回注销确认，agent 会在 3s 后超时并回滚）。
+- `HelloOK.data_tls`（v0.4.0，阶段 8D）是**新增可选字段**，`ProtocolVersion` 仍为 1。
+  但启用数据面 TLS 是**有意的运行时开关**，混跑行为如下（relay/agent/client 的 `data_tls`
+  取值见 README §5.3–§5.5）：
+
+  | relay | agent/client | 数据面结果 |
+  | --- | --- | --- |
+  | v0.4.0，`data_tls = true` | v0.4.0 `auto`/`true` | TLS，正常 |
+  | v0.4.0，`data_tls = true` | v0.4.0 `false` | 明确失败：本端拒绝拨号（永久错误） |
+  | v0.4.0，`data_tls = false` | v0.4.0 `true` | 明确失败：`HelloOK.data_tls=false`，拨号前即报错 |
+  | v0.4.0，`data_tls = true` | 旧端（≤ v0.3.1） | 旧端按明文连 TLS 端口 → 握手失败；relay 记 `data_plane_tls_handshake_fail` |
+  | 旧 relay（≤ v0.3.1，不下发 `data_tls`） | v0.4.0 `auto` | 明文 + WARN（与旧版行为一致） |
+  | 旧 relay（≤ v0.3.1） | v0.4.0 `true` | 明确失败：relay 未启用数据面 TLS |
+  | 旧 relay（≤ v0.3.1） | v0.4.0 `false` | 明文，正常 |
+
+  即：**启用 `data_tls` 要求三端 ≥ v0.4.0**；不启用时新端与旧端可继续混跑。
 
 ## 10. 典型时序（TCP）
 

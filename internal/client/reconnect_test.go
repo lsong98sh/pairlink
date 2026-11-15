@@ -130,7 +130,11 @@ func TestReconnectForcesNewRevisionBaseline(t *testing.T) {
 		_, newOK := services["new-svc"]
 		return newOK && !oldOK && rev == 0
 	})
-	tc.logContains(t, "reconnect_ok")
+	// 服务基线在 reconnect_ok 之前就已更新（先应用列表、再记日志），
+	// 所以这里必须轮询日志，不能立即断言（-race 下会稳定复现竞态）。
+	waitFor(t, 5*time.Second, "reconnect_ok 日志", func() bool {
+		return strings.Contains(tc.logs.String(), "reconnect_ok")
+	})
 
 	if err := tc.stop(); err != nil {
 		t.Fatalf("Run 应返回 nil，实际 %v", err)

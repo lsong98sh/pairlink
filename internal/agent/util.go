@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -27,13 +26,20 @@ import (
 //     与阶段 1~6 的既有行为完全一致。
 //
 // tls_insecure_skip_verify = true 优先级最高：即使 tls=true 也跳过校验并 WARN。
-// 注：数据面永远是明文哑管道，不经过本函数。
+// 数据面是否 TLS 由 [server] data_tls 与 relay 的 HelloOK.data_tls 决定（见
+// dataTLSConfig / dialDataPlane），但两者共用同一套 CA / insecure / SNI 规则。
 func serverTLSConfig(s *config.ServerConfig, host string, log *slog.Logger) (*tls.Config, error) {
 	mode := s.TLS
 	useTLS := mode.DialTLS(s.TLSCA, s.TLSInsecureSkipVerify)
 	if !useTLS {
+		// auto + 无材料仍是明文（向后兼容），但必须明确说清风险与出口（SEC-T2）。
+		if mode == config.TLSAuto && strings.TrimSpace(s.TLSCA) == "" && !s.TLSInsecureSkipVerify {
+			if log != nil {
+				log.Warn("当前以明文连接 relay（隧道内 auth_token 与信令可被链路上的人读取）；公网部署请把 tls 设为 true 并配置 tls_ca（公网 CA 场景可不配 CA）",
+					"event", "config_warning", "detail", "plaintext_auto")
+			}
+		}
 		// 只有显式 tls = false 且配了材料时才提示「材料被忽略」；
-		// auto + 无材料是既有明文默认，不额外刷日志。
 		if mode == config.TLSFalse && (s.TLSCA != "" || s.TLSInsecureSkipVerify) {
 			if log != nil {
 				log.Warn("tls = false：已配置的 tls_ca / tls_insecure_skip_verify 被忽略，控制面按明文拨号",
@@ -42,29 +48,29 @@ func serverTLSConfig(s *config.ServerConfig, host string, log *slog.Logger) (*tl
 		}
 		return nil, nil
 	}
-	tc := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
-	if ca := strings.TrimSpace(s.TLSCA); ca != "" {
-		pem, err := os.ReadFile(ca)
-		if err != nil {
-			return nil, fmt.Errorf("agent: 读取 tls_ca %q: %w", ca, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("agent: tls_ca %q 中没有可用的 PEM 证书", ca)
-		}
-		tc.RootCAs = pool
+	// CA 解析与 ServerName 规则和 client / 数据面共用 config.ClientTLSConfig，
+	// 避免三处重复实现（docs/architecture.md §7.6）。
+	tc, err := config.ClientTLSConfig(s.TLSCA, s.TLSInsecureSkipVerify, host)
+	if err != nil {
+		return nil, fmt.Errorf("agent: %w", err)
 	}
 	// tls_ca 为空且未 insecure 时 RootCAs 保持 nil：tls=true 强制走系统根证书。
-	if s.TLSInsecureSkipVerify {
-		tc.InsecureSkipVerify = true
-		if log != nil {
-			detail := "仅建议测试环境使用"
-			if mode == config.TLSTrue {
-				detail = "tls = true 时该开关是多余的，但它会关闭证书校验，仅建议测试环境使用"
-			}
-			log.Warn("已跳过 relay 证书校验（tls_insecure_skip_verify = true）", "event", "config_warning",
-				"detail", detail)
+	if s.TLSInsecureSkipVerify && log != nil {
+		detail := "仅建议测试环境使用"
+		if mode == config.TLSTrue {
+			detail = "tls = true 时该开关是多余的，但它会关闭证书校验，仅建议测试环境使用"
 		}
+		log.Warn("已跳过 relay 证书校验（tls_insecure_skip_verify = true）", "event", "config_warning",
+			"detail", detail)
+	}
+	return tc, nil
+}
+
+// dataTLSConfig 构造数据面 TLS 配置（与隧道共用 CA / insecure / SNI 规则）。
+func dataTLSConfig(s *config.ServerConfig, host string) (*tls.Config, error) {
+	tc, err := config.ClientTLSConfig(s.TLSCA, s.TLSInsecureSkipVerify, host)
+	if err != nil {
+		return nil, fmt.Errorf("agent: 数据面 TLS: %w", err)
 	}
 	return tc, nil
 }
@@ -99,10 +105,41 @@ func (a *agent) dialRelay(tcfg *tls.Config) (net.Conn, error) {
 	return tconn, nil
 }
 
-// dialTCP 用给定超时拨号一个明文 TCP 连接（数据面或管理面之外的目标）。
+// dialTCP 用给定超时拨号一个明文 TCP 连接（管理面之外的目标）。
 func (a *agent) dialTCP(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
 	d := &net.Dialer{Timeout: timeout}
 	return d.DialContext(ctx, "tcp", addr)
+}
+
+// dialDataPlane 拨号 relay 的 TCP 数据面，必要时在同一连接上完成 TLS 握手。
+//
+// 数据面 TLS 由握手阶段根据 relay 的 HelloOK.data_tls 与本地 [server] data_tls
+// 协商确定；明文/旧 relay 场景下与 v0.3.1 行为完全一致（裸 TCP）。
+func (a *agent) dialDataPlane(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
+	raw, err := a.dialTCP(ctx, addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	useTLS, tcfg := a.dataTLSSnapshot()
+	if !useTLS {
+		return raw, nil
+	}
+	if tcfg == nil {
+		_ = raw.Close()
+		return nil, permanent(fmt.Errorf("agent: 数据面要求 TLS 但本端 TLS 配置缺失（内部状态异常）"))
+	}
+	tconn := tls.Client(raw, tcfg)
+	_ = tconn.SetDeadline(time.Now().Add(timeout))
+	if err := tconn.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, permanent(fmt.Errorf(
+			"数据面 TLS 握手失败（relay 要求数据面 TLS：请检查本端 data_tls / tls_ca / tls_insecure_skip_verify 是否与 relay 证书匹配，relay 日志中可见 data_plane_tls_handshake_fail）: %w", err))
+	}
+	if err := tconn.SetDeadline(time.Time{}); err != nil {
+		_ = tconn.Close()
+		return nil, err
+	}
+	return tconn, nil
 }
 
 // dialUDP 拨号一个 UDP 连接（connected socket，只收发该对端的数据报）。

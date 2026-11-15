@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lsong98sh/pairlink/internal/logx"
 )
 
 // ErrAlreadyStarted 表示 Start 被重复调用。
@@ -167,8 +169,22 @@ func (s *Server) registerAction(a Action) {
 		}
 		// 阶段 7 安全门禁：非回环绑定一律只读，所有写 Action 返回 403。
 		if !s.writable {
-			s.AuditDenied(r, action.Name)
+			s.AuditDenied(r, action.Name, "read_only")
 			http.Error(w, "403 只读模式：manage_listen 绑定在非回环地址，写操作已禁用", http.StatusForbidden)
+			return
+		}
+		// SEC-M1：写操作必须来自回环 Host，且 Origin（若存在）与 Host 一致。
+		// 防 DNS rebinding 与跨站写；CSRF 一次性令牌仍作为第二道校验。
+		if err := checkHostOrigin(r); err != nil {
+			s.AuditDenied(r, action.Name, "host_origin")
+			s.log.Warn("管理页写操作被 Host/Origin 校验拒绝",
+				"event", "admin_denied",
+				"action", action.Name,
+				"host", logx.CleanN(r.Host, logx.MaxAttrLen),
+				"origin", logx.CleanN(r.Header.Get("Origin"), logx.MaxAttrLen),
+				"err", err,
+			)
+			http.Error(w, "403 Host/Origin 校验失败：管理页写操作只接受回环 Host", http.StatusForbidden)
 			return
 		}
 		if !s.consumeCSRF(r) {
@@ -232,7 +248,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("admin: 监听 %s: %w", s.addr, err)
 	}
 	srv := &http.Server{
-		Handler:           s.mux,
+		Handler:           s.securityHeaders(s.mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	s.listener = ln
@@ -293,7 +309,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 // Handler 返回管理页的 http.Handler，便于测试或挂载到已有服务。
-func (s *Server) Handler() http.Handler { return s.mux }
+//
+// 返回的 handler 已包含安全响应头（CSP / X-Frame-Options / nosniff / no-referrer）。
+func (s *Server) Handler() http.Handler { return s.securityHeaders(s.mux) }
 
 // CSRFToken 生成一个一次性 CSRF 令牌（随页面渲染发放，使用后立即失效）。
 //

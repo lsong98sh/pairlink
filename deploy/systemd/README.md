@@ -60,6 +60,17 @@ sudo useradd --system --gid pairlink --no-create-home --shell /usr/sbin/nologin 
    sudo chmod 0640 /etc/pairlink/*.ini
    sudo chmod 0640 /etc/pairlink/tls/* 2>/dev/null || true
    ```
+   **需要管理页写回 ini 时**（修改参数 / 服务增删改），目录必须对服务用户可写，
+   因为写回是「同目录临时文件 + rename」（只读目录会报 `permission denied`/`EROFS`）：
+   ```bash
+   # 方案 A：目录属主给 pairlink（推荐）
+   sudo chown -R pairlink:pairlink /etc/pairlink
+   # 方案 B：保留 root:pairlink，目录组可写 + setgid，文件组可写
+   sudo chmod 2775 /etc/pairlink
+   sudo chmod 0660 /etc/pairlink/*.ini
+   ```
+   另外 unit 里的 `ReadWritePaths=/etc/pairlink` 必须保留（`ProtectSystem=strict` 下
+   只有该路径可写）；不用页面写回时可把它注释掉，恢复全盘只读（P1-1）。
 3. `sudo systemctl edit pairlink-relay` 写入：
    ```ini
    [Service]
@@ -73,7 +84,8 @@ unit 已保留 `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` 与 `AmbientCapabili
 
 ## 3. 权限与加固说明
 
-- `ProtectSystem=strict` 把整个文件系统挂成只读；`/etc/pairlink` 仍然**可读**，证书不需要额外放行。
+- `ProtectSystem=strict` 把整个文件系统挂成只读；unit 已用 `ReadWritePaths=/etc/pairlink`
+  只为配置目录开一个写口（管理页写回需要临时文件 + rename，P1-1）。证书不需要额外放行；
   如果自定义证书放到别处，请确保该路径在只读视图内可读。
 - `ProtectHome=true` 会隐藏 `/home`；不要把配置/证书放到用户家目录。
 - `NoNewPrivileges=true`、`PrivateTmp=true`、`PrivateDevices=true`、空能力集（仅留低端口绑定）等

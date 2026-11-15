@@ -165,6 +165,26 @@ func (s *Store) Sweep() int {
 	return removed
 }
 
+// Pending 报告配对键对应的令牌是否处于"已签发、未消费、未过期"状态。
+//
+// 用于 relay 的单连接未完成请求配额（SEC-D2）：只有真正还能用来完成配对的
+// 令牌才计入上限。
+func (s *Store) Pending(key pairing.PairingKey) bool {
+	return s.PendingID(key.String())
+}
+
+// PendingID 与 Pending 相同，但以配对键字符串为参数。
+func (s *Store) PendingID(id string) bool {
+	now := s.nowFor()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[id]
+	if !ok {
+		return false
+	}
+	return !e.consumed && now.Before(e.expiresAt)
+}
+
 // Len 返回当前条目数（含已消费、尚未过期的条目）。
 func (s *Store) Len() int {
 	s.mu.Lock()

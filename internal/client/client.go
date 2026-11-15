@@ -29,6 +29,7 @@ package client
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -149,6 +150,10 @@ type negotiated struct {
 	udpDataAddr    string
 	udpDataUDPAddr *net.UDPAddr
 	udpDataErr     error
+	// dataTLS 是本次连接协商出的数据面 TLS 状态（relay 的 HelloOK.data_tls ×
+	// 本地 [client] data_tls）；dataTLSCfg 仅在 dataTLS=true 时非 nil，只读可复用。
+	dataTLS    bool
+	dataTLSCfg *tls.Config
 }
 
 // client 是 client 模式的全部运行状态。

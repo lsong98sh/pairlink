@@ -101,12 +101,29 @@ type RelayConfig struct {
 	UDPListen string
 	// TLS 是三态 TLS 开关：auto（默认，按证书推断）| true（强制 TLS）| false（强制明文）。
 	TLS TLSMode
+	// DataTLS 是 TCP 数据面（tcp_listen）的三态 TLS 开关：
+	// auto（默认，跟随隧道 TLS 判定）| true（强制 TLS）| false（强制明文）。
+	DataTLS TLSMode
 	// TLSCert 是隧道 TLS 证书路径；与 TLSKey 成对出现。
 	TLSCert string
 	// TLSKey 是隧道 TLS 私钥路径；与 TLSCert 成对出现。
 	TLSKey string
-	// AuthToken 是 agent/client 接入隧道时使用的共享密钥；为空表示不鉴权并告警。
+	// AuthToken 是 agent/client 接入隧道时使用的共享密钥；为空时**只允许回环
+	// 来源**接入（并 WARN），非回环来源一律回 auth_failed（SEC-A1）。
 	AuthToken string
+	// ServiceAllow 是允许注册的服务名白名单（[relay] service_allow，逗号分隔）。
+	// 为空表示不限制（启动 WARN），非空时不在名单内的注册一律拒绝（SEC-A2）。
+	ServiceAllow []string
+	// MaxServicesPerAgent 是单个 agent 可注册的服务数上限（默认 64，0 = 不限）。
+	MaxServicesPerAgent int
+	// MaxConns 是隧道控制面与 TCP 数据面的并发连接上限，默认 1024；0 表示不限制。
+	MaxConns int
+	// MaxConnsPerIP 是单个来源 IP 的并发连接上限（含隧道与 TCP 数据面），
+	// 默认 128；0 表示不限制。
+	MaxConnsPerIP int
+	// MaxPendingPairs 是待配对表 + 已签发令牌数的上限，默认 4096；超过后新的
+	// ConnectRequest 回 too_many_pending。
+	MaxPendingPairs int
 	// PairTimeout 是待配对表超时，默认 10s。
 	PairTimeout time.Duration
 	// IdleTimeout 是数据面空闲超时，默认 300s。
@@ -143,6 +160,9 @@ type ServerConfig struct {
 	Services []ServerService
 	// TLS 是三态 TLS 开关：auto（默认，按 CA/insecure 推断）| true（强制 TLS）| false（强制明文）。
 	TLS TLSMode
+	// DataTLS 是数据面三态 TLS 开关：auto（默认，跟随 relay 下发）| true（必须 TLS）
+	// | false（强制明文）。与 TLS 相互独立：隧道明文时数据面仍可要求 TLS。
+	DataTLS TLSMode
 	// TLSCA 是可选 CA 文件路径，用于校验 relay 证书。
 	TLSCA string
 	// TLSInsecureSkipVerify 为 true 时跳过 relay 证书校验（仅建议测试环境）。
@@ -196,6 +216,9 @@ type ClientConfig struct {
 	Services []ClientService
 	// TLS 是三态 TLS 开关：auto（默认，按 CA/insecure 推断）| true（强制 TLS）| false（强制明文）。
 	TLS TLSMode
+	// DataTLS 是数据面三态 TLS 开关：auto（默认，跟随 relay 下发）| true（必须 TLS）
+	// | false（强制明文）。与 TLS 相互独立：隧道明文时数据面仍可要求 TLS。
+	DataTLS TLSMode
 	// TLSCA 是可选 CA 文件路径，用于校验 relay 证书。
 	TLSCA string
 	// TLSInsecureSkipVerify 为 true 时跳过 relay 证书校验（仅建议测试环境）。
@@ -228,15 +251,21 @@ func newDefault() *Config {
 			LogFormat: "text",
 		},
 		Relay: RelayConfig{
-			TLS:               TLSAuto,
-			PairTimeout:       10 * time.Second,
-			IdleTimeout:       300 * time.Second,
-			HeartbeatTimeout:  90 * time.Second,
-			UDPSessionTimeout: 60 * time.Second,
-			TokenTTL:          15 * time.Second,
+			TLS:                 TLSAuto,
+			DataTLS:             TLSAuto,
+			MaxServicesPerAgent: 64,
+			MaxConns:            1024,
+			MaxConnsPerIP:       128,
+			MaxPendingPairs:     4096,
+			PairTimeout:         10 * time.Second,
+			IdleTimeout:         300 * time.Second,
+			HeartbeatTimeout:    90 * time.Second,
+			UDPSessionTimeout:   60 * time.Second,
+			TokenTTL:            15 * time.Second,
 		},
 		Server: ServerConfig{
 			TLS:                 TLSAuto,
+			DataTLS:             TLSAuto,
 			Heartbeat:           30 * time.Second,
 			DialTimeout:         10 * time.Second,
 			UDPSessionTimeout:   60 * time.Second,
@@ -245,6 +274,7 @@ func newDefault() *Config {
 		},
 		Client: ClientConfig{
 			TLS:                 TLSAuto,
+			DataTLS:             TLSAuto,
 			Heartbeat:           30 * time.Second,
 			Subscribe:           true,
 			DialTimeout:         10 * time.Second,
@@ -358,6 +388,24 @@ func (b *builder) boolean(section, key string, def bool) (bool, error) {
 	}
 }
 
+// integer 解析非负整数键；键不存在或值为空时返回默认值。
+//
+// 用于 max_conns / max_conns_per_ip / max_pending_pairs 这类上限（0 = 不限制）。
+func (b *builder) integer(section, key string, def int) (int, error) {
+	v, ok := b.raw(section, key)
+	if !ok || strings.TrimSpace(v.Value) == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v.Value))
+	if err != nil {
+		return def, fmt.Errorf("第 %d 行: [%s] %s = %q 不是合法的整数", v.Line, section, key, v.Value)
+	}
+	if n < 0 {
+		return def, fmt.Errorf("第 %d 行: [%s] %s = %q 不能为负数（0 表示不限制）", v.Line, section, key, v.Value)
+	}
+	return n, nil
+}
+
 // tlsMode 解析三态 tls 键；键不存在或值为空时返回默认值。
 func (b *builder) tlsMode(section, key string, def TLSMode) (TLSMode, error) {
 	v, ok := b.raw(section, key)
@@ -369,6 +417,26 @@ func (b *builder) tlsMode(section, key string, def TLSMode) (TLSMode, error) {
 		return def, fmt.Errorf("第 %d 行: [%s] %s = %q: %w", v.Line, section, key, v.Value, err)
 	}
 	return m, nil
+}
+
+// splitList 把逗号分隔的配置值拆成去空白、去空项的列表（保留原始顺序）。
+//
+// 用于 [relay] service_allow 这类白名单；重复项与合法性由 Validate 统一处理。
+func splitList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // load 依次解析各段。
@@ -416,9 +484,25 @@ func (b *builder) loadRelay() error {
 	r.AuthToken = b.str("relay", "auth_token")
 	r.TLSCert = b.absPath(b.str("relay", "tls_cert"))
 	r.TLSKey = b.absPath(b.str("relay", "tls_key"))
+	r.ServiceAllow = splitList(b.str("relay", "service_allow"))
 
 	var err error
 	if r.TLS, err = b.tlsMode("relay", "tls", r.TLS); err != nil {
+		return err
+	}
+	if r.DataTLS, err = b.tlsMode("relay", "data_tls", r.DataTLS); err != nil {
+		return err
+	}
+	if r.MaxServicesPerAgent, err = b.integer("relay", "max_services_per_agent", r.MaxServicesPerAgent); err != nil {
+		return err
+	}
+	if r.MaxConns, err = b.integer("relay", "max_conns", r.MaxConns); err != nil {
+		return err
+	}
+	if r.MaxConnsPerIP, err = b.integer("relay", "max_conns_per_ip", r.MaxConnsPerIP); err != nil {
+		return err
+	}
+	if r.MaxPendingPairs, err = b.integer("relay", "max_pending_pairs", r.MaxPendingPairs); err != nil {
 		return err
 	}
 	if r.PairTimeout, err = b.duration("relay", "pair_timeout", r.PairTimeout); err != nil {
@@ -450,6 +534,9 @@ func (b *builder) loadServer() error {
 
 	var err error
 	if s.TLS, err = b.tlsMode("server", "tls", s.TLS); err != nil {
+		return err
+	}
+	if s.DataTLS, err = b.tlsMode("server", "data_tls", s.DataTLS); err != nil {
 		return err
 	}
 	if s.TLSInsecureSkipVerify, err = b.boolean("server", "tls_insecure_skip_verify", false); err != nil {
@@ -508,6 +595,9 @@ func (b *builder) loadClient() error {
 
 	var err error
 	if c.TLS, err = b.tlsMode("client", "tls", c.TLS); err != nil {
+		return err
+	}
+	if c.DataTLS, err = b.tlsMode("client", "data_tls", c.DataTLS); err != nil {
 		return err
 	}
 	if c.TLSInsecureSkipVerify, err = b.boolean("client", "tls_insecure_skip_verify", false); err != nil {

@@ -1,11 +1,13 @@
 package relay
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,6 +61,43 @@ type tunnelConn struct {
 
 	closeOnce sync.Once
 	done      chan struct{}
+
+	// pending 记录本连接已签发但尚未完成配对的配对键（SEC-D2 单连接配额）。
+	// 只在 readLoop goroutine 内使用；用独立锁是为了将来允许异步写。
+	pendingMu sync.Mutex
+	pending   map[string]struct{}
+}
+
+// reservePending 登记一条"已签发、待配对"的请求；超过 maxPendingPerConn 返回 false。
+//
+// 登记前先剔除已经完成配对（令牌被消费）或已过期的键，避免计数只增不减。
+func (tc *tunnelConn) reservePending(key pairing.PairingKey) bool {
+	id := key.String()
+	tc.pendingMu.Lock()
+	defer tc.pendingMu.Unlock()
+	if tc.pending == nil {
+		tc.pending = make(map[string]struct{}, maxPendingPerConn)
+	}
+	for old := range tc.pending {
+		if !tc.srv.tokens.PendingID(old) {
+			delete(tc.pending, old)
+		}
+	}
+	if _, ok := tc.pending[id]; ok {
+		return true
+	}
+	if len(tc.pending) >= maxPendingPerConn {
+		return false
+	}
+	tc.pending[id] = struct{}{}
+	return true
+}
+
+// releasePending 撤销一条登记（签发失败时回滚）。
+func (tc *tunnelConn) releasePending(key pairing.PairingKey) {
+	tc.pendingMu.Lock()
+	delete(tc.pending, key.String())
+	tc.pendingMu.Unlock()
 }
 
 // acceptLoop 接受控制连接，每条连接一个 goroutine。
@@ -73,13 +112,26 @@ func (l *TunnelListener) acceptLoop() {
 			l.srv.fail(fmt.Errorf("relay: 隧道 accept: %w", err))
 			return
 		}
-		l.srv.log.Info("控制连接接入",
+		l.srv.log.Debug("控制连接接入",
 			"event", "tunnel_accept",
 			"remote", conn.RemoteAddr().String(),
 		)
+		host, ok, reason := l.srv.conns.acquire(conn.RemoteAddr())
+		if !ok {
+			// SEC-D2：超过 max_conns / max_conns_per_ip 时立即关闭新连接，
+			// WARN 由 limiter 限速（每 5 秒最多一条）。
+			if !l.srv.conns.warnLimited(l.srv.log, conn.RemoteAddr(), reason) {
+				l.srv.log.Debug("控制连接被连接上限拒绝",
+					"event", "conn_reject", "reason", reason,
+					"remote", conn.RemoteAddr().String())
+			}
+			_ = conn.Close()
+			continue
+		}
 		l.srv.wg.Add(1)
 		go func() {
 			defer l.srv.wg.Done()
+			defer l.srv.conns.release(host)
 			l.handle(conn)
 		}()
 	}
@@ -123,7 +175,8 @@ func (l *TunnelListener) handle(conn net.Conn) {
 
 	// Hello 必须在限定时间内到达，避免半开连接长期占用资源。
 	_ = conn.SetReadDeadline(time.Now().Add(controlHelloTimeout))
-	typ, payload, err := protocol.ReadFrame(conn)
+	// 报到帧只有 ~200 字节；网络入口统一用 64 KiB 上限（SEC-D1 / P0-1）。
+	typ, payload, err := protocol.ReadFrameWithLimit(conn, protocol.NetworkPayloadLimit)
 	if err != nil {
 		tc.log.Warn("读取 Hello 失败", "event", "hello_fail", "err", err)
 		return
@@ -162,11 +215,13 @@ func (l *TunnelListener) handle(conn net.Conn) {
 		return
 	}
 
-	if !s.checkAuth(hello.Token) {
-		tc.log.Warn("接入密钥错误",
+	if err := s.checkAuth(conn.RemoteAddr(), hello.Token); err != nil {
+		tc.log.Warn("隧道接入被拒绝",
 			"event", "auth_failed",
-			"role", hello.Role,
-			"client_name", hello.ClientName,
+			"role", logx.CleanN(hello.Role, logx.MaxAttrLen),
+			"client_name", logx.CleanN(hello.ClientName, logx.MaxAttrLen),
+			"remote", conn.RemoteAddr().String(),
+			"err", err,
 		)
 		_ = tc.writeError(protocol.ErrCodeAuthFailed, "接入密钥错误")
 		return
@@ -211,6 +266,9 @@ func (l *TunnelListener) handle(conn net.Conn) {
 		UDPMode:          s.udpMode,
 		TCPDataPort:      s.tcpPort,
 		UDPDataPort:      s.udpPort,
+		// 显式下发（含 false）：新 agent/client 据此决定数据面是否 TLS，
+		// nil 只可能来自旧 relay，用于触发「明文 + WARN」回退（SEC-T1）。
+		DataTLS: boolPtr(s.dataTLS),
 	}
 	if hello.Role == protocol.RoleAgent {
 		helloOK.AgentID = id
@@ -228,7 +286,7 @@ func (l *TunnelListener) handle(conn net.Conn) {
 	)
 	tc.log.Info("控制面接入成功",
 		"event", "hello_ok",
-		"client_name", hello.ClientName,
+		"client_name", logx.CleanN(hello.ClientName, logx.MaxAttrLen),
 		"udp_mode", s.udpMode,
 	)
 	// 身份字段写入完成后再对外可见（心跳判死 ticker 只检查 ready 的连接）。
@@ -243,23 +301,80 @@ func (l *TunnelListener) handle(conn net.Conn) {
 	tc.readLoop()
 }
 
-// checkAuth 校验隧道接入密钥；未配置 auth_token 时放行。
-func (s *server) checkAuth(got string) bool {
-	want := s.cfg.Relay.AuthToken
-	if want == "" {
-		s.log.Debug("auth_token 为空，放行接入",
-			"event", "config_warning",
-			"detail", "auth_token 未配置",
-		)
+// 隧道接入鉴权错误（供日志与单测判别）。
+var (
+	// errAuthNonLoopbackEmptyToken 表示 auth_token 为空且来源不是回环地址。
+	errAuthNonLoopbackEmptyToken = errors.New("relay: auth_token 为空时只允许回环来源接入")
+	// errAuthMismatch 表示 auth_token 与配置不匹配。
+	errAuthMismatch = errors.New("relay: 接入密钥错误")
+)
+
+// checkAuth 校验隧道接入密钥（server 上的入口，转到纯函数 authAllowed）。
+func (s *server) checkAuth(remote net.Addr, got string) error {
+	return authAllowed(s.cfg.Relay.AuthToken, got, remote)
+}
+
+// authAllowed 是鉴权判定的纯函数版本（SEC-A1）。
+//
+// 规则：
+//   - want == ""：**只允许来源为回环地址**（127.0.0.0/8、::1）的 agent/client 接入；
+//     非回环来源一律拒绝。空 token 不再是"人人可接入"。
+//   - want != ""：token 必须匹配（两侧先做 SHA-256 再常量时间比较，避免
+//     长度/内容的时序侧信道）。
+//
+// 抽成不依赖 server 状态的函数，是为了能在 loopback 测试里覆盖"非回环来源"
+// 这一分支（假 relay 只能产生 127.0.0.1 连接）。
+func authAllowed(want, got string, remote net.Addr) error {
+	if strings.TrimSpace(want) == "" {
+		if !isLoopbackRemote(remote) {
+			return errAuthNonLoopbackEmptyToken
+		}
+		return nil
+	}
+	wantHash := sha256.Sum256([]byte(want))
+	gotHash := sha256.Sum256([]byte(got))
+	if subtle.ConstantTimeCompare(wantHash[:], gotHash[:]) != 1 {
+		return errAuthMismatch
+	}
+	return nil
+}
+
+// isLoopbackRemote 报告连接来源是否在回环网段。
+//
+// 判定与 internal/admin.IsLoopbackListen、config.isLoopbackListenAddr 一致：
+// 127.0.0.0/8（含 IPv4-mapped IPv6 ::ffff:127.x.x.x）、::1。
+func isLoopbackRemote(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	return isLoopbackHostText(host)
+}
+
+// isLoopbackHostText 报告 host 文本是否是回环 IP 或 localhost。
+func isLoopbackHostText(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // readLoop 读取并分发控制面消息。
 func (tc *tunnelConn) readLoop() {
 	for {
-		typ, payload, err := protocol.ReadFrame(tc.conn)
+		// 控制面网络入口上限 64 KiB（SEC-D1 / P0-1）：服务列表远小于此值。
+		typ, payload, err := protocol.ReadFrameWithLimit(tc.conn, protocol.NetworkPayloadLimit)
 		if err != nil {
 			if tc.srv.ctx.Err() == nil && !tc.isClosed() {
 				tc.log.Warn("控制连接读取失败", "event", "data_close", "err", err)
@@ -312,7 +427,9 @@ func (l *TunnelListener) dispatch(tc *tunnelConn, typ protocol.MessageType, msg 
 		return false
 	case protocol.MsgError:
 		peerErr := msg.(*protocol.Error)
-		tc.log.Warn("对端返回错误", "event", "peer_error", "code", peerErr.Code, "detail", peerErr.Message)
+		tc.log.Warn("对端返回错误", "event", "peer_error",
+			"code", logx.CleanN(peerErr.Code, logx.MaxAttrLen),
+			"detail", logx.CleanN(peerErr.Message, logx.MaxAttrLen))
 		return true
 	default:
 		if !typ.Valid() {
@@ -324,24 +441,96 @@ func (l *TunnelListener) dispatch(tc *tunnelConn, typ protocol.MessageType, msg 
 	}
 }
 
-// handleRegisterService 处理 agent 的服务注册。
+// handleRegisterService 处理 agent 的服务注册（SEC-A2）。
+//
+// 依次检查：白名单 → 单 agent 服务数上限 → 归属规则（同 owner 覆盖 / 异 owner
+// 在线拒绝 / 异 owner 离线接管）→ 注册并回 MsgServiceRegistered。
+// 拒绝原因通过 MsgError.Detail 下发稳定的机器可读码（service_denied /
+// service_conflict / service_limit），agent 据此给出可读提示。
 func (l *TunnelListener) handleRegisterService(tc *tunnelConn, req *protocol.RegisterService) {
 	s := tc.srv
 	if tc.role != protocol.RoleAgent {
-		_ = tc.writeError(protocol.ErrCodeBadRequest, "只有 agent 可以注册服务")
+		_ = tc.writeErrorDetail(protocol.ErrCodeBadRequest, "只有 agent 可以注册服务", "")
 		return
 	}
 	if !validServiceID(req.ServiceID) {
-		_ = tc.writeError(protocol.ErrCodeBadRequest, "service_id 非法")
+		_ = tc.writeErrorDetail(protocol.ErrCodeBadRequest, "service_id 非法", "")
 		return
 	}
 	if !validProto(req.Proto) {
-		_ = tc.writeError(protocol.ErrCodeBadRequest, "proto 必须是 tcp 或 udp")
+		_ = tc.writeErrorDetail(protocol.ErrCodeBadRequest, "proto 必须是 tcp 或 udp", "")
 		return
 	}
-	if existing, ok := s.services.Get(req.ServiceID); ok && existing.AgentID != tc.agentID {
-		_ = tc.writeError(protocol.ErrCodeBadRequest, "服务已由其它 agent 注册")
+
+	// 1) 白名单（空 = 不限制，启动时已 WARN）。
+	if !s.serviceAllowed(req.ServiceID) {
+		tc.log.Warn("服务注册被拒绝：服务名不在白名单",
+			"event", "service_denied",
+			"service_id", req.ServiceID,
+			"agent_id", tc.agentID,
+			"detail", "service_allow 未列出该服务名",
+		)
+		_ = tc.writeErrorDetail(protocol.ErrCodeBadRequest, "服务名不在白名单（relay 的 [relay] service_allow 未列出 "+req.ServiceID+"）", protocol.ErrDetailServiceDenied)
 		return
+	}
+
+	// 2) 单 agent 服务数上限（同一服务重复注册不重复计数）。
+	existing, exists := s.services.Get(req.ServiceID)
+	if limit := s.maxServicesPerAgent(); limit > 0 && !(exists && existing.AgentID == tc.agentID) {
+		if len(s.services.ListByAgent(tc.agentID)) >= limit {
+			tc.log.Warn("服务注册被拒绝：该 agent 服务数已达上限",
+				"event", "service_denied",
+				"reason", "max_services_per_agent",
+				"service_id", req.ServiceID,
+				"agent_id", tc.agentID,
+				"limit", limit,
+			)
+			_ = tc.writeErrorDetail(protocol.ErrCodeBadRequest,
+				fmt.Sprintf("该 agent 已注册 %d 个服务，达到上限 max_services_per_agent = %d", limit, limit),
+				protocol.ErrDetailServiceLimit)
+			return
+		}
+	}
+
+	// 3) 归属规则。
+	if exists && existing.AgentID != tc.agentID {
+		if s.agentOnline(existing.AgentID) {
+			// 原 owner 仍在线：拒绝，避免在线抢占/流量劫持。
+			tc.log.Warn("服务注册被拒绝：服务已由其它在线 agent 注册",
+				"event", "service_conflict",
+				"service_id", req.ServiceID,
+				"owner", existing.AgentID,
+				"requester", tc.agentID,
+				"detail", "原 owner 在线，拒绝抢占",
+			)
+			_ = tc.writeErrorDetail(protocol.ErrCodeBadRequest, "服务已由其它 agent 注册", protocol.ErrDetailServiceConflict)
+			return
+		}
+		// 原 owner 已离线：允许接管（真实 agent 重连自愈），并 WARN 留痕。
+		if _, _, ok := s.services.RecentOwner(req.ServiceID); !ok {
+			// 在线表存在但历史表未记录（极少见：直接构造状态/历史被淘汰），补一条。
+			s.services.RememberOwner(req.ServiceID, existing.AgentID, time.Now())
+		}
+		tc.log.Warn("服务已由离线 agent 接管",
+			"event", "service_takeover",
+			"service_id", req.ServiceID,
+			"old_owner", existing.AgentID,
+			"new_owner", tc.agentID,
+			"detail", "原 owner 离线或心跳超时，允许新 agent 接管",
+		)
+	} else if !exists {
+		// 在线表已无该服务（正常断开/注销即删除，保持原有语义）：查"最近归属"
+		// 表判断是否为离线接管；原 owner 仍在线（主动注销释放）时不报接管。
+		if owner, at, ok := s.services.RecentOwner(req.ServiceID); ok && owner != tc.agentID && !s.agentOnline(owner) {
+			tc.log.Warn("服务已由离线 agent 接管",
+				"event", "service_takeover",
+				"service_id", req.ServiceID,
+				"old_owner", owner,
+				"new_owner", tc.agentID,
+				"disconnected_at", at.Format(time.RFC3339),
+				"detail", "服务已从在线表移除且原 owner 不在线，允许新 agent 接管",
+			)
+		}
 	}
 
 	entry := registry.ServiceEntry{
@@ -353,7 +542,7 @@ func (l *TunnelListener) handleRegisterService(tc *tunnelConn, req *protocol.Reg
 		RegisteredAt: time.Now(),
 	}
 	if err := s.services.Register(entry); err != nil {
-		_ = tc.writeError(protocol.ErrCodeInternal, "服务注册失败")
+		_ = tc.writeErrorDetail(protocol.ErrCodeInternal, "服务注册失败", "")
 		return
 	}
 
@@ -374,6 +563,7 @@ func (l *TunnelListener) handleRegisterService(tc *tunnelConn, req *protocol.Reg
 		"event", "service_register",
 		"service_id", req.ServiceID,
 		"proto", req.Proto,
+		"owner", tc.agentID,
 		"local_hint", req.LocalHint,
 	)
 }
@@ -480,11 +670,7 @@ func (l *TunnelListener) handleConnectRequest(tc *tunnelConn, req *protocol.Conn
 		return
 	}
 
-	agent, online := s.agents.Get(entry.AgentID)
-	agentOnline := online
-	if agentOnline && s.heartbeatTimeoutValue() > 0 {
-		agentOnline = time.Since(agent.LastSeen) <= s.heartbeatTimeoutValue()
-	}
+	agentOnline := s.agentOnline(entry.AgentID)
 	if !agentOnline {
 		tc.log.Warn("接入请求的 agent 不在线",
 			"event", "connect_request",
@@ -495,7 +681,17 @@ func (l *TunnelListener) handleConnectRequest(tc *tunnelConn, req *protocol.Conn
 		return
 	}
 
-	if s.pairs.Len() >= maxPendingPairs {
+	// SEC-D2：配额计入"待配对占位 + 已签发令牌"（tokens.Len() 含已消费未过期条目），
+	// 上限可配（[relay] max_pending_pairs，默认 4096，0 = 不限制）。
+	if limit := s.cfg.Relay.MaxPendingPairs; limit > 0 && s.pairs.Len()+s.tokens.Len() >= limit {
+		tc.log.Warn("待配对/令牌数已达上限，拒绝接入请求",
+			"event", "connect_request",
+			"reason", "max_pending_pairs",
+			"limit", limit,
+			"pending_pairs", s.pairs.Len(),
+			"tokens", s.tokens.Len(),
+			"service_id", req.ServiceID,
+		)
 		_ = tc.writeErrorFor(protocol.ErrCodeTooManyPending, "待配对表已满，请稍后重试", connID)
 		return
 	}
@@ -506,8 +702,21 @@ func (l *TunnelListener) handleConnectRequest(tc *tunnelConn, req *protocol.Conn
 		return
 	}
 
+	// SEC-D2：单连接"已签发但未完成配对"的请求数上限（默认 64）。
+	if !tc.reservePending(key) {
+		tc.log.Warn("单连接未完成请求数已达上限，拒绝接入请求",
+			"event", "connect_request",
+			"reason", "max_pending_per_conn",
+			"limit", maxPendingPerConn,
+			"pairing_key", key.String(),
+		)
+		_ = tc.writeErrorFor(protocol.ErrCodeTooManyPending, "该连接未完成的接入请求过多，请稍后重试", connID)
+		return
+	}
+
 	pairingToken, err := s.tokens.Issue(key)
 	if err != nil {
+		tc.releasePending(key)
 		tc.log.Error("签发配对令牌失败", "event", "internal", "pairing_key", key.String(), "err", err)
 		_ = tc.writeErrorFor(protocol.ErrCodeInternal, "签发配对令牌失败", connID)
 		return
@@ -725,6 +934,18 @@ func (tc *tunnelConn) writeErrorFor(code, message, clientConnID string) error {
 		Code:         code,
 		Message:      message,
 		ClientConnID: clientConnID,
+	})
+}
+
+// writeErrorDetail 写一帧带稳定 Detail 的 MsgError。
+//
+// 服务注册拒绝用 Detail 下发机器可读原因（service_denied / service_conflict /
+// service_limit，SEC-A2）；旧 agent 忽略该字段，只看 message。
+func (tc *tunnelConn) writeErrorDetail(code, message, detail string) error {
+	return tc.write(protocol.MsgError, &protocol.Error{
+		Code:    code,
+		Message: message,
+		Detail:  detail,
 	})
 }
 

@@ -35,6 +35,14 @@ type server struct {
 	// udpMode 在启动时确定，运行期间不变：native 或 tcp_tunnel。
 	udpMode string
 
+	// tunnelTLS / dataTLS 在启动时由三态 tls / data_tls 与证书材料确定，
+	// 运行期间不变；tlsCfg 为两个监听器共用（证书与 MinVersion 完全一致）。
+	tunnelTLS bool
+	dataTLS   bool
+	tlsCfg    *tls.Config
+	// serviceAllow 是 [relay] service_allow 白名单集合（空表示不限制，SEC-A2）。
+	serviceAllow map[string]struct{}
+
 	// 阶段 7：管理页可在运行期修改的三个超时（纳秒，atomic）。
 	//
 	// pair_timeout 由 PairingTable 自己持有（SetTimeout），token_ttl 由 token.Store
@@ -42,6 +50,8 @@ type server struct {
 	idleTimeout       atomic.Int64
 	heartbeatTimeout  atomic.Int64
 	udpSessionTimeout atomic.Int64
+	// carrierTimeout 是承载连接单帧读超时（SEC-M4），随 udp_session_timeout 联动。
+	carrierTimeout atomic.Int64
 
 	services *registry.ServiceRegistry
 	agents   *registry.AgentRegistry
@@ -72,6 +82,9 @@ type server struct {
 
 	dataConns *connSet
 
+	// conns 限制隧道控制面与 TCP 数据面的并发连接数（SEC-D2）。
+	conns *connLimiter
+
 	waitMu sync.Mutex
 	waits  map[pairing.PairingKey]*pairWait
 
@@ -101,14 +114,30 @@ func (s *server) serve(parent context.Context) error {
 		"udp_listen", s.cfg.Relay.UDPListen,
 	)
 	if strings.TrimSpace(s.cfg.Relay.AuthToken) == "" {
-		s.log.Warn("auth_token 为空，任何 agent/client 都可接入隧道",
+		s.log.Warn("auth_token 为空：仅允许回环来源接入隧道（非回环来源将回 auth_failed），仅供本机调试",
 			"event", "config_warning", "detail", "auth_token 未配置")
 	}
+	if len(s.serviceAllow) == 0 {
+		s.log.Warn("未配置 service_allow：任何持有 auth_token 的接入者都可以注册任意服务名（SEC-A2），多租户/公网部署建议显式列出允许的服务名",
+			"event", "config_warning", "detail", "service_allow 未配置")
+	}
+	if s.cfg.Relay.MaxConns > 0 || s.cfg.Relay.MaxConnsPerIP > 0 {
+		s.log.Info("连接上限已启用",
+			"event", "start",
+			"max_conns", s.cfg.Relay.MaxConns,
+			"max_conns_per_ip", s.cfg.Relay.MaxConnsPerIP,
+		)
+	}
 
-	// 1) 先监听 TCP 数据面。
-	tcpLn, err := net.Listen("tcp", s.cfg.Relay.TCPListen)
+	// 0) 先按 tls / data_tls 决定两个监听器是否 TLS，并加载（共用）证书。
+	if err := s.prepareTLS(); err != nil {
+		return err
+	}
+
+	// 1) 先监听 TCP 数据面（data_tls 生效时为 TLS）。
+	tcpLn, err := s.listenTCPData()
 	if err != nil {
-		return fmt.Errorf("relay: 监听 TCP 数据面 %s: %w", s.cfg.Relay.TCPListen, err)
+		return err
 	}
 	s.tcpData = &TCPDataListener{srv: s, ln: tcpLn}
 	s.tcpAddr = tcpLn.Addr().String()
@@ -181,13 +210,18 @@ func (s *server) serve(parent context.Context) error {
 	return nil
 }
 
-// listenTunnel 按三态 tls 开关监听隧道端口。
+// prepareTLS 按三态 tls / data_tls 决定隧道与数据面是否 TLS，并加载共用证书。
 //
-// 决策顺序（docs/architecture.md §7.6）：
-//   - tls = true：必须 TLS；tls_cert/tls_key 缺失时返回错误（Validate 已提前拦截）；
-//   - tls = false：一律明文；若配了证书则 WARN（材料被忽略）；
-//   - tls = auto（默认）：证书+私钥均非空 → TLS；否则明文 + WARN（既有行为）。
-func (s *server) listenTunnel() (net.Listener, error) {
+// 决策顺序（docs/architecture.md §7.6 / §7.11）：
+//   - 隧道 tls = true：必须 TLS；tls_cert/tls_key 缺失时返回错误（Validate 已提前拦截）；
+//   - 隧道 tls = false：一律明文；若配了证书则 WARN（材料被忽略）；
+//   - 隧道 tls = auto（默认）：证书+私钥均非空 → TLS；否则明文 + WARN（既有行为）；
+//   - 数据面 data_tls = true：强制 TLS，证书与隧道共用；
+//   - 数据面 data_tls = false：强制明文；
+//   - 数据面 data_tls = auto：跟随隧道判定（隧道 TLS 时数据面也 TLS）。
+//
+// 证书只加载一次，隧道与数据面共享同一个 *tls.Config（MinVersion 均为 1.2）。
+func (s *server) prepareTLS() error {
 	certPath := strings.TrimSpace(s.cfg.Relay.TLSCert)
 	keyPath := strings.TrimSpace(s.cfg.Relay.TLSKey)
 	complete := certPath != "" && keyPath != ""
@@ -202,10 +236,9 @@ func (s *server) listenTunnel() (net.Listener, error) {
 			s.log.Warn("tls = false，隧道以明文运行（不建议在公网使用）",
 				"event", "config_warning", "detail", "tls=false")
 		}
-		return s.listenPlainTunnel()
 	case config.TLSTrue:
 		if !complete {
-			return nil, fmt.Errorf("relay: tls = true 但缺少 tls_cert / tls_key（强制 TLS 必须同时配置证书与私钥）")
+			return fmt.Errorf("relay: tls = true 但缺少 tls_cert / tls_key（强制 TLS 必须同时配置证书与私钥）")
 		}
 	default: // auto
 		if !complete {
@@ -216,19 +249,75 @@ func (s *server) listenTunnel() (net.Listener, error) {
 				s.log.Warn("未配置 TLS，隧道以明文运行（不建议在公网使用）",
 					"event", "config_warning", "detail", "隧道明文")
 			}
-			return s.listenPlainTunnel()
+		}
+	}
+	s.tunnelTLS = mode.ListenTLS(certPath, keyPath)
+
+	dataMode := s.cfg.Relay.DataTLS
+	if dataMode == config.TLSTrue && !complete {
+		return fmt.Errorf("relay: data_tls = true 但缺少 tls_cert / tls_key（数据面 TLS 与隧道共用证书，必须同时配置证书与私钥）")
+	}
+	s.dataTLS = dataMode.RelayDataTLS(s.tunnelTLS)
+	if s.tunnelTLS || s.dataTLS {
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return fmt.Errorf("relay: 加载 TLS 证书 %s / %s: %w", certPath, keyPath, err)
+		}
+		s.tlsCfg = &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
 		}
 	}
 
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	// 数据面最终状态的可见性：启动日志必须能一眼看出是否加密（SEC-T1）。
+	if s.dataTLS {
+		s.log.Info("数据面: TLS", "event", "start",
+			"detail", "数据面: TLS(证书="+certPath+", 类型=TCP)",
+			"data_tls", true, "tls_min_version", "1.2")
+	} else {
+		detail := "数据面: 明文（业务数据与 pairing_token 在链路上可被读取）"
+		if dataMode == config.TLSFalse {
+			detail = "数据面: 明文（data_tls = false 显式关闭，业务数据与 pairing_token 不加密）"
+		} else if s.tunnelTLS {
+			detail = "数据面: 明文（data_tls = false 覆盖了隧道 TLS；只有控制面加密）"
+		}
+		s.log.Warn(detail, "event", "config_warning", "detail", detail, "data_tls", false)
+	}
+	if s.dataTLS && s.udpMode == protocol.UDPModeNative {
+		s.log.Warn("原生 UDP 数据面仍为明文（不引入 DTLS）：已配置 udp_listen，如需加密请移除 udp_listen 改用 udp_mode = tcp_tunnel（承载走已加密的 TCP 数据面）",
+			"event", "config_warning", "detail", "data_tls 不覆盖原生 UDP")
+	}
+	return nil
+}
+
+// listenTCPData 按 data_tls 决定以 TLS 还是明文监听 TCP 数据面。
+//
+// tls.Listener 在 Accept 时不握手，握手发生在首帧读取；明文客户端连 TLS 端口
+// 会在 handleDataConn 的报到读帧处失败，并记录 data_plane_tls_handshake_fail。
+func (s *server) listenTCPData() (net.Listener, error) {
+	if s.dataTLS {
+		ln, err := tls.Listen("tcp", s.cfg.Relay.TCPListen, s.tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("relay: 监听 TCP 数据面（TLS）%s: %w", s.cfg.Relay.TCPListen, err)
+		}
+		s.log.Info("TCP 数据面使用 TLS 监听", "event", "start",
+			"tcp_listen", ln.Addr().String(), "tls_min_version", "1.2")
+		return ln, nil
+	}
+	ln, err := net.Listen("tcp", s.cfg.Relay.TCPListen)
 	if err != nil {
-		return nil, fmt.Errorf("relay: 加载 TLS 证书 %s / %s: %w", certPath, keyPath, err)
+		return nil, fmt.Errorf("relay: 监听 TCP 数据面 %s: %w", s.cfg.Relay.TCPListen, err)
 	}
-	tlsCfg := &tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{cert},
+	s.log.Info("TCP 数据面以明文监听", "event", "start", "tcp_listen", ln.Addr().String())
+	return ln, nil
+}
+
+// listenTunnel 按 prepareTLS 的结果监听隧道端口。
+func (s *server) listenTunnel() (net.Listener, error) {
+	if !s.tunnelTLS {
+		return s.listenPlainTunnel()
 	}
-	ln, err := tls.Listen("tcp", s.cfg.Relay.TunnelListen, tlsCfg)
+	ln, err := tls.Listen("tcp", s.cfg.Relay.TunnelListen, s.tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("relay: 监听隧道（TLS）%s: %w", s.cfg.Relay.TunnelListen, err)
 	}

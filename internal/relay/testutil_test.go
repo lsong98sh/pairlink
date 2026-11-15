@@ -196,6 +196,22 @@ func (c *ctrlConn) register(serviceID, proto string) *protocol.ServiceRegistered
 	return reg
 }
 
+// registerExpectError 发送服务注册并断言被拒绝（返回 MsgError）。
+func (c *ctrlConn) registerExpectError(serviceID, proto, wantDetail string) *protocol.Error {
+	c.t.Helper()
+	c.send(protocol.MsgRegisterService, &protocol.RegisterService{
+		ServiceID: serviceID,
+		Proto:     proto,
+		LocalHint: "127.0.0.1:1",
+	})
+	protocolErr := c.expectError(protocol.ErrCodeBadRequest)
+	if protocolErr.Detail != wantDetail {
+		c.t.Fatalf("服务 %s 的拒绝原因 Detail = %q，期望 %q（message=%q）",
+			serviceID, protocolErr.Detail, wantDetail, protocolErr.Message)
+	}
+	return protocolErr
+}
+
 // sync 发送一次心跳并等待 Ack，用于确保同一控制连接上先前的消息已被处理。
 //
 // 订阅后 relay 可能主动下发全量 ServiceList（订阅基线或 revision 断档重同步），

@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/config"
+	"github.com/lsong98sh/pairlink/internal/logx"
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
 )
@@ -74,16 +74,46 @@ func (c *client) connectOnce() error {
 		return permanent(fmt.Errorf("client: relay 协议版本不匹配: %w", err))
 	}
 
+	// 数据面 TLS（SEC-T1）：本地 [client] data_tls × relay 的 HelloOK.data_tls。
+	// 不兼容属永久错误（不重连、不静默降级）；旧 relay 未下发时按明文 + WARN。
+	dataNeg := config.NegotiateDataTLS(c.cfg.Client.DataTLS, helloOK.DataTLS)
+	if dataNeg.Err != nil {
+		c.closeControl()
+		return permanent(fmt.Errorf("client: %w", dataNeg.Err))
+	}
+	if dataNeg.Warning != "" {
+		c.ctrlLog.Warn(dataNeg.Warning, "event", "data_tls", "detail", "old_relay_or_missing_field")
+	}
+	var dataTLSCfg *tls.Config
+	if dataNeg.UseTLS {
+		cfg, cfgErr := c.dataTLSConfig()
+		if cfgErr != nil {
+			c.closeControl()
+			return cfgErr
+		}
+		dataTLSCfg = cfg
+	}
+
 	neg := negotiated{
-		clientID:  helloOK.ClientID,
-		udpMode:   c.resolveUDPMode(helloOK.UDPMode, "hello_ok"),
-		heartbeat: negotiateHeartbeat(c.cfg.Client.Heartbeat, helloOK.HeartbeatSeconds),
-		tcpPort:   helloOK.TCPDataPort,
-		udpPort:   helloOK.UDPDataPort,
+		clientID:   helloOK.ClientID,
+		udpMode:    c.resolveUDPMode(helloOK.UDPMode, "hello_ok"),
+		heartbeat:  negotiateHeartbeat(c.cfg.Client.Heartbeat, helloOK.HeartbeatSeconds),
+		tcpPort:    helloOK.TCPDataPort,
+		udpPort:    helloOK.UDPDataPort,
+		dataTLS:    dataNeg.UseTLS,
+		dataTLSCfg: dataTLSCfg,
 	}
 	c.ctrlLog.Info("接入成功", "event", "hello_ok", "client_id", neg.clientID,
-		"detail", fmt.Sprintf("udp_mode=%s tcp_data_port=%d udp_data_port=%d heartbeat=%s",
-			neg.udpMode, neg.tcpPort, neg.udpPort, neg.heartbeat))
+		"data_tls", neg.dataTLS,
+		"detail", fmt.Sprintf("udp_mode=%s tcp_data_port=%d udp_data_port=%d heartbeat=%s data_tls=%v",
+			neg.udpMode, neg.tcpPort, neg.udpPort, neg.heartbeat, neg.dataTLS))
+	c.logDataPlaneTLS(dataNeg.UseTLS, helloOK.DataTLS)
+
+	// 原生 UDP 数据面不引入 DTLS：relay 要求数据面 TLS 时明确提示 UDP 仍明文。
+	if dataNeg.UseTLS && neg.udpMode == protocol.UDPModeNative {
+		c.ctrlLog.Warn("udp_mode = native：原生 UDP 数据面仍为明文（不引入 DTLS），只有 TCP 数据面走 TLS；如需加密请让 relay 移除 udp_listen 使用 udp_mode = tcp_tunnel",
+			"event", "config_warning", "detail", "data_tls 不覆盖原生 UDP")
+	}
 
 	// 2) 服务列表（既是管理页数据，也是本地监听协议的唯一依据）
 	if err := c.writeControlTo(conn, protocol.MsgListServices, &protocol.ListServices{}); err != nil {
@@ -204,6 +234,11 @@ func (c *client) closeControl() {
 func (c *client) dialControl() (net.Conn, bool, error) {
 	mode := c.cfg.Client.TLS
 	if !mode.DialTLS(c.cfg.Client.TLSCA, c.cfg.Client.TLSInsecureSkipVerify) {
+		// auto + 无材料仍是明文（向后兼容），但明确提示风险与出口（SEC-T2）。
+		if mode == config.TLSAuto && strings.TrimSpace(c.cfg.Client.TLSCA) == "" && !c.cfg.Client.TLSInsecureSkipVerify {
+			c.ctrlLog.Warn("当前以明文连接 relay（隧道内 token 与信令可被链路上的人读取）；公网部署请把 tls 设为 true 并配置 tls_ca（公网 CA 场景可不配 CA）",
+				"event", "control_connect", "detail", "plaintext_auto")
+		}
 		if mode == config.TLSFalse && (c.cfg.Client.TLSCA != "" || c.cfg.Client.TLSInsecureSkipVerify) {
 			c.ctrlLog.Warn("tls = false：已配置的 tls_ca / tls_insecure_skip_verify 被忽略，控制面按明文拨号",
 				"event", "control_connect", "detail", "plaintext_forced")
@@ -236,30 +271,49 @@ func (c *client) dialControl() (net.Conn, bool, error) {
 	return conn, true, nil
 }
 
-// tlsConfig 按 tls_ca / tls_insecure_skip_verify 构造客户端 TLS 配置。
+// tlsConfig 按 tls_ca / tls_insecure_skip_verify 构造控制面 TLS 配置。
 //
 // tls_ca 为空时 RootCAs 保持 nil，表示使用系统根证书（tls=true 场景的标准校验路径）。
+// CA 解析规则由 config.ClientTLSConfig 统一实现（与 agent / 数据面共用）。
 func (c *client) tlsConfig() (*tls.Config, error) {
-	cfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		ServerName: c.host,
-	}
-	if c.cfg.Client.TLSInsecureSkipVerify {
-		cfg.InsecureSkipVerify = true
-	}
-	if ca := strings.TrimSpace(c.cfg.Client.TLSCA); ca != "" {
-		pem, err := os.ReadFile(ca)
-		if err != nil {
-			return nil, permanent(fmt.Errorf("client: 读取 tls_ca %q: %w", ca, err))
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, permanent(fmt.Errorf("client: tls_ca %q 中没有可用证书", ca))
-		}
-		// 只信任该 CA（不使用系统根）。
-		cfg.RootCAs = pool
+	cfg, err := config.ClientTLSConfig(c.cfg.Client.TLSCA, c.cfg.Client.TLSInsecureSkipVerify, c.host)
+	if err != nil {
+		return nil, permanent(fmt.Errorf("client: %w", err))
 	}
 	return cfg, nil
+}
+
+// dataTLSConfig 构造数据面 TLS 配置（与隧道共用 CA / insecure / SNI 规则）。
+func (c *client) dataTLSConfig() (*tls.Config, error) {
+	cfg, err := config.ClientTLSConfig(c.cfg.Client.TLSCA, c.cfg.Client.TLSInsecureSkipVerify, c.host)
+	if err != nil {
+		return nil, permanent(fmt.Errorf("client: 数据面 TLS: %w", err))
+	}
+	return cfg, nil
+}
+
+// logDataPlaneTLS 打印本次连接的数据面加密状态（SEC-T1 可见性要求）。
+func (c *client) logDataPlaneTLS(useTLS bool, advertised *bool) {
+	if useTLS {
+		verify := "系统根证书"
+		if strings.TrimSpace(c.cfg.Client.TLSCA) != "" {
+			verify = "tls_ca=" + c.cfg.Client.TLSCA
+		}
+		if c.cfg.Client.TLSInsecureSkipVerify {
+			verify = "跳过证书校验（tls_insecure_skip_verify = true，仅建议测试环境）"
+		}
+		c.ctrlLog.Info("数据面: TLS（TCP）", "event", "data_tls", "detail", "数据面: TLS（"+verify+"）")
+		return
+	}
+	reason := "relay 未启用数据面 TLS"
+	switch {
+	case advertised == nil:
+		reason = "旧 relay 未下发 data_tls（< v0.4.0）"
+	case c.cfg.Client.DataTLS == config.TLSFalse:
+		reason = "data_tls = false（本端强制明文）"
+	}
+	c.ctrlLog.Warn("数据面: 明文（业务数据与 pairing_token 不加密）",
+		"event", "data_tls", "detail", "数据面: 明文（"+reason+"）")
 }
 
 // dialTLS 先建立 TCP 再在同一连接上完成 TLS 握手（带超时）。
@@ -321,7 +375,7 @@ func (c *client) readControlFrame(conn net.Conn, d time.Duration) (any, error) {
 	} else {
 		_ = conn.SetReadDeadline(time.Time{})
 	}
-	typ, payload, err := protocol.ReadFrame(conn)
+	typ, payload, err := protocol.ReadFrameWithLimit(conn, protocol.NetworkPayloadLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +388,8 @@ func (c *client) readControlFrame(conn net.Conn, d time.Duration) (any, error) {
 // （包装后）表示被踢出；其它错误代表连接断开，由 supervise 决定是否重连。
 func (c *client) controlLoop(conn net.Conn) error {
 	for {
-		typ, payload, err := protocol.ReadFrame(conn)
+		// 网络入口上限 64 KiB（SEC-D1 / P0-1）：服务列表远小于此值。
+		typ, payload, err := protocol.ReadFrameWithLimit(conn, protocol.NetworkPayloadLimit)
 		if err != nil {
 			if c.ctx.Err() != nil || errors.Is(err, net.ErrClosed) || c.controlConn() != conn {
 				return nil
@@ -367,10 +422,10 @@ func (c *client) controlLoop(conn net.Conn) error {
 				"detail", fmt.Sprintf("before=%d after=%d revision=%d udp_mode=%s",
 					len(before), len(m.Services), m.Revision, m.UDPMode))
 		case *protocol.Kicked:
-			c.ctrlLog.Warn("被 relay 踢出，client 退出（不重连）", "event", "kicked", "detail", m.Reason)
-			return fmt.Errorf("%w: %s", errKicked, m.Reason)
+			c.ctrlLog.Warn("被 relay 踢出，client 退出（不重连）", "event", "kicked", "detail", logx.CleanN(m.Reason, logx.MaxAttrLen))
+			return fmt.Errorf("%w: %s", errKicked, logx.CleanN(m.Reason, logx.MaxAttrLen))
 		case *protocol.ServerShutdown:
-			c.ctrlLog.Info("relay 即将停机，client 退出", "event", "server_shutdown", "detail", m.Reason)
+			c.ctrlLog.Info("relay 即将停机，client 退出", "event", "server_shutdown", "detail", logx.CleanN(m.Reason, logx.MaxAttrLen))
 			return nil
 		case *protocol.Heartbeat:
 			if err := c.writeControlTo(conn, protocol.MsgHeartbeatAck, &protocol.HeartbeatAck{}); err != nil && c.ctx.Err() == nil {

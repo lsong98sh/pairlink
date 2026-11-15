@@ -22,8 +22,18 @@ import (
 const ProtocolVersion = 1
 
 const (
-	// MaxPayload 是单帧 payload 上限（1 MiB）。
+	// MaxPayload 是单帧 payload 的**绝对**上限（1 MiB）。
+	//
+	// 只用于内存帧（EncodeFrame / ReadFrame 的单测）与协议兼容性常量；
+	// **不得**作为网络入口的预分配上限：隧道控制面与 TCP/UDP 数据面一律使用
+	// NetworkPayloadLimit（64 KiB），见 docs/protocol.md §2。
 	MaxPayload = 1 << 20
+	// NetworkPayloadLimit 是网络入口的单帧 payload 上限（64 KiB）。
+	//
+	// 正常业务帧远小于此值：MsgHello/MsgBind 约 100~300 字节，服务列表在
+	// 64 KiB 内可容纳数百个服务。超过即视为异常/恶意帧，读取前直接拒绝，
+	// 避免按对端声明值预分配内存（SEC-D1 / P0-1）。
+	NetworkPayloadLimit = 64 << 10
 	// HeaderSize 是帧头长度：1 字节类型 + 4 字节大端长度。
 	HeaderSize = 5
 )
@@ -49,6 +59,9 @@ var (
 	ErrUnsupportedVersion = errors.New("protocol: 不支持的协议版本")
 	// ErrBadUDPTunnelFrame 表示 UDP over TCP 隧道帧结构非法。
 	ErrBadUDPTunnelFrame = errors.New("protocol: UDP 隧道帧非法")
+	// ErrFrameLengthMismatch 表示字节切片中的声明长度与实际可读字节数不一致
+	// （数据报截断或多帧拼接）。
+	ErrFrameLengthMismatch = errors.New("protocol: 帧长度与实际数据不一致")
 )
 
 // MessageType 是隧道信令的消息类型（帧首字节）。
@@ -172,6 +185,11 @@ func ReadFrame(r io.Reader) (MessageType, []byte, error) {
 
 // ReadFrameWithLimit 与 ReadFrame 相同，但使用调用方指定的负载上限。
 // limit <= 0 时回退到 MaxPayload。
+//
+// 注意：本函数在校验 n <= limit 后按声明值预分配 n 字节。因此**网络入口必须传
+// 小上限**（NetworkPayloadLimit = 64 KiB），否则对端只发 5 字节帧头即可让本端
+// 常驻 1 MiB（SEC-D1 / P0-1）。UDP 数据报请用 ParseFrameLimit：它在解析前要求
+// 声明长度与实际数据报长度一致，完全不按声明值分配。
 func ReadFrameWithLimit(r io.Reader, limit int) (MessageType, []byte, error) {
 	if limit <= 0 || limit > MaxPayload {
 		limit = MaxPayload
@@ -279,16 +297,40 @@ func EncodeFrame(typ MessageType, payload any) ([]byte, error) {
 // ParseFrame 从字节切片解析恰好一帧。
 //
 // 与 ReadFrame 相同，但要求 data 在帧之后没有多余字节（数据报场景）。
+// 实现上不按声明长度分配内存：先校验长度自洽（见 ParseFrameLimit）。
 func ParseFrame(data []byte) (MessageType, []byte, error) {
-	r := bytes.NewReader(data)
-	typ, payload, err := ReadFrame(r)
-	if err != nil {
-		return 0, nil, err
+	return ParseFrameLimit(data, MaxPayload)
+}
+
+// ParseFrameLimit 从字节切片解析恰好一帧，并限制声明负载不超过 limit。
+//
+// 与 ParseFrame 的区别是**先校验再解析**：
+//  1. len(data) 必须 >= HeaderSize（不足帧头直接拒绝）；
+//  2. 声明的 payload_len 必须 <= limit（超限返回 ErrPayloadTooLarge）；
+//  3. 声明的 payload_len 必须**等于** len(data)-HeaderSize，否则返回
+//     ErrFrameLengthMismatch（数据报截断 / 多帧拼接）。
+//
+// 只有三条都通过才会切出 payload，因此攻击者发 5 字节帧头声明 1 MiB 时不会
+// 产生任何按声明值的分配（SEC-D1 / P0-1）。返回的 payload 是 data 的子切片，
+// 调用方不得在 data 被复用的场景下长期持有。
+func ParseFrameLimit(data []byte, limit int) (MessageType, []byte, error) {
+	if limit <= 0 || limit > MaxPayload {
+		limit = MaxPayload
 	}
-	if r.Len() != 0 {
-		return typ, nil, fmt.Errorf("protocol: %s 帧后还有 %d 字节", typ, r.Len())
+	if len(data) < HeaderSize {
+		return 0, nil, fmt.Errorf("%w: 数据报只有 %d 字节，不足帧头 %d 字节",
+			ErrFrameLengthMismatch, len(data), HeaderSize)
 	}
-	return typ, payload, nil
+	typ := MessageType(data[0])
+	n := int(binary.BigEndian.Uint32(data[1:HeaderSize]))
+	if n < 0 || n > limit {
+		return typ, nil, fmt.Errorf("%w: %s 声明负载 %d 字节 > %d", ErrPayloadTooLarge, typ, n, limit)
+	}
+	if actual := len(data) - HeaderSize; n != actual {
+		return typ, nil, fmt.Errorf("%w: %s 声明负载 %d 字节，实际可用 %d 字节",
+			ErrFrameLengthMismatch, typ, n, actual)
+	}
+	return typ, data[HeaderSize:], nil
 }
 
 // WriteUDPTunnelFrame 写出一个 UDP over TCP 隧道帧。
@@ -345,6 +387,11 @@ func ReadUDPTunnelFrame(r io.Reader) (session string, payload []byte, err error)
 	sessionLen := int(body[0])
 	if sessionLen > n-1 {
 		return "", nil, fmt.Errorf("%w: 会话标识长度 %d 超过帧长 %d", ErrBadUDPTunnelFrame, sessionLen, n)
+	}
+	if sessionLen > MaxSessionIDLen {
+		// 读侧也限制会话标识长度：对端可以合法地声明 1..MaxUDPTunnelFrameLen 的
+		// 帧长，但会话标识超过 129 字节属于异常输入（P2-6）。
+		return "", nil, fmt.Errorf("%w: 会话标识长度 %d > %d", ErrBadUDPTunnelFrame, sessionLen, MaxSessionIDLen)
 	}
 	session = string(body[1 : 1+sessionLen])
 	payload = body[1+sessionLen:]

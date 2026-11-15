@@ -5,7 +5,8 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now pairlink-agent
 #
-# 注意：agent 控制连接断开后进程会退出，由 Restart=on-failure 拉起（第一版无内置重连）；
+# 注意：agent 默认启用内置重连（指数退避）；只有配置非法、relay 明确拒绝、被踢出等永久性错误才退出，
+# 其余断链/拨号失败由内置重连处理，Restart=on-failure 只作兜底；
 # 连续失败 5 次/60 秒后 systemd 会停止重试，排障见 deploy/systemd/README.md。
 # 不要加 -service（-service 只用于 Windows SCM）。
 [Unit]
@@ -36,7 +37,10 @@ SyslogIdentifier=pairlink-agent
 
 # ---- 适度加固 ----
 NoNewPrivileges=true
+# 整个文件系统只读；/etc/pairlink 需可读写：管理页的'服务增删改'会把 ini
+# 原地写回（写临时文件 + rename），只读会让页面保存失败（P1-1）。
 ProtectSystem=strict
+ReadWritePaths=/etc/pairlink
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

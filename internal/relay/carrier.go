@@ -140,10 +140,30 @@ func (s *server) handleCarrierBind(conn net.Conn, bind *protocol.Bind, log *slog
 func (c *carrierConn) readLoop() {
 	defer c.close()
 	for {
+		// SEC-M4：每帧设置读 deadline。承载连接可能承载多个 UDP 会话，允许
+		// 静默期较长（max(30s, 2×udp_session_timeout)），但只发帧头/半帧的
+		// 连接不能无限占用 goroutine 与会话表项；超时即关闭并清理会话。
+		timeout := c.srv.carrierFrameTimeout()
+		if timeout > 0 {
+			if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+				c.log.Debug("设置承载连接读超时失败", "event", "data_close", "err", err)
+				return
+			}
+		}
 		session, payload, err := protocol.ReadUDPTunnelFrame(c.conn)
 		if err != nil {
 			if c.srv.ctx.Err() == nil && !c.isClosed() {
-				c.log.Warn("承载连接读取失败", "event", "data_close", "err", err)
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					c.log.Warn("承载连接读超时（半帧或长时间静默），已关闭并清理会话",
+						"event", "data_close",
+						"detail", "carrier_read_timeout",
+						"timeout", timeout.String(),
+						"err", err,
+					)
+				} else {
+					c.log.Warn("承载连接读取失败", "event", "data_close", "err", err)
+				}
 			}
 			return
 		}
@@ -162,7 +182,8 @@ func (c *carrierConn) readLoop() {
 
 // handleControlPayload 处理承载连接上的控制帧（session=""）。
 func (c *carrierConn) handleControlPayload(payload []byte) {
-	typ, raw, err := protocol.ParseFrame(payload)
+	// 控制帧是内存切片：只允许"声明长度 == 实际长度"的完整帧（P0-1）。
+	typ, raw, err := protocol.ParseFrameLimit(payload, protocol.NetworkPayloadLimit)
 	if err != nil {
 		c.log.Debug("承载控制帧结构非法", "event", "udp_evict", "err", err)
 		return
@@ -175,7 +196,10 @@ func (c *carrierConn) handleControlPayload(payload []byte) {
 		}
 		e, _ := msg.(*protocol.Error)
 		if e != nil {
-			c.log.Warn("对端承载返回错误", "event", "peer_error", "code", e.Code, "detail", e.Message)
+			// detail 完全由对端控制：清洗控制字符并截断，防日志注入/放大（SEC-M2）。
+			c.log.Warn("对端承载返回错误", "event", "peer_error",
+				"code", logx.CleanN(e.Code, logx.MaxAttrLen),
+				"detail", logx.CleanN(e.Message, logx.MaxAttrLen))
 		}
 	default:
 		c.log.Debug("忽略承载控制帧", "event", "message_ignored", "type", typ.String())
@@ -188,11 +212,20 @@ func (c *carrierConn) handleControlPayload(payload []byte) {
 // MsgBind 帧完成会话登记。单会话错误用控制帧回报，不关闭承载连接。
 func (s *server) handleCarrierFrame(c *carrierConn, key pairing.PairingKey, payload []byte) {
 	if s.carriers.owns(c, key) {
+		// P2-7：已登记会话又收到同一配对键的 MsgBind 帧时丢弃，绝不能当数据
+		// 转发给对端（否则对端会把报到帧当成业务数据）。这里复用 5 字节帧头
+		// 嗅探 + 精确长度解析，业务数据帧不会走到 JSON 解析。
+		if bindKey, ok := parseBindKey(payload); ok && bindKey == key {
+			c.log.Debug("承载连接收到已登记会话的重复报到帧，已丢弃（不转发）",
+				"event", "bind_dup_drop", "pairing_key", key.String())
+			return
+		}
 		s.deliverCarrierData(c, key, payload)
 		return
 	}
 
-	typ, raw, err := protocol.ParseFrame(payload)
+	// 会话登记帧只能是完整的一帧：声明长度必须等于实际可用字节数（P0-1）。
+	typ, raw, err := protocol.ParseFrameLimit(payload, protocol.NetworkPayloadLimit)
 	if err != nil || typ != protocol.MsgBind {
 		// 未登记会话的数据帧：UDP 允许丢包，直接丢弃。
 		c.log.Debug("丢弃未知承载会话的数据帧",

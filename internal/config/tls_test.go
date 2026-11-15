@@ -188,6 +188,7 @@ tcp_listen = 0.0.0.0:7001
 tls = false
 tls_cert = /nonexistent/relay.crt
 tls_key = /nonexistent/relay.key
+auth_token = test-token
 `))
 	if err != nil {
 		t.Fatalf("Load 失败: %v", err)

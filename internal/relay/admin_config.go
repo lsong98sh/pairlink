@@ -136,6 +136,9 @@ func (s *server) handleConfigAction(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("%s 写回 ini 失败（运行时未改变）: %v", key, err))
 		return
 	}
+	// PARSE 已保证 value > 0，param.Set 的唯一错误条件是 <= 0，因此本分支
+	// 实际不可达（P3-10）；保留它是为了防御未来 Set 语义变化导致"ini 已写、
+	// 运行时没改"的部分成功状态，不要删掉。
 	if err := param.Set(s, value); err != nil {
 		admin.RedirectNotice(w, r, "/relay", true,
 			fmt.Sprintf("%s 已写回 ini，但更新运行时失败: %v", key, err))

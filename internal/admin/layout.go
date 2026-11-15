@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -83,7 +84,8 @@ footer{padding:10px 18px;color:#9ca3af;font-size:12px}
 }
 `
 
-// layoutHTML 是页面骨架：charset 固定 utf-8，自动刷新通过 meta 实现（可关闭）。
+// layoutHTML 是页面骨架：charset 固定 utf-8，自动刷新通过 meta 实现（默认只在
+// 只读页开启，可写页/含写表单的页面默认暂停，避免整页重载清空用户正在输入的内容）。
 const layoutHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -117,16 +119,22 @@ var layoutTemplate = template.Must(template.New("layout").Parse(layoutHTML))
 // WriteHTML 把页面主体套入统一布局后写出。
 //
 // 页面渲染函数应当只写主体 HTML（如 <section>…），布局负责 charset、样式、
-// 顶栏（mode / version / 运行时长）与 1s 自动刷新开关。
+// 顶栏（mode / version / 运行时长）与自动刷新开关。
+//
+// 自动刷新默认值（P1-2）：只读页且页面内没有写表单时开启（1s）；**可写页或
+// 含 <form> 的页面默认暂停**——否则浏览器每秒整页重载会把用户正在输入的值清空。
+// 需要临时恢复刷新时点顶栏「开启自动刷新」（?refresh=1），或用 ?refresh=0 强制关闭。
 func (s *Server) WriteHTML(w http.ResponseWriter, r *http.Request, pageBody template.HTML) {
+	hasForm := bytes.Contains([]byte(pageBody), []byte("<form"))
+	refresh := refreshOn(r, s.writable, hasForm)
 	data := layoutData{
 		Title:     s.opts.Title,
 		Mode:      s.opts.Mode,
 		Version:   s.opts.Version,
 		Uptime:    formatUptime(time.Since(s.startedAt)),
 		Now:       time.Now().Format("2006-01-02 15:04:05"),
-		RefreshOn: autoRefresh(r),
-		ToggleURL: toggleRefreshURL(r),
+		RefreshOn: refresh,
+		ToggleURL: toggleRefreshURL(r, refresh),
 		Writable:  s.writable,
 		Notice:    NoticeBar(r),
 		Nav:       s.navItems(),
@@ -154,22 +162,34 @@ func (s *Server) navItems() []navItem {
 	return items
 }
 
-// autoRefresh 报告当前请求是否启用自动刷新（?refresh=0 关闭）。
-func autoRefresh(r *http.Request) bool {
-	if r == nil {
-		return true
+// refreshOn 报告当前请求是否注入 1s 自动刷新（P1-2）。
+//
+// 优先级：显式 ?refresh=0 / ?refresh=1 > 页面默认值。
+// 默认值：可写页（Writable=true）或页面里含写表单时**暂停**（否则输入的内容每秒
+// 被整页重载清空），只读页保持 1s 刷新。
+func refreshOn(r *http.Request, writable, hasForm bool) bool {
+	if r != nil {
+		switch r.URL.Query().Get("refresh") {
+		case "0":
+			return false
+		case "1":
+			return true
+		}
 	}
-	return r.URL.Query().Get("refresh") != "0"
+	if writable || hasForm {
+		return false
+	}
+	return true
 }
 
 // toggleRefreshURL 生成切换自动刷新的 URL（保留其它查询参数）。
-func toggleRefreshURL(r *http.Request) string {
+func toggleRefreshURL(r *http.Request, on bool) string {
 	if r == nil {
 		return "/?refresh=0"
 	}
 	u := url.URL{Path: r.URL.Path}
 	q := r.URL.Query()
-	if autoRefresh(r) {
+	if on {
 		q.Set("refresh", "0")
 	} else {
 		q.Set("refresh", "1")

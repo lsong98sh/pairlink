@@ -92,7 +92,8 @@ func plainListener(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// TestClientTLSConfigAutoPlainWithoutCA 覆盖 auto + 无材料：明文，且不产生 TLS WARN。
+// TestClientTLSConfigAutoPlainWithoutCA 覆盖 auto + 无材料：明文，且必须明确
+// WARN 明文风险与出口（SEC-T2），但不得出现「tls = false 材料被忽略」类误导信息。
 func TestClientTLSConfigAutoPlainWithoutCA(t *testing.T) {
 	addr := plainListener(t)
 	c, logs := newTLSClient(t, addr, func(cc *config.ClientConfig) {
@@ -106,8 +107,12 @@ func TestClientTLSConfigAutoPlainWithoutCA(t *testing.T) {
 	if isTLS {
 		t.Fatal("auto + 无 tls_ca 应为明文连接")
 	}
-	if strings.Contains(logs.String(), "跳过") || strings.Contains(logs.String(), "tls = false") {
-		t.Errorf("auto + 无材料不应产生 TLS 相关 WARN，实际:\n%s", logs.String())
+	out := logs.String()
+	if !strings.Contains(out, "明文连接 relay") || !strings.Contains(out, "tls 设为 true") {
+		t.Errorf("auto + 无材料应 WARN 明文风险并给出出口，实际:\n%s", out)
+	}
+	if strings.Contains(out, "跳过") || strings.Contains(out, "tls = false") {
+		t.Errorf("auto + 无材料不应产生误导性 TLS WARN，实际:\n%s", out)
 	}
 }
 

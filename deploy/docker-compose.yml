@@ -10,8 +10,12 @@
 # 说明：
 #   - 三个 PairLink 容器共用一个镜像（anchor x-pairlink），只读根文件系统、
 #     丢弃全部 Linux capabilities，以 distroless 的 nonroot（uid 65532）运行。
-#   - 配置从 examples/docker/*.ini 只读挂载；容器内 manage_listen 必须绑 0.0.0.0，
-#     再用下面的 "127.0.0.1:宿主端口:容器端口" 把管理页限制为仅本机访问。
+#   - 配置从 examples/docker/*.ini **以目录方式读写挂载**：管理页的写操作
+#     （修改参数 / 服务增删改）用「临时文件 + rename」原地写回 ini，
+#     单文件 :ro 挂载不支持 rename，只能目录挂载。根文件系统仍保持只读。
+#     容器以 uid 65532 运行，宿主机目录必须对该 uid 可写（见下面各服务的注释）。
+#   - 容器内 manage_listen 必须绑 0.0.0.0，再用下面的
+#     "127.0.0.1:宿主端口:容器端口" 把管理页限制为仅本机访问。
 #   - 只发布演示必需端口：三个管理页 + client 的 18080。
 #     要让宿主机外的 agent/client 接入 relay，再放开 17000/17001/17002。
 #   - 镜像未在本仓库开发机验证（无 Docker/Podman），详见 deploy/README.md。
@@ -19,7 +23,7 @@
 name: pairlink
 
 x-pairlink: &pairlink
-  image: pairlink:v0.3.0
+  image: pairlink:v0.4.0
   build:
     context: ..
     dockerfile: Dockerfile
@@ -38,7 +42,9 @@ services:
     container_name: pairlink-relay
     command: ['-relay', '-config', '/etc/pairlink/relay.ini']
     volumes:
-      - ../examples/docker/relay.ini:/etc/pairlink/relay.ini:ro
+      # 目录读写挂载（管理页写回需要 rename）；宿主机先执行：
+      #   sudo chown -R 65532:65532 examples/docker
+      - ../examples/docker:/etc/pairlink:rw
       # 生产启用 TLS 时挂载证书，并确保容器用户 uid 65532 可读（建议 0644）：
       # - ../certs:/etc/pairlink/tls:ro
     ports:
@@ -66,7 +72,8 @@ services:
     container_name: pairlink-agent
     command: ['-agent', '-config', '/etc/pairlink/agent.ini']
     volumes:
-      - ../examples/docker/agent.ini:/etc/pairlink/agent.ini:ro
+      # 同上：目录读写挂载，便于管理页写回 agent.ini
+      - ../examples/docker:/etc/pairlink:rw
     ports:
       - '127.0.0.1:17091:17091'
     depends_on:
@@ -78,7 +85,8 @@ services:
     container_name: pairlink-client
     command: ['-client', '-config', '/etc/pairlink/client.ini']
     volumes:
-      - ../examples/docker/client.ini:/etc/pairlink/client.ini:ro
+      # 同上：目录读写挂载，便于管理页写回 client.ini
+      - ../examples/docker:/etc/pairlink:rw
     ports:
       # 管理页
       - '127.0.0.1:17092:17092'

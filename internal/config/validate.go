@@ -16,18 +16,24 @@ var knownKeys = map[string]map[string]bool{
 		"log_format":    true,
 	},
 	"relay": {
-		"tunnel_listen":       true,
-		"tcp_listen":          true,
-		"udp_listen":          true,
-		"tls":                 true,
-		"tls_cert":            true,
-		"tls_key":             true,
-		"auth_token":          true,
-		"pair_timeout":        true,
-		"idle_timeout":        true,
-		"heartbeat_timeout":   true,
-		"udp_session_timeout": true,
-		"token_ttl":           true,
+		"tunnel_listen":          true,
+		"tcp_listen":             true,
+		"udp_listen":             true,
+		"tls":                    true,
+		"data_tls":               true,
+		"tls_cert":               true,
+		"tls_key":                true,
+		"auth_token":             true,
+		"service_allow":          true,
+		"max_services_per_agent": true,
+		"max_conns":              true,
+		"max_conns_per_ip":       true,
+		"max_pending_pairs":      true,
+		"pair_timeout":           true,
+		"idle_timeout":           true,
+		"heartbeat_timeout":      true,
+		"udp_session_timeout":    true,
+		"token_ttl":              true,
 	},
 	"server": {
 		"relay_addr":               true,
@@ -35,6 +41,7 @@ var knownKeys = map[string]map[string]bool{
 		"protocol":                 true,
 		"local":                    true,
 		"tls":                      true,
+		"data_tls":                 true,
 		"tls_ca":                   true,
 		"tls_insecure_skip_verify": true,
 		"heartbeat":                true,
@@ -47,6 +54,7 @@ var knownKeys = map[string]map[string]bool{
 		"relay_addr":               true,
 		"token":                    true,
 		"tls":                      true,
+		"data_tls":                 true,
 		"tls_ca":                   true,
 		"tls_insecure_skip_verify": true,
 		"heartbeat":                true,
@@ -191,21 +199,31 @@ func (c *Config) validateRelay() error {
 	}
 	hasCert := strings.TrimSpace(r.TLSCert) != ""
 	hasKey := strings.TrimSpace(r.TLSKey) != ""
+	tunnelLoopback := isLoopbackListenAddr(r.TunnelListen)
 	switch mode {
 	case TLSFalse:
 		if hasCert || hasKey {
 			c.addWarning("[relay] 已配置 tls_cert / tls_key 但 tls = false，隧道按明文监听（证书被忽略）")
 		}
+		if !tunnelLoopback {
+			c.addWarning("[relay] tls = false 且 tunnel_listen = %q 绑定非回环地址：隧道（含 auth_token 与全部信令）在公网上是明文，请确认已评估风险", r.TunnelListen)
+		}
 	case TLSTrue:
 		if !hasCert || !hasKey {
 			return fmt.Errorf("[relay] tls = true 但缺少 tls_cert / tls_key：强制 TLS 必须同时配置证书与私钥路径")
 		}
-	default: // auto：完全保持原有推断行为
+	default: // auto：按证书材料推断；非回环监听不再允许静默降级为明文（SEC-T2）
 		switch {
 		case !hasCert && !hasKey:
-			c.addWarning("[relay] 未配置 tls_cert / tls_key，隧道将以明文运行（不建议在公网使用；可设 tls = true 强制 TLS）")
+			if !tunnelLoopback {
+				return fmt.Errorf("[relay] tls = auto 且未配置 tls_cert / tls_key，但 tunnel_listen = %q 绑定非回环地址：公网监听必须配置证书（tls = true + tls_cert/tls_key），或显式写 tls = false 承担明文风险", r.TunnelListen)
+			}
+			c.addWarning("[relay] 未配置 tls_cert / tls_key，隧道将以明文运行（当前 tunnel_listen 仅绑定回环，仅供本机调试；公网部署请配置证书并把 tls 设为 true）")
 		case hasCert != hasKey:
-			c.addWarning("[relay] tls_cert 与 tls_key 必须成对配置，当前按明文隧道运行")
+			if !tunnelLoopback {
+				return fmt.Errorf("[relay] tls = auto 但 tls_cert 与 tls_key 未成对配置，且 tunnel_listen = %q 绑定非回环地址：请补齐证书对（tls = true），或显式写 tls = false 承担明文风险", r.TunnelListen)
+			}
+			c.addWarning("[relay] tls_cert 与 tls_key 必须成对配置，当前按明文隧道运行（tunnel_listen 仅绑定回环）")
 		}
 	}
 	// tls=false 时证书材料被显式忽略，不再检查文件是否存在（避免误导）。
@@ -217,8 +235,80 @@ func (c *Config) validateRelay() error {
 			warnFileMissing(c, "tls_key", r.TLSKey)
 		}
 	}
+
+	// 数据面 TLS（SEC-T1）：auto 跟随隧道判定，true 强制，false 强制明文。
+	dataMode, err := c.checkTLSMode("[relay] data_tls", r.DataTLS)
+	if err != nil {
+		return err
+	}
+	r.DataTLS = dataMode
+	tunnelTLS := mode != TLSFalse && hasCert && hasKey
+	if dataMode == TLSTrue && (!hasCert || !hasKey) {
+		return fmt.Errorf("[relay] data_tls = true 但缺少 tls_cert / tls_key：数据面 TLS 与隧道共用证书，必须同时配置证书与私钥路径")
+	}
+	dataTLS := dataMode.RelayDataTLS(tunnelTLS)
+	if dataTLS && mode == TLSFalse {
+		// tls=false 跳过了上面的文件检查，但数据面 TLS 仍要读证书。
+		if hasCert {
+			warnFileMissing(c, "tls_cert", r.TLSCert)
+		}
+		if hasKey {
+			warnFileMissing(c, "tls_key", r.TLSKey)
+		}
+		c.addWarning("[relay] tls = false 但 data_tls = true：隧道（含 auth_token 与信令）仍为明文，只有 TCP 数据面使用 TLS")
+	}
+	if dataMode == TLSFalse && tunnelTLS {
+		c.addWarning("[relay] data_tls = false：TCP 数据面按明文运行（业务数据与 pairing_token 可被链路上的人读取），隧道 TLS 只保护控制面")
+	}
+	if dataTLS && strings.TrimSpace(r.UDPListen) != "" {
+		c.addWarning("[relay] 数据面 TLS 只覆盖 TCP 数据面：已配置 udp_listen，原生 UDP 数据面仍为明文；如需加密请移除 udp_listen 改用 udp_mode = tcp_tunnel")
+	}
+
+	// SEC-A2：服务名白名单与单 agent 服务数上限。
+	allow := make([]string, 0, len(r.ServiceAllow))
+	seenAllow := make(map[string]struct{}, len(r.ServiceAllow))
+	for _, id := range r.ServiceAllow {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if err := validateServiceID(id); err != nil {
+			return fmt.Errorf("[relay] service_allow 中的 %q 非法: %w", id, err)
+		}
+		if _, dup := seenAllow[id]; dup {
+			continue
+		}
+		seenAllow[id] = struct{}{}
+		allow = append(allow, id)
+	}
+	r.ServiceAllow = allow
+	if len(allow) == 0 {
+		c.addWarning("[relay] 未配置 service_allow：任何持有 auth_token 的接入者都可以注册任意服务名（SEC-A2）；多租户/公网部署建议显式列出允许的服务名")
+	}
+	if r.MaxServicesPerAgent < 0 {
+		return fmt.Errorf("[relay] max_services_per_agent = %d 不能为负数（0 表示不限制）", r.MaxServicesPerAgent)
+	}
+	// SEC-A1：空 auth_token 等价于"谁都能接入"，只允许配合回环监听做本机调试。
 	if strings.TrimSpace(r.AuthToken) == "" {
-		c.addWarning("[relay] auth_token 为空，任何 agent/client 都可接入隧道（仅建议内网调试使用）")
+		if !tunnelLoopback {
+			return fmt.Errorf("[relay] auth_token 为空且 tunnel_listen = %q 绑定非回环地址：任何能访问该端口的人都能以 agent/client 身份接入。请配置 auth_token（例如 openssl rand -hex 32），或把 tunnel_listen 绑定到回环地址（127.0.0.1:端口）仅供本机调试", r.TunnelListen)
+		}
+		c.addWarning("[relay] auth_token 为空：仅允许回环地址（127.0.0.0/8、::1）的 agent/client 接入隧道，非回环来源一律拒绝（仅供本机调试）")
+	}
+	// SEC-D2：连接/待配对上限（0 表示不限制）。ini 解析已拒绝负数，
+	// 这里兜住「绕过 ini 直接构造 Config」的情形。
+	limits := []struct {
+		name  string
+		value int
+	}{
+		{"max_conns", r.MaxConns},
+		{"max_conns_per_ip", r.MaxConnsPerIP},
+		{"max_pending_pairs", r.MaxPendingPairs},
+	}
+	for _, l := range limits {
+		if l.value < 0 {
+			return fmt.Errorf("[relay] %s = %d 不能为负数（0 表示不限制）", l.name, l.value)
+		}
 	}
 	if c.Common.ManageListen != "" {
 		manageKey := canonicalAddr(c.Common.ManageListen)
@@ -267,9 +357,14 @@ func (c *Config) validateServer() error {
 	if err != nil {
 		return err
 	}
+	dataMode, err := c.checkTLSMode("[server] data_tls", s.DataTLS)
+	if err != nil {
+		return err
+	}
+	s.DataTLS = dataMode
 	if mode == TLSFalse {
 		if s.TLSCA != "" || s.TLSInsecureSkipVerify {
-			c.addWarning("[server] 已配置 tls_ca / tls_insecure_skip_verify 但 tls = false，控制面按明文拨号（上述配置被忽略）")
+			c.addWarning("[server] 已配置 tls_ca / tls_insecure_skip_verify 但 tls = false，控制面按明文拨号（上述配置被忽略；数据面是否 TLS 由 data_tls 决定，若判定为 TLS 仍会使用上述材料）")
 		}
 	} else {
 		if s.TLSCA != "" {
@@ -282,6 +377,14 @@ func (c *Config) validateServer() error {
 				c.addWarning("[server] tls_insecure_skip_verify = true，将跳过 relay 证书校验（仅建议测试环境）")
 			}
 		}
+	}
+	switch dataMode {
+	case TLSTrue:
+		if s.TLSCA == "" && !s.TLSInsecureSkipVerify {
+			c.addWarning("[server] data_tls = true 且未配置 tls_ca：数据面 TLS 将用系统根证书校验 relay 证书（与隧道一致）")
+		}
+	case TLSFalse:
+		c.addWarning("[server] data_tls = false：数据面按明文运行；若 relay 要求数据面 TLS，拨号会明确失败而不是静默降级")
 	}
 	// duration 解析阶段已拒绝 <= 0；这里兜住「绕过 ini 直接构造 Config」的情形。
 	if s.ReconnectMaxBackoff < 0 {
@@ -345,9 +448,14 @@ func (c *Config) validateClient() error {
 	if err != nil {
 		return err
 	}
+	dataMode, err := c.checkTLSMode("[client] data_tls", cl.DataTLS)
+	if err != nil {
+		return err
+	}
+	cl.DataTLS = dataMode
 	if mode == TLSFalse {
 		if cl.TLSCA != "" || cl.TLSInsecureSkipVerify {
-			c.addWarning("[client] 已配置 tls_ca / tls_insecure_skip_verify 但 tls = false，控制面按明文拨号（上述配置被忽略）")
+			c.addWarning("[client] 已配置 tls_ca / tls_insecure_skip_verify 但 tls = false，控制面按明文拨号（上述配置被忽略；数据面是否 TLS 由 data_tls 决定，若判定为 TLS 仍会使用上述材料）")
 		}
 	} else {
 		if cl.TLSCA != "" {
@@ -360,6 +468,14 @@ func (c *Config) validateClient() error {
 				c.addWarning("[client] tls_insecure_skip_verify = true，将跳过 relay 证书校验（仅建议测试环境）")
 			}
 		}
+	}
+	switch dataMode {
+	case TLSTrue:
+		if cl.TLSCA == "" && !cl.TLSInsecureSkipVerify {
+			c.addWarning("[client] data_tls = true 且未配置 tls_ca：数据面 TLS 将用系统根证书校验 relay 证书（与隧道一致）")
+		}
+	case TLSFalse:
+		c.addWarning("[client] data_tls = false：数据面按明文运行；若 relay 要求数据面 TLS，拨号会明确失败而不是静默降级")
 	}
 	// duration 解析阶段已拒绝 <= 0 的值；这里兜住"绕过 ini 直接构造 Config"的情形，
 	// 保证 client 侧 UDP 空闲清理不会退化成"立刻清理"或"永不清理"。
@@ -408,6 +524,40 @@ func checkDialAddr(field, value string) error {
 		return fmt.Errorf("%s = %q: %w", field, value, err)
 	}
 	return nil
+}
+
+// isLoopbackListenAddr 报告监听地址是否只绑定回环接口（127.0.0.0/8、::1、localhost）。
+//
+// 用于两条安全校验（SEC-A1 / SEC-T2）：空 auth_token 与 tls=auto 无证书时，
+// 只允许回环监听；0.0.0.0 / :: / 具体网卡 IP / 空 host 一律按"非回环"处理
+// （宁可拒绝）。与 internal/admin.IsLoopbackListen 的判定保持一致。
+func isLoopbackListenAddr(addr string) bool {
+	s := strings.TrimSpace(addr)
+	if s == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(s)
+	if err != nil {
+		// 容忍不带端口的写法（校验会另行拒绝，这里不能误判为可写）。
+		host = s
+	}
+	return isLoopbackHost(host)
+}
+
+// isLoopbackHost 报告 host 是否是回环主机名或回环 IP。
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // warnFileMissing 在路径存在但文件缺失时给出警告（不报错，便于先写配置后拷证书）。

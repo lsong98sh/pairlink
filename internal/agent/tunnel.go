@@ -74,7 +74,7 @@ func (m *carrierManager) openSession(sess *localSession, key pairing.PairingKey,
 		m.cur = nil
 	}
 	if c == nil {
-		conn, err := m.a.dialTCP(m.a.ctx, tcpDataAddr, m.a.dialTimeout())
+		conn, err := m.a.dialDataPlane(m.a.ctx, tcpDataAddr, m.a.dialTimeout())
 		if err != nil {
 			m.mu.Unlock()
 			return nil, "", fmt.Errorf("连接 relay TCP 数据面（UDP 承载）: %w", err)

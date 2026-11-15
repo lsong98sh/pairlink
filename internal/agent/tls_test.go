@@ -56,7 +56,8 @@ func newBufferLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }
 
-// TestServerTLSConfigAutoPlainWithoutCA 覆盖默认行为：auto + 无材料 → 明文。
+// TestServerTLSConfigAutoPlainWithoutCA 覆盖默认行为：auto + 无材料 → 明文，
+// 并必须明确 WARN「当前以明文连接 relay；公网部署请 tls = true」（SEC-T2）。
 func TestServerTLSConfigAutoPlainWithoutCA(t *testing.T) {
 	buf := &bytes.Buffer{}
 	tc, err := serverTLSConfig(&config.ServerConfig{TLS: config.TLSAuto}, "relay.example.com", newBufferLogger(buf))
@@ -66,8 +67,12 @@ func TestServerTLSConfigAutoPlainWithoutCA(t *testing.T) {
 	if tc != nil {
 		t.Fatalf("auto + 无 tls_ca 应返回 nil（明文），实际 %+v", tc)
 	}
-	if buf.Len() != 0 {
-		t.Errorf("auto + 无材料不应产生 WARN，实际 %q", buf.String())
+	logs := buf.String()
+	if !strings.Contains(logs, "明文连接 relay") {
+		t.Errorf("auto + 无材料应 WARN 明文风险，实际 %q", logs)
+	}
+	if !strings.Contains(logs, "tls 设为 true") {
+		t.Errorf("WARN 应给出显式开启 TLS 的出口，实际 %q", logs)
 	}
 }
 

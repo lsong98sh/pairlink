@@ -7,7 +7,7 @@ PairLink 是一个**协议无关的字节流中转**：同一套系统可以承�
 数据库、自定义 TCP/UDP 服务，中继不解析也不终止上层协议（HTTPS/SSH 的端到端加密由
 第三方客户端与真实服务自行完成，中继透明转发）。
 
-- 版本：`v0.3.0`
+- 版本：`v0.4.0`
 - 许可证：Apache-2.0
 - 语言：Go 1.24.4，单二进制三模式
 - 唯一第三方依赖：`golang.org/x/sys`（Windows 服务 SCM）
@@ -52,7 +52,7 @@ graph LR
   之后双向 `io.Copy` 原样透传；**relay 在配对成功前不写任何字节**。
 - **UDP 数据面**（`udp_listen`，可选）：配置了就走原生 UDP——首个数据报是 `MsgBind`，
   relay 记录两侧 `(IP,Port)` 建立会话映射，之后按源地址反查配对键转发数据报；
-  未配置则复用 `tcp_listen`，UDP 数据报封装进 UDP 隧道帧（见 §3.3）。
+  未配置则复用 `tcp_listen`，UDP 数据报封装进 UDP 隧道帧（见 §3.4）。
 - 详细协议见 [`docs/protocol.md`](docs/protocol.md)，架构与并发模型见
   [`docs/architecture.md`](docs/architecture.md)，阶段 2 契约见 [`docs/contract.md`](docs/contract.md)。
 
@@ -152,7 +152,26 @@ relay 也无需维护"请求 → ID"的反查表。重复 ID 会被 relay 的 `P
 agent/client 据此选择 UDP 数据面承载方式并推导数据面拨号地址（无需在 agent/client 的 ini 里
 重复写 `[relay]` 端口）。
 
-### 3.3 UDP 数据面承载模式与取舍
+### 3.3 数据面 TLS（阶段 8D）
+
+默认 `data_tls = auto`：relay 跟随隧道 TLS 判定（`tls = true`，或 `auto` + 证书 → 数据面 TLS），
+agent/client 跟随 `HelloOK.data_tls`。启用后 TCP 数据面（配对报到 `MsgBind` + 业务字节 +
+UDP-over-TCP 承载帧）全部走 TLS，`pairing_token` 不再明文；证书与 `minVersion TLS 1.2`
+与隧道完全相同（relay 复用 `tls_cert`/`tls_key`，agent/client 复用 `tls_ca` /
+`tls_insecure_skip_verify`）。
+
+| 配置 | relay 行为 | agent/client 行为 |
+| --- | --- | --- |
+| `auto`（默认） | 隧道 TLS 开 → 数据面 TLS；隧道明文 → 数据面明文 | 跟随 `HelloOK.data_tls`；旧 relay 未下发 → 明文 + WARN |
+| `true` | 强制 TLS；缺证书对 → 启动校验失败 | 必须 TLS；relay 未启用 → 拨号永久失败（可读错误） |
+| `false` | 强制明文（即使隧道 TLS），启动 WARN | 强制明文；relay 要求 TLS → 明确报错，不静默降级 |
+
+`udp_mode = native` 时原生 UDP 数据面**没有 DTLS，仍是明文**；需要加密 UDP 请改用
+`udp_mode = tcp_tunnel`（承载在 TCP 数据面上，随 `data_tls` 一起加密）。启用数据面 TLS 要求
+relay/agent/client 三端 ≥ v0.4.0：旧端忽略 `HelloOK.data_tls`，会以明文连 TLS 端口并握手失败，
+relay 记录 `data_plane_tls_handshake_fail` WARN 便于定位。
+
+### 3.4 UDP 数据面承载模式与取舍
 
 `[relay] udp_listen` 是**可选**的。relay 启动时确定模式，并通过
 `HelloOK` / `ServiceRegistered` / `ServiceList` 的 `udp_mode` 字段下发给 agent/client：
@@ -285,7 +304,7 @@ udp_session_timeout = 60s
 | --- | --- |
 | `-relay` / `-agent` / `-client` | 必须且只能指定一个模式 |
 | `-config <path>` | ini 配置文件路径（必填） |
-| `-version` | 打印 `pairlink v0.3.0` 并退出（退出码 0） |
+| `-version` | 打印 `pairlink v0.4.0` 并退出（退出码 0） |
 | `-service <op>` | 仅 Windows：`install` / `start` / `stop` / `uninstall`（另有内部使用的 `run`） |
 
 退出码：`0` 正常；`1` 运行/配置错误；`2` 参数用法错误（会打印帮助）。
@@ -322,15 +341,21 @@ udp_session_timeout = 60s
 | `tunnel_listen` | `host:port` | **是** | — | 控制面（信令）监听地址 |
 | `tcp_listen` | `host:port` | **是** | — | TCP 数据面监听地址 |
 | `udp_listen` | `host:port` | 否 | 空 | 原生 UDP 数据面监听地址；为空表示不监听 UDP，UDP 走 TCP 隧道（`udp_mode = tcp_tunnel`） |
-| `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（按 `tls_cert`/`tls_key` 推断）/ `true`（强制 TLS，证书必须成对且路径非空，否则启动校验失败）/ `false`（强制明文，证书被忽略并 WARN）；只接受 `auto`/`true`/`false` |
+| `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（按 `tls_cert`/`tls_key` 推断；**非回环监听且无证书时启动校验失败**，必须改 `true` 或显式 `false`，SEC-T2）/ `true`（强制 TLS，证书必须成对且路径非空，否则启动校验失败）/ `false`（强制明文，证书被忽略；非回环监听会额外 WARN 明文风险）；只接受 `auto`/`true`/`false` |
 | `tls_cert` | 路径 | `tls=true` 时是 | 空 | 隧道 TLS 证书；`tls = true` 时必须与 `tls_key` 成对，`auto` 下都为空则明文并 WARN |
 | `tls_key` | 路径 | `tls=true` 时是 | 空 | 隧道 TLS 私钥；`tls = true` 时必须与 `tls_cert` 成对 |
-| `auth_token` | string | 建议 | 空 | agent/client 接入密钥；为空则 WARN 并放行（仅内网调试） |
+| `data_tls` | enum | 否 | `auto` | TCP 数据面 TLS 三态：`auto`（跟随隧道 TLS，启用则数据面也 TLS）/ `true`（强制 TLS，复用 `tls_cert`/`tls_key`，缺证书对启动失败）/ `false`（强制明文，即使隧道 TLS，启动 WARN）；只接受 `auto`/`true`/`false`。原生 UDP 不受影响（SEC-T1） |
+| `auth_token` | string | 公网**是** | 空 | agent/client 接入密钥。**为空时只允许回环来源**（`127.0.0.0/8`、`::1`）接入，非回环一律 `auth_failed`（SEC-A1）；非回环 `tunnel_listen` + 空 token 直接启动校验失败。公网请用 `openssl rand -hex 32` 生成 |
 | `pair_timeout` | duration | 否 | `10s` | 待配对表占位超时 / 数据面报到读帧超时（可在管理页修改） |
 | `idle_timeout` | duration | 否 | `300s` | TCP 数据面空闲超时（无流量即断开）（可在管理页修改） |
 | `heartbeat_timeout` | duration | 否 | `90s` | 控制面无心跳判死时间（可在管理页修改） |
 | `udp_session_timeout` | duration | 否 | `60s` | UDP 完整会话空闲超时（可在管理页修改） |
 | `token_ttl` | duration | 否 | `15s` | 一次性配对令牌有效期（可在管理页修改） |
+| `max_conns` | int | 否 | `1024` | 隧道控制面 + TCP 数据面的并发连接总数上限；`0` = 不限制。超限立即关闭新连接并限速 WARN（SEC-D2） |
+| `max_conns_per_ip` | int | 否 | `128` | 单来源 IP 的并发连接上限（隧道与 TCP 数据面合计）；`0` = 不限制 |
+| `max_pending_pairs` | int | 否 | `4096` | 待配对占位 + 已签发未消费令牌的总数上限；超限对新 `ConnectRequest` 回 `too_many_pending`；另有单连接「未完成请求 ≤ 64」的硬上限；`0` = 不限制 |
+| `service_allow` | list | 否 | 空 | 允许注册的服务名白名单（逗号分隔，自动去重）；空 = 允许任意服务名但启动 WARN；不在名单内的 `RegisterService` 回 `bad_request`（`detail=service_denied`）（SEC-A2） |
+| `max_services_per_agent` | int | 否 | `64` | 单个 agent 可注册的服务数上限；`0` = 不限制；超限回 `bad_request`（`detail=service_limit`，消息带上限值）；同一服务重复注册不重复计数 |
 
 ### 5.4 `[server]`（agent 模式）
 
@@ -344,6 +369,7 @@ udp_session_timeout = 60s
 | `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（有 `tls_ca` 或 `tls_insecure_skip_verify` 才 TLS，否则明文）/ `true`（强制 TLS；`tls_ca` 为空时用**系统根证书**做标准校验，公网 CA 场景写这个）/ `false`（强制明文，`tls_ca`/insecure 被忽略并 WARN）；只接受 `auto`/`true`/`false` |
 | `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；`tls = auto` 时为空且未开 `tls_insecure_skip_verify` 则走**明文**，`tls = true` 时为空则用**系统根证书**校验（见 §7.1） |
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过 relay 证书校验（仅测试，启动 WARN） |
+| `data_tls` | enum | 否 | `auto` | 数据面 TLS 三态：`auto`（跟随 `HelloOK.data_tls`；旧 relay 未下发则明文 + WARN）/ `true`（必须 TLS，relay 未启用时拨号永久失败）/ `false`（强制明文，relay 要求 TLS 时明确报错，不静默降级）；复用 `tls_ca`/`tls_insecure_skip_verify` 与 `minVersion TLS 1.2` |
 | `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
 | `dial_timeout` | duration | 否 | `10s` | 连接 relay / 本地目标超时 |
 | `udp_session_timeout` | duration | 否 | `60s` | agent 侧本地 UDP 会话空闲清理 |
@@ -360,6 +386,7 @@ udp_session_timeout = 60s
 | `tls` | enum | 否 | `auto` | TLS 三态开关：`auto`（有 `tls_ca` 或 `tls_insecure_skip_verify` 才 TLS，否则明文）/ `true`（强制 TLS；`tls_ca` 为空时用**系统根证书**做标准校验，公网 CA 场景写这个）/ `false`（强制明文，`tls_ca`/insecure 被忽略并 WARN）；只接受 `auto`/`true`/`false` |
 | `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；`tls = auto` 时为空且未开 `tls_insecure_skip_verify` 则走**明文**，`tls = true` 时为空则用**系统根证书**校验（见 §7.1） |
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过证书校验（仅测试，启动 WARN） |
+| `data_tls` | enum | 否 | `auto` | 数据面 TLS 三态：`auto`（跟随 `HelloOK.data_tls`；旧 relay 未下发则明文 + WARN）/ `true`（必须 TLS，relay 未启用时拨号永久失败）/ `false`（强制明文，relay 要求 TLS 时明确报错，不静默降级）；复用 `tls_ca`/`tls_insecure_skip_verify` 与 `minVersion TLS 1.2` |
 | `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
 | `subscribe` | bool | 否 | `true` | 是否订阅服务列表变更 |
 | `dial_timeout` | duration | 否 | `10s` | 连接 relay / 数据面超时 |
@@ -423,6 +450,11 @@ service.ssh = :2222
 - `[server]`/`[client]` 的 `reconnect_max_backoff` 必须是 > 0 的 duration（`0s`、负值、无单位都直接报错）；
 - `tls` 只能是 `auto` / `true` / `false`（大小写不敏感），其它值（`on`、`yes`、`1` 等）直接报错；
 - `[relay] tls = true` 要求 `tls_cert` 与 `tls_key` 成对且路径非空（文件不存在仍只 WARN）；
+- **SEC-A1**：`[relay] auth_token` 为空且 `tunnel_listen` 非回环（含 `0.0.0.0`/`::`/具体网卡 IP）→ **直接报错**，
+  提示配置 `auth_token` 或把隧道绑回环；回环 + 空 token 仅 WARN（只允许回环来源接入）。
+- **SEC-T2**：`[relay] tls = auto`（或未写）且未配置成对证书、`tunnel_listen` 非回环 → **直接报错**，
+  提示「公网监听必须配置证书，或显式写 tls = false 承担明文风险」；回环监听保持 WARN。
+- `[relay] max_conns` / `max_conns_per_ip` / `max_pending_pairs` 必须是非负整数（`0` = 不限制），负数/非整数报错。
 - `[server]`/`[client] tls = false` 时已配置的 `tls_ca`/`tls_insecure_skip_verify` 被忽略并 WARN；
   `tls = true` 且 `tls_insecure_skip_verify = true` 允许但 WARN（开关多余）。
 
@@ -440,17 +472,31 @@ service.ssh = :2222
 | agent | 本机已注册服务列表、到 relay 的控制连接状态、当前活跃数据连接 | **服务表**：`service.<id>` 新增/修改/删除；**主服务** `protocol` + `local` 修改 |
 | client | relay 返回的可用服务列表、本地端口映射表、当前活跃配对 | **映射表**：`service.<id>` 本地监听地址的新增/修改/删除 |
 
-- 顶栏显示模式、版本、运行时长；页面默认 **1 秒自动刷新**，可点右上角暂停/开启。
+- 顶栏显示模式、版本、运行时长与刷新开关。**只读页默认 1 秒自动刷新**；
+  **可写页（回环 `manage_listen`）或含写表单的页面默认暂停刷新**，避免整页重载清空正在输入的值（P1-2）；
+  点右上角「开启自动刷新」即可临时恢复（`?refresh=1`），`?refresh=0` 强制关闭。
 - **持久化**：写操作同时改运行时并**写回 ini**。ini 补丁只替换目标键的值，**保留注释、空行、
   键顺序、对齐与换行风格**（LF/CRLF），按行插入/删除键，同目录临时文件 + `Rename` 原子替换并
   保留权限位；不支持跨行值与行尾注释（值中的 `;`/`#` 属于值本身）。
+  写回要求 **ini 所在目录对服务进程可写**（临时文件 + `rename` 必须能建/改名）：
+  - systemd 启用 `User=pairlink` 时，`/etc/pairlink` 需 `2775`（或 `chown -R pairlink:pairlink`），
+    且 unit 里必须放行 `ReadWritePaths=/etc/pairlink`（`ProtectSystem=strict` 下默认只读，P1-1）；
+  - Docker 部署用**目录读写挂载**（`-v ./config:/etc/pairlink`），容器 uid `65532` 需可写该目录。
+  目录只读时页面保存会明确报错（`EROFS`/`permission denied`），运行时状态保持不变。
 - **一致性**：relay 参数先校验 → 写 ini → 改运行时（写 ini 失败则不改运行时）；agent 服务改动
   需先得到 relay 确认（3s 超时）才落盘，失败回滚内存；client 映射先开监听成功才落盘，失败回滚旧监听。
 - **鉴权**：管理页**没有账号体系**，写能力的边界就是"只能绑回环"。写操作仍走一次性 CSRF 令牌 +
-  POST，禁止 GET 触发写；每次写操作记审计日志 `event=admin_action`（含 `remote`/`action`/
+  POST，禁止 GET 触发写；**所有写 Action 额外校验 `Host` 必须是回环名**（`127.0.0.1` / `[::1]` /
+  `localhost` + 可选端口），**且 `Origin`（若存在）必须等于 `http://` + 同一 Host**——防 DNS
+  rebinding 与跨站写，伪造一律 403（SEC-M1）。每次写操作记审计日志 `event=admin_action`（含 `remote`/`action`/
   `target`/`old`/`new`），被拒记 `admin_action_denied`，失败记 `admin_action_failed`。
 - 其它字段（`relay_addr`、`token`、监听端口、`tls*`、`reconnect` 等）**不在页面开放**，仍改 ini + 重启。
 - `pprof = true` 时额外提供 `/debug/pprof/`；生产环境建议关闭，或只监听 `127.0.0.1`。
+  该调试端点的 CSP 单独放宽 `script-src 'unsafe-inline'`/`img-src`（否则 pprof 图表脚本被禁），
+  业务页面仍严格 `default-src 'none'`。
+- **安全响应头（SEC-M1）**：所有响应统一加
+  `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`、
+  `X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` 与 `Cache-Control: no-store`。
 
 **HTML 组织方式（设计选择）**：三种模式共用 `internal/admin` 的**一套内联布局**——统一的
 `<html lang="zh-CN">` 外壳、内联 CSS、顶栏（模式 / 版本 / 运行时长 / 刷新开关），不引用任何
@@ -474,16 +520,32 @@ service.ssh = :2222
    - `false`（强制明文）：即使配了证书/CA 也不启用 TLS，并 WARN 提示材料被忽略。
    两侧配置不匹配时 TLS 握手直接失败并报可读错误（提示检查 relay 的 tls 与本端 tls/tls_ca），
    属预期行为（不会自动降级、不做协议探测）。
-2. **接入密钥**：`[relay] auth_token` 是 agent/client 接入隧道的共享密钥，务必改成随机长串
-   并与两端一致；为空时 relay 会 WARN 并放行，仅限内网调试。
+2. **接入密钥（SEC-A1）**：`[relay] auth_token` 是 agent/client 接入隧道的共享密钥，务必改成随机长串
+   并与两端一致。**为空时不再等于"人人可接入"**：relay 只允许回环来源（`127.0.0.0/8`、`::1`）接入，
+   非回环来源一律回 `auth_failed` 并记 WARN（含 `remote`）；非回环 `tunnel_listen` + 空 `auth_token`
+   会在启动校验阶段直接失败，只有「绑回环 + 空 token」的本机调试组合被允许（并 WARN）。
+   密钥比较先做 SHA-256 再常量时间比较。
 3. **一次性配对令牌**：与配对键绑定、32 字节 `crypto/rand`、短有效期（默认 15s）、
    用后即焚（Consume）、存储只保留 SHA-256、常量时间比较；TCP/UDP 数据面都强制校验。
-4. **数据面是明文哑管道**：HTTPS/SSH/RDP 等端到端加密由第三方客户端与真实服务完成，
-   relay 不解密也无法解密；但**明文协议（HTTP、裸 TCP）经过 relay 时是明文**，
-   不要把敏感明文协议直接暴露到公网而不加 TLS。
-5. **管理页无鉴权**：只监听 `127.0.0.1`；不要 `0.0.0.0:9000` 直接暴露。
-6. **日志**：不打印 `pairing_token` 明文；`auth_token` 也不打印。
-7. **最小暴露面**：agent 的本地目标地址只在 agent 本地；relay 只看到服务ID与协议。
+4. **数据面 TLS（SEC-T1，阶段 8D）**：`data_tls` 三态默认 `auto`——隧道启用 TLS 时 TCP 数据面
+   自动加密（`MsgBind`、`pairing_token`、业务字节与 UDP-over-TCP 承载帧都在 TLS 内），relay
+   复用隧道证书、agent/client 复用 `tls_ca` 与 `minVersion TLS 1.2`。`false` 强制明文会 WARN；
+   两端不匹配时握手失败并给出可读错误（不静默降级）。**原生 UDP（`udp_mode = native`）没有
+   DTLS，仍是明文**，公网/多租户建议改用 `udp_mode = tcp_tunnel`。HTTPS/SSH 等端到端加密仍应
+   由业务自身完成，relay 始终是哑管道、不解密。
+5. **管理页无鉴权**：只监听 `127.0.0.1`；不要 `0.0.0.0:9000` 直接暴露。写 Action 另有
+   Host/Origin 回环校验 + 一次性 CSRF（SEC-M1）；所有响应带 CSP/X-Frame-Options/nosniff。
+6. **日志（SEC-M2）**：不打印 `pairing_token` 明文；`auth_token` 也不打印。来自对端的字符串
+   （`client_name`/`agent_id`/错误信息/踢出原因）统一经 `logx.CleanN` 去除控制字符并按 64 字符
+   截断——1 MiB 的 `client_name` 只会产生 < 512 字节的单行日志，`\n` 也无法伪造额外日志行。
+7. **连接与配额（SEC-D2）**：隧道与 TCP 数据面受 `max_conns`/`max_conns_per_ip` 限制；
+   `ConnectRequest` 受 `max_pending_pairs` 与「单连接 ≤ 64 个未完成请求」限制；agent 并发处理
+   `MsgIncoming` 上限 256（超出丢弃并 WARN，不 panic）。超限日志按 5 秒一条限速。
+8. **最小暴露面**：agent 的本地目标地址只在 agent 本地；relay 只看到服务ID与协议。
+9. **服务名归属（SEC-A2，阶段 8D）**：`service_allow` 限定可注册的服务名，`max_services_per_agent`
+   （默认 64）限制单 agent 数量；同名服务同时只允许一个在线 owner，异 owner 在线时注册被拒
+   （`service_conflict`），原 owner 离线才允许接管（`service_takeover`）。**未配置 `service_allow`
+   时只 WARN**：任何持有 `auth_token` 的接入者仍可注册任意服务名，多租户部署应显式配置。
 
 ---
 
@@ -526,6 +588,10 @@ sudo journalctl -u pairlink-relay -f
 - 三个脚本**不会互相安装/启动**；单机只跑 relay 时不会出现 agent/client 的 unit 或 ini。
 - 共享二进制 `/usr/local/bin/pairlink`；卸载时仅当没有任何其它 `pairlink-*.service` 残留才删除。
 - `/etc/pairlink` 为 `0750 root:pairlink`，ini 为 `0640`；非 root 运行需在 unit 启用 `User=pairlink`/`Group=pairlink`（见 `deploy/systemd/README.md`）。
+- **管理页写回需要可写目录**（P1-1）：启用 `User=pairlink` 后，`/etc/pairlink` 需对服务用户可写
+  （`sudo chmod 2775 /etc/pairlink`，或 `chown -R pairlink:pairlink`；ini 改 `0660` / `0640` 视需要而定）。
+  unit 已在 `ProtectSystem=strict` 旁放行 `ReadWritePaths=/etc/pairlink`；不用写页面时可注释掉它恢复全只读。
+  目录只读时页面保存会报 `permission denied`/`EROFS`，运行时不会半更新。
 - 默认以 root 运行；`Restart=on-failure` + `RestartSec=3s` + 60s/5 次启动限制兜底；agent/client 自身也会自动重连（`reconnect`/`reconnect_max_backoff`，见 §5.4/§5.5 与 §10 #1）。
 - `--no-systemd` 只放二进制与配置；卸载用 `sudo ./deploy/linux/install-<mode>.sh --uninstall`，默认保留 `/etc/pairlink`，`--purge` 只删本模式 ini/证书。
 
@@ -566,7 +632,7 @@ sudo journalctl -u pairlink-relay -f
 ### 8.4 容器（Docker）
 
 ```bash
-docker build -t pairlink:v0.3.0 .
+docker build -t pairlink:v0.4.0 .
 docker compose -f deploy/docker-compose.yml up -d --build
 curl -fsS http://127.0.0.1:18080/ | grep -qi 'welcome to nginx' && echo 'e2e OK'
 docker compose -f deploy/docker-compose.yml down
@@ -574,6 +640,10 @@ docker compose -f deploy/docker-compose.yml down
 
 - 运行时 `gcr.io/distroless/static-debian12:nonroot`（uid 65532），`CGO_ENABLED=0` 静态编译；
 - 容器内 `127.0.0.1` 是容器自己，不是宿主机；`examples/docker/*.ini` 管理页绑 `0.0.0.0`，宿主机用 `127.0.0.1:端口:端口` 限制来源；
+- **配置目录以读写方式挂载**（`../examples/docker:/etc/pairlink:rw`）：管理页写回 ini 需要
+  「临时文件 + rename」，单文件 `:ro` 挂载做不到。容器以 uid 65532 运行，宿主机需
+  `sudo chown -R 65532:65532 examples/docker`（或 `chmod 0775` + 同组），否则页面保存报权限错误；
+  根文件系统仍保持 `read_only: true`（P1-1）；
 - 只映射管理页 17090/17091/17092 与演示入口 18080；
 - **镜像未在开发机验证（无容器运行时）**，验证命令与限制见 `deploy/README.md`。
 
@@ -628,10 +698,13 @@ docker compose -f deploy/docker-compose.yml down
    绑定 `0.0.0.0`/`::` 时只读且所有写 Action 返回 403。可写时表单仍受一次性 CSRF 保护，
    写操作会同时更新运行时并写回 ini；ini patch 保留注释、空行、键顺序、对齐与换行风格，但
    **不支持跨行值、行尾注释**（值中的 `;`/`#` 属于值本身）**与同名段/重复键之外的复杂结构**；
-   同一 ini 被其它进程或编辑器同时修改时**后写覆盖先写**。页面默认 1s 自动刷新且间隔不可配置。
+   同一 ini 被其它进程或编辑器同时修改时**后写覆盖先写**。页面自动刷新：只读页 1s，
+   可写页/含表单页默认暂停（`?refresh=1` 恢复、`?refresh=0` 强制关闭），间隔 1s 不可配置。
 8. **relay 状态全在内存**：重启后服务注册与配对关系丢失，agent/client 需要重启恢复。
 9. **单 relay 进程**：没有集群/多活；relay 是单点。
-10. **数据面无 TLS**：relay 是明文哑管道，安全性依赖上层协议自身的端到端加密。
+10. **数据面 TLS 默认跟随隧道，原生 UDP 仍无 DTLS（见第 19 条）**：启用隧道 TLS 后 TCP 数据面
+    默认也加密（`data_tls = auto`）；但 `udp_mode = native` 的原生 UDP 数据面没有 DTLS，
+    仍是明文，公网 UDP 场景请改用 `udp_mode = tcp_tunnel`。
 11. **Linux 已在真机（WSL2 Ubuntu）验证**：阶段 6A 起在 WSL2 的 Ubuntu 26.04
     （`go1.24.4 linux/amd64` / `gcc 15.2` / `CGO_ENABLED=1`）上跑通了全量单测、`-race`
     （真跑，非 `CGO_ENABLED=0` 降级）与真实三进程端到端（HTTP / TCP echo / UDP 两种承载 /
@@ -659,6 +732,45 @@ docker compose -f deploy/docker-compose.yml down
     `docker build` / `docker compose up` 需在有容器运行时的机器按 `deploy/README.md` 复核。
 18. **容器内 127.0.0.1 不是宿主机**：容器模板把管理页绑 `0.0.0.0` 以配合端口映射，
     宿主机侧用 `127.0.0.1:端口` 限制来源；不要把管理页映射到 `0.0.0.0` 公网。
+
+### 10.1 阶段 8C/8D 深层风险：已修复项与仍在范围的 SEC-D3
+
+SEC-T1（数据面 TLS）与 SEC-A2（服务名归属）在 **v0.4.0 / 阶段 8D 已修复**，下面保留历史记录
+并写清启用方式与残差；SEC-D3（原生 UDP 会话反伪造）仍未修复。
+
+19. **SEC-T1（High）：数据面 TLS —— 已修复（v0.4.0）**
+    - **启用方式**：`[relay] tls = true`（或 `auto` + `tls_cert`/`tls_key`）时，`data_tls = auto`
+      （默认）会让 TCP 数据面自动 TLS；也可显式 `data_tls = true`。agent/client 用默认 `auto`
+      跟随 `HelloOK.data_tls`，并复用 `tls_ca`/`tls_insecure_skip_verify`。启用后
+      `MsgBind` 与 `pairing_token`、业务字节、UDP-over-TCP 承载帧全部在 TLS 内。
+    - **失败语义**：`data_tls = true` 缺证书对 → relay 启动校验失败；本端 `true` 而 relay 未启用
+      → 拨号永久失败；本端 `false` 而 relay 要求 TLS → 明确报错，不静默降级；明文连接打到
+      TLS 数据面 → 握手失败 + relay `data_plane_tls_handshake_fail` WARN。
+    - **仍存在的边界**：原生 UDP（`udp_mode = native`）无 DTLS，仍是明文；relay 仍是哑管道，
+      不会替上层做端到端加密（HTTPS/SSH 仍应端到端启用）。启用数据面 TLS 要求三端 ≥ v0.4.0。
+20. **SEC-D3（Medium）：原生 UDP 会话可被源地址伪造/抢注**
+    - **现状**：`Bind` 只凭一次性令牌 + 配对键绑定会话，之后按源 IP:端口识别端点；
+      同一 NAT 后的攻击者或能嗅探令牌的链路攻击者，可在令牌有效期内抢先以受害者配对键
+      报到（会话抢注/源地址漂移），或伪造数据报注入会话。
+    - **临时缓解**：① 令牌 TTL 默认 15s，缩短可减小窗口（`token_ttl`）；② 对 UDP 服务
+      优先使用应用层鉴权（如 WireGuard 的 cookie、DTLS）；③ 对来源不稳定的场景改用
+      `udp_mode = tcp_tunnel`（TCP 三次握手 + 隧道/数据面 TLS，天然抗源地址伪造）；
+      ④ 公网部署给 `udp_listen` 加 ACL/限速。
+    - **计划（v0.4.x）**：引入 UDP 会话 cookie（HMAC(源地址, 密钥) 挑战-应答）或
+      QUIC/DTLS 类握手，把"源地址"纳入会话凭证；同时评估 `max_conns_per_ip` 之外的
+      UDP 每源配额。
+21. **SEC-A2（High）：服务名归属 —— 已修复（v0.4.0）**
+    - **启用方式**：`[relay] service_allow = web,ssh,default` 显式列出允许的服务名；
+      `max_services_per_agent`（默认 64）限制单 agent 服务数。`RegisterService` 依序校验
+      白名单 → 数量上限 → 归属：同 owner 覆盖；异 owner 在线 → 拒绝（`service_conflict`）；
+      原 owner 离线 → 允许接管（`service_takeover`，WARN 记录旧/新 owner）。agent 日志与
+      管理页显示稳定 `detail` 对应的可读提示。
+    - **失败语义**：不在白名单 → `bad_request` + `detail=service_denied`；超过上限 →
+      `bad_request` + `detail=service_limit`（消息带上限值）；异 owner 在线 → 拒绝并记录
+      `service_conflict`（含两个 agentID）。
+    - **仍存在的边界**：未配置 `service_allow` 时只 WARN，任何持 `auth_token` 的接入者仍可
+      注册任意服务名；接管判定依赖 relay 的在线表/心跳，网络分区期间可能短暂误判离线。
+      服务名仍无独立密钥/签名，多租户强隔离需配合按租户拆分 relay 或 token。
 
 ---
 
@@ -783,7 +895,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
 | 8 | task2：`udp_mode` 在三处下发 | `TestE2EUDPModeNegotiation` | **PASS**：`HelloOK`、`ServiceRegistered`、`ServiceList` 的 `udp_mode` 在 native 与 tcp_tunnel 两种模式下都与 relay 判定一致；`tcp_data_port > 0`，native 的 `udp_data_port > 0`，tcp_tunnel 为 0 |
 | 9 | 三种模式管理页 + pprof | `TestE2EAdminPagesThreeModes` | **PASS**：relay/agent/client 页面均 200；标题分别为 `PairLink relay/agent/client 管理页`；关键表头齐全；无 `<script src=`；三个端口的 `/debug/pprof/goroutine?debug=1` 均返回 200 且含 `goroutine profile: total` |
 | 10 | 无僵尸配对 / 无 goroutine 泄漏 | `TestE2EGoroutineNoLeak` | **PASS**：5 次完整配对流量后运行中 pprof `total=30`，无 `internal/forward.Bidirectional` 残留；全部 `Run` 退出后 goroutine `2 → 3`（容差 +2），`runtime/pprof` 中无 `internal/{relay,agent,client,forward}` 栈帧；每个测试的看护基线均 `2 → 2` |
-| 11 | 单二进制：版本/参数/配置错误退出码 | `TestBinaryVersionUsageAndConfigErrors` | **PASS**：`-version` → `pairlink v0.3.0` 且退出码 0；无模式/多模式/未知 flag → 退出码 **2**；`-relay -config 不存在` / `-agent -config 非法 ini` → 退出码 **1** 且有中文错误 |
+| 11 | 单二进制：版本/参数/配置错误退出码 | `TestBinaryVersionUsageAndConfigErrors` | **PASS**：`-version` → `pairlink v0.4.0` 且退出码 0；无模式/多模式/未知 flag → 退出码 **2**；`-relay -config 不存在` / `-agent -config 非法 ini` → 退出码 **1** 且有中文错误 |
 | 12 | 真实二进制三子进程 TCP echo | `TestSubprocessTCPEcho` | **PASS**：`go build` 出的真实 `pairlink.exe` 分别以 relay/agent/client 三个子进程运行，未改造的第三方 TCP 客户端回显成功；阶段 6A 起收尾统一用跨平台的 `os.Process.Kill()`（Windows/Linux 通用，不再依赖 `taskkill`） |
 | 13 | 跨平台编译（纯 Go 无 CGO） | `TestCrossCompile` | **PASS**：`linux/amd64` 13,895,704 B；`windows/amd64` 14,444,032 B；`windows/arm64` 13,505,024 B；三个平台 `go build ./...` 均通过 |
 | 14 | Windows 服务 | `TestE2EWindowsService` | **PASS（非管理员分支）**：`pairlink-relay -service install` 退出码 1，输出可读错误 `service: 连接 SCM（需要管理员权限）: Access is denied.`，无 panic/静默成功；完整 install→start→stop→uninstall 需管理员，本机未执行（见 §13.10） |
@@ -893,7 +1005,7 @@ pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|
 ### 13.10 真实二进制、子进程与跨平台
 
 - `TestBinaryVersionUsageAndConfigErrors`：`pairlink -version` 输出
-  `pairlink v0.3.0`；无模式/多模式/未知 flag 退出码 2；配置文件缺失/非法退出码 1，
+  `pairlink v0.4.0`；无模式/多模式/未知 flag 退出码 2；配置文件缺失/非法退出码 1，
   错误信息为中文且可定位。
 - `TestSubprocessTCPEcho`：TestMain 在临时目录 `go build` 出真实 `pairlink.exe`，启动
   relay/agent/client 三个子进程，第三方 TCP echo 成功，最后用跨平台 `os.Process.Kill()` 清理（阶段 6A 起不再依赖 `taskkill`）。
@@ -970,7 +1082,7 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
 3. **TLS e2e 只覆盖自签 CA 与 insecure 组合**（阶段 4 补充）：`TestE2ETLS*` 已覆盖
    relay `tls.Listen` + agent/client `tls_ca`、`tls_insecure_skip_verify`，以及
    "明文连 TLS / TLS 连明文"必须失败的路径；未覆盖公网 CA（系统根证书）、证书过期、
-   主机名不匹配。数据面按设计永远明文。
+   主机名不匹配。数据面 TLS 已由阶段 8D 覆盖（`TestE2EDataPlaneTLS*`），原生 UDP 仍是明文。
 4. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；
    TCP/UDP 行为在真实广域网下可能不同。
 5. **UDP over TCP 首包可能丢失**：会话刚建立、对端尚未完成登记时，第一个数据帧可能被
@@ -1269,16 +1381,120 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 **回归**：`gofmt -l .` 无输出；`go vet ./...`、`go build ./...`、`go test ./... -count=1`
 通过；WSL 侧 `go test ./test -run TestExamples -count=1` 通过。
 
+### 13.19 阶段 8C：P0/High 缺陷修复验证（v0.3.1）
+
+**Windows 11 / amd64（Go 1.24.4）**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `gofmt -l .` / `go vet ./...` / `go build ./...` | 全部无输出/通过 |
+| `go test ./... -count=1` | 17 个包全部 `ok`（含 `internal/{protocol,config,admin,relay,agent,client,logx,token}` 与 `test` e2e） |
+| `go test -race ./... -count=1`（连续 2 次） | 两次全部 `ok`，无 data race |
+| `go test ./test/... -count=2` | 全部 `ok`（e2e 重复跑 2 轮） |
+| `GOOS=linux GOARCH=amd64 go build ./...` | 通过 |
+| 新增/更新回归 | `TestReadFrameWithLimitRejectsOversizedHeader`（1 MiB 声明 → 拒绝，堆增量 1784 B < 256 KiB）、`TestParseFrameLimit`、`TestAuthAllowed`（9 分支）、`TestValidateRelayNonLoopbackSecurity`（11 分支）、`TestDataPlaneBindOversizedHeaderRejected`、`TestConnLimitMaxConns`、`TestConnLimitPerIP`、`TestConnectRequestPendingQuota`、`TestConnectRequestPerConnQuota`、`TestCarrierReadTimeout`、`TestCarrierDuplicateBindNotForwarded`、`TestIncomingConcurrentLimitDrops`、`TestCleanN`/`TestCleanNKeepsLogLineSmall`、`TestRelayTruncatesClientNameInLogs`、`TestRefreshDefaults`、`TestSecurityHeaders`（含 404）、`TestSecurityHeadersPprof`、`TestActionHostOriginCheck`、`TestAuditDeniedReason`、`TestPendingAndPendingID` |
+
+**WSL2 Ubuntu（systemd 259，Go 1.24.4 linux/amd64，ext4 副本）**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `gofmt -l .` / `go vet ./...` / `go build ./...` | clean / 通过 / 通过 |
+| `go test ./... -count=1` | 17 个包全部 `ok` |
+| `go test -race ./... -count=1` | 全部 `ok`（`CGO_ENABLED=1`，真实 race） |
+| `systemd-analyze verify` 三个 unit | 通过（仅提示 `/mnt/e` 9p 的文件模式与二进制未安装，属环境噪声） |
+
+**systemd 真机写回（P1-1，root 运行 + `ProtectSystem=strict`）**：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 安装 unit（含 `ReadWritePaths=/etc/pairlink`）、`enable --now` | `is-active=active`，管理页 `/relay` = 200 |
+| 从页面把 `pair_timeout` 改为 `17s` | 303；`grep -x 'pair_timeout = 17s' /etc/pairlink/relay.ini` 命中 |
+| 再改回 `10s` | 303；`grep -x 'pair_timeout = 10s'` 命中；审计日志 `admin_action` 记录 old/new |
+| 伪造 `Host: evil.example:17090` 写同一键 | **403**，日志 `event=admin_denied` + `admin_action_denied reason=host_origin`（不再误标 `read_only`） |
+| 响应头 | CSP / `X-Frame-Options: DENY` / `nosniff` / `no-referrer` 全部命中 |
+| 可写页默认刷新 | 无 `<meta http-equiv="refresh">`（P1-2） |
+
+> 说明：SEC-T1（数据面 TLS）、SEC-D3（UDP 反伪造）、SEC-A2（服务名归属）**不在本轮范围**，
+> 已在 README §10.1、`docs/architecture.md` §7.10、`docs/review-security.md` §0 记录
+> 现状/临时缓解/计划；其复现步骤仍然有效，不能视为已修复。
+
 ## 14. 版本与许可证
 
-- 版本：`v0.3.0`
+- 版本：`v0.4.0`
 - 许可证：[Apache-2.0](LICENSE)
 
 ---
 
 ## 15. 变更记录（Changelog）
 
-### v0.3.0（当前）
+### v0.4.0（当前）
+
+**安全修复（阶段 8D：数据面 TLS 与服务名归属）**
+
+- **SEC-T1（High）数据面明文**：`[relay]` / `[server]` / `[client]` 新增三态 `data_tls`
+  （`auto` 默认 / `true` 强制 TLS / `false` 强制明文）。`auto` 时 relay 跟随隧道 TLS 判定，
+  agent/client 跟随 `HelloOK.data_tls`；TCP 数据面（配对报到 + 业务流量 + UDP-over-TCP 承载）
+  改用 `tls.Listen` / `tls.Client`，复用隧道证书与 `minVersion = TLS 1.2`。`data_tls = true`
+  缺证书对直接启动失败；明文连接打到 TLS 数据面时握手失败并记录
+  `data_plane_tls_handshake_fail` WARN；两端 `data_tls` 冲突为**永久错误**（不重连、不静默降级）。
+  `HelloOK` 增加可选 `data_tls` 字段（`*bool`），旧 agent/client 忽略该字段，
+  **启用后要求三端 ≥ v0.4.0**；旧 relay 未下发该字段时新端按明文运行并 WARN。
+- **SEC-A2（High）服务名归属**：relay 新增 `service_allow`（逗号分隔白名单；空 = 允许任意，
+  但启动 WARN）与 `max_services_per_agent`（默认 64，0 = 不限）。`RegisterService` 依序校验
+  白名单 → 单 agent 数量上限 → 归属：同 owner 覆盖；异 owner 在线 → 拒绝（`service_conflict`），
+  原 owner 离线 → 允许接管（`service_takeover`，WARN 记录旧/新 owner）；拒绝原因用稳定
+  `detail` 代码下发，agent 日志与管理页显示可读提示。relay 新增 `service_denied` 事件。
+
+**安全修复（阶段 8C，对应 `docs/review-security.md` / `docs/review-code.md`）**
+
+- **P0-1 / SEC-D1 帧长度预分配放大**：所有**网络入口**（隧道控制面、TCP 数据面报到、UDP
+  报到嗅探、agent/client 控制连接）改用 `ReadFrameWithLimit(conn, 64 KiB)`，对端只发 5 字节
+  帧头声明 1 MiB 时立即 `ErrPayloadTooLarge` 并断开，不再按声明长度分配；新增
+  `ParseFrameLimit(data, limit)` 供 UDP 数据报使用（要求 `len >= 5` 且声明长度 == 实际长度，
+  截断/拼接一律拒绝）。回归测试断言 1 MiB 声明下堆分配增量 < 256 KiB。`MaxPayload` 仅保留给
+  `EncodeFrame` 等内存路径。
+- **SEC-A1（Critical）空 `auth_token` = 全开放**：空 token 时只允许回环来源（`127.0.0.0/8`、
+  `::1`）接入，非回环一律 `auth_failed` + WARN（含 `remote`）；非回环 `tunnel_listen` + 空
+  token 直接**启动校验失败**。密钥比较改为 SHA-256 + 常量时间比较。
+- **SEC-T2（High）`tls = auto` 静默明文**：非回环监听 + 无成对证书 → 启动校验失败
+  「公网监听必须配置证书，或显式写 tls = false 承担明文风险」；回环保持 WARN；
+  agent/client 的 `auto` 无 CA 路径升级为明确 WARN（当前明文连接 relay，公网请 `tls = true`）。
+- **P1-1 systemd/compose 写回失败**：三个 unit 增加 `ReadWritePaths=/etc/pairlink`；compose
+  改为**配置目录读写挂载**（单文件 `:ro` 无法 rename）；文档补充 `2775`/uid 65532 权限要求。
+- **P1-2 1 秒刷新清空写表单**：可写页/含表单页默认暂停自动刷新，顶栏可 `?refresh=1` 恢复；
+  只读页仍 1s。
+- **SEC-M1 管理页 Host/Origin 与安全头**：所有写 Action 校验 `Host` 为回环名、`Origin` 匹配，
+  伪造返回 403；所有响应加 CSP / `X-Frame-Options: DENY` / `nosniff` / `no-referrer`。
+- **SEC-M2 日志放大/注入**：`client_name`/`agent_id`/错误与踢出原因统一 `logx.CleanN`
+  （去控制字符 + 64 字符截断）；1 MiB `client_name` → 单行 < 512 B，`\n` 无法伪造日志行。
+- **SEC-M4 承载半帧无读超时**：承载连接逐帧读 deadline = `max(30s, 2×udp_session_timeout)`，
+  超时关连接并清理该连接全部会话。
+- **SEC-D2（部分）连接/配额上限**：新增 `[relay] max_conns`（1024）、`max_conns_per_ip`（128）、
+  `max_pending_pairs`（4096）；`ConnectRequest` 计入已签发未消费令牌，单连接未完成请求 ≤ 64；
+  agent 并发 `MsgIncoming` ≤ 256（超出丢弃 + WARN）；超限日志 5 秒限速。
+- **P2 顺手修复**：UDP 鉴权失败 WARN 限速（P2-1）、accept 日志降 Debug（P2-2）、
+  承载帧 `sess_len ≤ 129` 读侧校验（P2-6）、已登记会话重复 `MsgBind` 丢弃（P2-7）、
+  `traceability.md` 测试锚点脚本重生成 + 标题/基线更新（P2-3，45 处行号修正、0 缺失）。
+
+**未修复（明确不在本轮范围，见 §10.1）**：SEC-D3 UDP 会话反伪造。原生 UDP 数据面
+（`udp_mode = native`）没有 DTLS，仍是明文；公网部署建议改用 `udp_mode = tcp_tunnel`
+复用数据面 TLS。relay 未配置 `service_allow` 时只 WARN，不强制白名单。
+
+**兼容性**
+
+- 线协议不变（`ProtocolVersion = 1`）；旧 ini 不需要新字段（新键有默认值
+  `data_tls = auto` / `max_services_per_agent = 64`，`service_allow` 留空仅 WARN）。
+- **启用数据面 TLS 后要求 relay/agent/client 三端均 ≥ v0.4.0**：旧端不识别
+  `HelloOK.data_tls`，仍按明文连 TLS 数据面 → 握手失败（relay 记录
+  `data_plane_tls_handshake_fail`）；旧 relay 未下发该字段时新端按明文回退并 WARN。
+  两端 `data_tls` 冲突（`true` vs `false`）是永久错误，不会静默降级。
+- **行为变化**（有意为之，启动校验会给出明确提示）：空 `auth_token` + 非回环监听、
+  `tls = auto` + 非回环监听 + 无证书，现在会**拒绝启动**；受影响的旧部署需改配置或显式
+  写 `tls = false` / 绑回环。配置 `service_allow` 后未列入白名单的服务名注册会被拒；
+  `max_services_per_agent` 默认 64，单 agent 大规模部署需调大或设 0 关闭。
+- 可写管理页默认不再 1s 自动刷新（只读页不变）。
+
+### v0.3.0
 
 **新增**
 

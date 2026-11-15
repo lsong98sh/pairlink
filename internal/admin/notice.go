@@ -66,17 +66,24 @@ func (s *Server) Audit(r *http.Request, action, target, oldValue, newValue strin
 	)
 }
 
-// AuditDenied 记录一次被只读门禁拒绝的写请求。
-func (s *Server) AuditDenied(r *http.Request, action string) {
+// AuditDenied 记录一次被门禁拒绝的写请求。
+//
+// reason 区分拒绝原因：只读模式（read_only）与 Host/Origin 校验失败
+// （host_origin，SEC-M1）。两者都必须留审计痕迹，但日志不能让排障者误判为
+// "服务正处于只读模式"。
+func (s *Server) AuditDenied(r *http.Request, action, reason string) {
 	remote := ""
 	if r != nil {
 		remote = r.RemoteAddr
+	}
+	if reason == "" {
+		reason = "read_only"
 	}
 	s.log.Warn("管理页写操作被拒绝",
 		"event", "admin_action_denied",
 		"remote", sanitizeLog(remote),
 		"action", sanitizeLog(action),
-		"reason", "read_only",
+		"reason", sanitizeLog(reason),
 	)
 }
 

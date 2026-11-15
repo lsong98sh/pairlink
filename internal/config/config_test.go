@@ -238,9 +238,13 @@ func TestUnknownKeysOnlyWarn(t *testing.T) {
 
 func TestRelayUDPListenOptional(t *testing.T) {
 	// 未配置 udp_listen：合法，UDP 走 TCP 隧道。
+	// 显式 tls = false + auth_token：非回环监听必须显式承担明文风险（SEC-T2）
+	// 并提供接入密钥（SEC-A1），本用例只关注 udp_listen 的可选性。
 	path := writeTempINI(t, `[relay]
 tunnel_listen = 0.0.0.0:7000
 tcp_listen = 0.0.0.0:7001
+tls = false
+auth_token = test-token
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -261,6 +265,8 @@ tcp_listen = 0.0.0.0:7001
 tunnel_listen = 0.0.0.0:7000
 tcp_listen = 0.0.0.0:7001
 udp_listen = 0.0.0.0:7002
+tls = false
+auth_token = test-token
 `)
 	cfg, err = Load(path)
 	if err != nil {
@@ -278,6 +284,8 @@ udp_listen = 0.0.0.0:7002
 tunnel_listen = 0.0.0.0:7000
 tcp_listen = 0.0.0.0:7001
 udp_listen = 0.0.0.0:0
+tls = false
+auth_token = test-token
 `)
 	cfg, err = Load(path)
 	if err != nil {
@@ -289,11 +297,13 @@ udp_listen = 0.0.0.0:0
 }
 
 func TestDefaults(t *testing.T) {
+	// 回环监听 + tls = auto 无证书 + 空 auth_token 仍是合法组合（仅本机调试），
+	// 非回环监听则会被 SEC-A1 / SEC-T2 拒绝，见 TestValidateRelayNonLoopbackSecurity。
 	path := writeTempINI(t, `[common]
 [relay]
-tunnel_listen = 0.0.0.0:7000
-tcp_listen = 0.0.0.0:7001
-udp_listen = 0.0.0.0:7002
+tunnel_listen = 127.0.0.1:7000
+tcp_listen = 127.0.0.1:7001
+udp_listen = 127.0.0.1:7002
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -335,6 +345,16 @@ udp_listen = 0.0.0.0:7002
 	}
 	if !hasWarning(cfg.Warnings, "auth_token 为空") {
 		t.Errorf("空 auth_token 应有警告: %v", cfg.Warnings)
+	}
+	// SEC-D2 新增上限的默认值必须固定（0 = 不限制，默认值不能退化成 0）。
+	if cfg.Relay.MaxConns != 1024 {
+		t.Errorf("relay.max_conns 默认 = %d, want 1024", cfg.Relay.MaxConns)
+	}
+	if cfg.Relay.MaxConnsPerIP != 128 {
+		t.Errorf("relay.max_conns_per_ip 默认 = %d, want 128", cfg.Relay.MaxConnsPerIP)
+	}
+	if cfg.Relay.MaxPendingPairs != 4096 {
+		t.Errorf("relay.max_pending_pairs 默认 = %d, want 4096", cfg.Relay.MaxPendingPairs)
 	}
 }
 

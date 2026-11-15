@@ -622,6 +622,17 @@ func IsWindowsService() bool
 - 可写时：仍保留现有一次性 CSRF 令牌机制，写操作必须 POST + 有效令牌；
   每次写操作记审计日志 `event=admin_action`（`remote`/`action`/`target`/`old`/`new`），
   被拒绝的写请求记 `event=admin_action_denied`，失败记 `event=admin_action_failed`。
+- **SEC-M1（阶段 8C）Host/Origin 与响应头**：可写时，所有写 Action 还必须满足
+  `Host` ∈ {`127.0.0.1[:port]`, `[::1][:port]`, `localhost[:port]`}，且 `Origin`（若请求带）
+  必须等于 `http://` + 同一 Host；否则 403 并记 `admin_denied`（不执行 Handler、不消费 CSRF）。
+  所有响应（含 404/405）统一加 CSP
+  `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`、
+  `X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`；
+  唯一例外是 `Pprof=true` 时的 `/debug/pprof/*`：CSP 额外允许 `script-src 'unsafe-inline'`
+  与 `img-src 'self' data:`（否则图表页面不可用），其它头不变，业务页面策略不变。
+  GET 页面不受 Host/Origin 限制（只影响写），避免误伤只读/测试访问。
+- **P1-2 刷新边界**：只读页默认 1s 自动刷新；可写实例或含 `<form` 的页面默认暂停，
+  `?refresh=1` 开启、`?refresh=0` 关闭；刷新开关只改页面 `<meta>`，不影响写能力。
 
 **可改字段白名单（其它字段一律 400/403，不得回显进 ini）**：
 
@@ -691,7 +702,45 @@ func IsWindowsService() bool
   `tls=true` 但系统根证书拒绝自签证书）按**永久错误**处理，立即返回 `Run` 错误（不重试）；
   而"relay 要求 TLS、本端明文"只能表现为读 HelloOK 时 EOF，与瞬时断链不可区分，因此按可
   重试断开处理（`reconnect=false` 时仍立即失败退出，见 §2.5 第 9 条）。
-- 数据面**永远明文**（哑管道），不得包 TLS。
+- 数据面 TLS（阶段 8D / v0.4.0，SEC-T1）：见 §4.3.1；**不得**再假设数据面永远明文。
+
+### 4.3.1 数据面 TLS（`data_tls`）
+
+- 新增三态 `data_tls`（`[relay]` / `[server]` / `[client]`，默认 `auto`），语义与 `tls` 一致；
+  同一份证书与 `minVersion TLS 1.2` 规则复用于数据面，禁止三处各写一套 TLS 配置构造。
+- **决策**：
+  - relay：`auto` = 跟随隧道判定（`tls = true` 或 `auto` + 证书对 → TLS）；`true` = 强制 TLS
+    且必须复用 `tls_cert`/`tls_key`（缺证书对 → 启动校验失败）；`false` = 强制明文（即使隧道
+    TLS，启动 WARN）。
+  - agent/client：`auto` = 跟随 `HelloOK.data_tls`（字段缺省 = 旧 relay → 明文 + WARN）；
+    `true` = 必须 TLS，relay 未启用 → **永久错误**；`false` = 强制明文，relay 要求 TLS →
+    明确报错（不得静默降级）。
+- **范围**：`tcp_listen` 上的全部内容——`MsgBind` 帧、`pairing_token`、业务字节、
+  `udp-over-tcp` 承载帧。原生 UDP（`udp_mode = native`）**无 DTLS，仍是明文**。
+- **失败语义**：
+  - relay 对 TLS 数据面做 `tls.Listen`；accept 不握手，因此明文连接在首次读 `MsgBind` 时
+    握手失败 → 关闭并记 WARN `event=data_plane_tls_handshake_fail`（含提示三端 ≥ v0.4.0）；
+  - 任一端握手失败按**永久错误**处理（配置不匹配，不重连）；
+  - `data_tls = true` 且 `tls_ca` 为空 → 使用系统根证书（与隧道一致）。
+- **协议**：`HelloOK.data_tls` 为可选 `*bool`，缺省区分"旧 relay"与"显式 false"；
+  `ProtocolVersion` 保持 1，但启用后要求三端 ≥ v0.4.0（混跑矩阵见 `docs/protocol.md` §9）。
+
+### 4.3.2 服务名归属（`service_allow` / `max_services_per_agent`）
+
+- `[relay] service_allow`：逗号分隔白名单（自动去重、按服务ID 字符集校验）；空 = 允许任意
+  服务名但启动 WARN。`max_services_per_agent`：默认 64，0 = 不限。
+- `RegisterService` 的**固定顺序**：角色/ID/协议校验 → 白名单 → 单 agent 数量上限 → 归属。
+  归属规则：
+  1. 同一 owner 重复注册 = 覆盖（不重复计数，不产生冲突事件）；
+  2. 不同 owner 且原 owner **在线**（`AgentRegistry` 有记录且未判死）→ 拒绝；
+  3. 不同 owner 且原 owner **离线** → 允许接管，记 `service_takeover` WARN（旧/新 owner）。
+  4. 在线表无该服务但"最近归属"记录存在且原 owner 离线 → 同样允许接管。
+- 拒绝一律 `MsgError{code: bad_request, detail: service_denied|service_limit|service_conflict}`；
+  `detail` 是稳定机器码，agent 必须映射为可读提示（白名单/上限/冲突）。
+- 显式 `UnregisterService` = 释放服务名，不产生接管事件；断开连接由 relay 注销该 agent 的
+  全部服务，并写入"最近归属"（容量 1024，最旧淘汰）。
+- relay 必须推送 `updated` 事件，让 client 的服务列表跟随归属变化；agent 重连后重新注册
+  当前全部服务（既有语义不变）。
 
 ### 4.4 超时使用
 

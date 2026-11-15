@@ -120,14 +120,20 @@ type relaySpec struct {
 	AuthToken                string
 	TLSCert, TLSKey          string
 	// TLS 是三态开关原文（auto/true/false）；空表示不写进 ini（默认 auto）。
-	TLS               string
-	Pprof             bool
-	LogLevel          string
-	PairTimeout       time.Duration
-	IdleTimeout       time.Duration
-	HeartbeatTimeout  time.Duration
-	UDPSessionTimeout time.Duration
-	TokenTTL          time.Duration
+	TLS string
+	// DataTLS 是数据面三态开关原文；空表示不写进 ini（默认 auto）。
+	DataTLS string
+	// ServiceAllow 写入 [relay] service_allow（逗号分隔）；空表示不写（不限制）。
+	ServiceAllow []string
+	// MaxServicesPerAgent > 0 时写入 max_services_per_agent；0 表示不写（默认 64）。
+	MaxServicesPerAgent int
+	Pprof               bool
+	LogLevel            string
+	PairTimeout         time.Duration
+	IdleTimeout         time.Duration
+	HeartbeatTimeout    time.Duration
+	UDPSessionTimeout   time.Duration
+	TokenTTL            time.Duration
 }
 
 type serverService struct {
@@ -142,7 +148,9 @@ type agentSpec struct {
 	TLSCA                    string
 	TLSInsecure              bool
 	// TLS 是三态开关原文（auto/true/false）；空表示不写进 ini（默认 auto）。
-	TLS               string
+	TLS string
+	// DataTLS 是数据面三态开关原文；空表示不写进 ini（默认 auto）。
+	DataTLS           string
 	Pprof             bool
 	LogLevel          string
 	Heartbeat         time.Duration
@@ -164,7 +172,9 @@ type clientSpec struct {
 	TLSCA                    string
 	TLSInsecure              bool
 	// TLS 是三态开关原文（auto/true/false）；空表示不写进 ini（默认 auto）。
-	TLS               string
+	TLS string
+	// DataTLS 是数据面三态开关原文；空表示不写进 ini（默认 auto）。
+	DataTLS           string
 	Pprof             bool
 	LogLevel          string
 	Heartbeat         time.Duration
@@ -204,6 +214,13 @@ func writeRelayINI(t *testing.T, s relaySpec) (*config.Config, string) {
 		fmt.Fprintf(&b, "tls_key = %s\n", s.TLSKey)
 	}
 	writeTLS(&b, s.TLS)
+	writeDataTLS(&b, s.DataTLS)
+	if len(s.ServiceAllow) > 0 {
+		fmt.Fprintf(&b, "service_allow = %s\n", strings.Join(s.ServiceAllow, ","))
+	}
+	if s.MaxServicesPerAgent > 0 {
+		fmt.Fprintf(&b, "max_services_per_agent = %d\n", s.MaxServicesPerAgent)
+	}
 	writeDuration(&b, "pair_timeout", s.PairTimeout)
 	writeDuration(&b, "idle_timeout", s.IdleTimeout)
 	writeDuration(&b, "heartbeat_timeout", s.HeartbeatTimeout)
@@ -242,6 +259,7 @@ func writeAgentINI(t *testing.T, s agentSpec) (*config.Config, string) {
 		b.WriteString("tls_insecure_skip_verify = true\n")
 	}
 	writeTLS(&b, s.TLS)
+	writeDataTLS(&b, s.DataTLS)
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
 	if s.NoReconnect {
@@ -280,6 +298,7 @@ func writeClientINI(t *testing.T, s clientSpec) (*config.Config, string) {
 		b.WriteString("tls_insecure_skip_verify = true\n")
 	}
 	writeTLS(&b, s.TLS)
+	writeDataTLS(&b, s.DataTLS)
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "pair_timeout", s.PairTimeout)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
@@ -303,10 +322,17 @@ func writeDuration(b *strings.Builder, key string, d time.Duration) {
 	}
 }
 
-// writeTLS 写入三态 tls 键（原文透传，便于测试非法值以外的显式取值）。
+// writeTLS 写入三态 tls/data_tls 键（原文透传，便于测试显式取值）。
 func writeTLS(b *strings.Builder, mode string) {
 	if strings.TrimSpace(mode) != "" {
 		fmt.Fprintf(b, "tls = %s\n", mode)
+	}
+}
+
+// writeDataTLS 写入三态 data_tls 键（空表示不写，默认 auto）。
+func writeDataTLS(b *strings.Builder, mode string) {
+	if strings.TrimSpace(mode) != "" {
+		fmt.Fprintf(b, "data_tls = %s\n", mode)
 	}
 }
 

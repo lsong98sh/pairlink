@@ -55,6 +55,8 @@ type relayOptions struct {
 	enableUDPData bool
 	// dropBindOK 为 N 时，原生 UDP 数据面前 N 个 Bind 不回应 BindOK（模拟丢包）。
 	dropBindOK int
+	// dataTLS 是 HelloOK.data_tls；nil 表示模拟 v0.3.1 旧 relay（未下发该字段）。
+	dataTLS *bool
 }
 
 // tunnelBind 是承载连接上收到的 MsgBind（首帧或会话帧）。
@@ -184,6 +186,7 @@ func newFakeRelay(t *testing.T, opts relayOptions) *fakeRelay {
 		UDPMode:          opts.udpMode,
 		TCPDataPort:      f.tcpPort(),
 		UDPDataPort:      f.udpPort(),
+		DataTLS:          opts.dataTLS,
 	}
 
 	go f.serveTunnel()
@@ -805,13 +808,20 @@ func newTestConfig(relayAddr string, services ...config.ServerService) *config.C
 	return cfg
 }
 
+// recvTimeout 是"等待对端事件"的上限，不是被测行为本身。
+//
+// 取 10s：`go test -race ./...` 会并行跑多个包，WSL2 上 CPU 争用会把
+// "300ms 重发 + 调度"放大到数秒——5s 曾在全量 -race 中把 UDP 重发用例
+// 误判为超时（单跑稳定 0.31s）。真实行为断言（如重发间隔 < 2s）仍由用例自己把住。
+const recvTimeout = 10 * time.Second
+
 // recv 从通道接收一个值，超时则 Fatal。
 func recv[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
 	select {
 	case v := <-ch:
 		return v
-	case <-time.After(5 * time.Second):
+	case <-time.After(recvTimeout):
 		t.Fatalf("等待 %s 超时", what)
 	}
 	var zero T

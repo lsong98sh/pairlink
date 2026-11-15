@@ -36,7 +36,10 @@ SyslogIdentifier=pairlink-client
 
 # ---- 适度加固 ----
 NoNewPrivileges=true
+# 整个文件系统只读；/etc/pairlink 需可读写：管理页的'服务增删改'会把 ini
+# 原地写回（写临时文件 + rename），只读会让页面保存失败（P1-1）。
 ProtectSystem=strict
+ReadWritePaths=/etc/pairlink
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

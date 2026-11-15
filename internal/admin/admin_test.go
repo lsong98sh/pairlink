@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -54,6 +55,9 @@ func httpGet(t *testing.T, rawURL string) (int, string) {
 }
 
 // httpPost 提交表单（可带额外请求头）。
+//
+// headers 里的 "Host" 会写入 req.Host（Go 的 Transport 忽略 Header["Host"]），
+// 用于构造 Host/Origin 校验用例。
 func httpPost(t *testing.T, rawURL string, values url.Values, headers map[string]string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, rawURL, strings.NewReader(values.Encode()))
@@ -62,6 +66,10 @@ func httpPost(t *testing.T, rawURL string, values url.Values, headers map[string
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	for k, v := range headers {
+		if strings.EqualFold(k, "Host") {
+			req.Host = v
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
@@ -108,8 +116,18 @@ func TestIndexAndPages(t *testing.T) {
 	if !strings.Contains(body, `<meta charset="utf-8">`) {
 		t.Error("页面缺少 utf-8 charset")
 	}
-	if !strings.Contains(body, `http-equiv="refresh"`) {
-		t.Error("默认应开启自动刷新")
+	// P1-2：127.0.0.1 属于回环（Writable=true），可写页默认暂停自动刷新，
+	// 避免整页重载清空用户正在编辑的表单；需要刷新时点顶栏按钮（?refresh=1）。
+	if strings.Contains(body, `http-equiv="refresh"`) {
+		t.Error("可写页默认不应注入自动刷新（P1-2）")
+	}
+	if !strings.Contains(body, "自动刷新 暂停") {
+		t.Error("顶栏应显示自动刷新已暂停")
+	}
+	// 主动开启自动刷新。
+	status, body = httpGet(t, "http://"+s.Addr()+"/?refresh=1")
+	if status != http.StatusOK || !strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatalf("?refresh=1 应开启自动刷新: status=%d", status)
 	}
 
 	status, body = httpGet(t, "http://"+s.Addr()+"/services")
@@ -127,6 +145,141 @@ func TestIndexAndPages(t *testing.T) {
 	if status != http.StatusOK || strings.Contains(body, `http-equiv="refresh"`) {
 		t.Fatalf("?refresh=0 应关闭自动刷新: status=%d", status)
 	}
+}
+
+// TestRefreshDefaults 覆盖 P1-2 的自动刷新默认值：
+//
+//   - 只读页（非回环 manage_listen）：默认 1s 刷新；
+//   - 可写页：默认暂停（?refresh=1 可显式开启）；
+//   - 页面里含 <form>（即使只读）：默认暂停，避免重载丢输入。
+func TestRefreshDefaults(t *testing.T) {
+	// 只读：127.0.0.1 但把 writable 关掉（等价于非回环 manage_listen）。
+	ro := New("127.0.0.1:0", Options{Title: "只读", Mode: "relay", Version: "v0", Logger: discardLogger()})
+	ro.writable = false
+	ro.AddPage(Page{Path: "/ro", Title: "只读页", Render: func(w io.Writer, r *http.Request) {
+		io.WriteString(w, `<section><p>ok</p></section>`)
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := ro.Start(ctx); err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		sctx, c := context.WithTimeout(context.Background(), 2*time.Second)
+		defer c()
+		_ = ro.Shutdown(sctx)
+	})
+	status, body := httpGet(t, "http://"+ro.Addr()+"/ro")
+	if status != http.StatusOK || !strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatalf("只读页默认应开启自动刷新: status=%d body=%s", status, body)
+	}
+
+	// 可写 + 含表单：默认暂停。
+	rw := startTestServer(t, Options{Title: "可写", Mode: "relay", Version: "v0"})
+	rw.AddPage(Page{Path: "/form", Title: "写表单", Render: func(w io.Writer, r *http.Request) {
+		io.WriteString(w, `<section><form method="post" action="/action/x"><input name="a"></form></section>`)
+	}})
+	status, body = httpGet(t, "http://"+rw.Addr()+"/form")
+	if status != http.StatusOK {
+		t.Fatalf("写表单页状态码 = %d", status)
+	}
+	if strings.Contains(body, `http-equiv="refresh"`) {
+		t.Error("含写表单的页面默认不应自动刷新（否则编辑内容每秒被清空）")
+	}
+	status, body = httpGet(t, "http://"+rw.Addr()+"/form?refresh=1")
+	if status != http.StatusOK || !strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatalf("?refresh=1 应显式开启自动刷新: status=%d", status)
+	}
+}
+
+// TestSecurityHeaders 断言 SEC-M1 的安全响应头出现在所有响应上（含 404）。
+func TestSecurityHeaders(t *testing.T) {
+	s := startTestServer(t, Options{Title: "headers", Mode: "relay", Version: "v0"})
+	base := "http://" + s.Addr()
+	for _, path := range []string{"/", "/no-such-page"} {
+		resp, err := (&http.Client{Timeout: 3 * time.Second}).Get(base + path)
+		if err != nil {
+			t.Fatalf("GET %s 失败: %v", path, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		want := map[string]string{
+			"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+			"X-Frame-Options":         "DENY",
+			"X-Content-Type-Options":  "nosniff",
+			"Referrer-Policy":         "no-referrer",
+		}
+		for name, value := range want {
+			if got := resp.Header.Get(name); got != value {
+				t.Errorf("%s %s = %q, want %q", path, name, got, value)
+			}
+		}
+	}
+}
+
+// TestActionHostOriginCheck 断言 SEC-M1：写操作必须来自回环 Host，且 Origin
+// （若存在）必须与 Host 一致；伪造 Host / 恶意 Origin 一律 403。
+func TestActionHostOriginCheck(t *testing.T) {
+	called := 0
+	s := startTestServer(t, Options{
+		Mode:    "relay",
+		Version: "v0",
+		Actions: []Action{{
+			Name:  "kick",
+			Title: "踢出",
+			Handler: func(w http.ResponseWriter, r *http.Request) {
+				called++
+				w.WriteHeader(http.StatusOK)
+			},
+		}},
+	})
+	base := "http://" + s.Addr()
+
+	// 伪造 Host（DNS rebinding 的典型请求）：即使 CSRF 令牌正确也必须 403。
+	tok := s.CSRFToken()
+	status, body := httpPost(t, base+"/action/kick", url.Values{"csrf_token": {tok}},
+		map[string]string{"Host": "evil.example"})
+	if status != http.StatusForbidden || !strings.Contains(body, "Host/Origin") {
+		t.Fatalf("伪造 Host 应 403（Host/Origin 校验）: status=%d body=%s", status, body)
+	}
+	if called != 0 {
+		t.Fatalf("被拒绝的请求不应执行操作: called=%d", called)
+	}
+
+	// 合法 Host + 恶意 Origin（跨站写）：403。
+	tok = s.CSRFToken()
+	status, _ = httpPost(t, base+"/action/kick", url.Values{"csrf_token": {tok}},
+		map[string]string{"Origin": "http://evil.example"})
+	if status != http.StatusForbidden {
+		t.Fatalf("恶意 Origin 应 403: status=%d", status)
+	}
+	if called != 0 {
+		t.Fatalf("被拒绝的请求不应执行操作: called=%d", called)
+	}
+
+	// 合法 Host + 同源 Origin：放行。
+	tok = s.CSRFToken()
+	status, _ = httpPost(t, base+"/action/kick", url.Values{"csrf_token": {tok}},
+		map[string]string{"Origin": "http://" + s.Addr()})
+	if status != http.StatusOK || called != 1 {
+		t.Fatalf("同源 Origin 应放行: status=%d called=%d", status, called)
+	}
+
+	// localhost 也属于允许的回环名单。
+	tok = s.CSRFToken()
+	status, _ = httpPost(t, base+"/action/kick", url.Values{"csrf_token": {tok}},
+		map[string]string{"Host": "localhost:" + portOf(s.Addr())})
+	if status != http.StatusOK || called != 2 {
+		t.Fatalf("localhost Host 应放行: status=%d called=%d", status, called)
+	}
+}
+
+// portOf 返回 host:port 中的端口部分（测试辅助）。
+func portOf(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[i+1:]
+	}
+	return ""
 }
 
 func TestCSRF(t *testing.T) {
@@ -421,5 +574,83 @@ func TestFormatUptime(t *testing.T) {
 	}
 	if got := formatUptime(-time.Second); got != "0s" {
 		t.Errorf("负时长应归零，实际 %q", got)
+	}
+}
+
+// TestAuditDeniedReason 断言 SEC-M1 的审计不会把 Host/Origin 拒绝误标为只读模式：
+// 两种拒绝都记 admin_action_denied，但 reason 必须可区分（排障不误导）。
+func TestAuditDeniedReason(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	s := startTestServer(t, Options{
+		Mode:    "relay",
+		Version: "v0",
+		Logger:  log,
+		Actions: []Action{{
+			Name:    "kick",
+			Title:   "踢出",
+			Handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) },
+		}},
+	})
+	base := "http://" + s.Addr()
+
+	// 伪造 Host：403 + admin_denied + admin_action_denied(reason=host_origin)。
+	status, _ := httpPost(t, base+"/action/kick", url.Values{"csrf_token": {s.CSRFToken()}},
+		map[string]string{"Host": "evil.example"})
+	if status != http.StatusForbidden {
+		t.Fatalf("伪造 Host 应 403，实际 %d", status)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "reason=host_origin") {
+		t.Fatalf("Host/Origin 拒绝的审计 reason 应为 host_origin:\n%s", logs)
+	}
+	if strings.Contains(logs, "reason=read_only") {
+		t.Fatalf("可写实例不应出现 reason=read_only:\n%s", logs)
+	}
+
+	// 只读实例（非回环监听）：403 + reason=read_only。
+	// 127.0.0.1 监听 + writable=false，等价于非回环 manage_listen 的只读门禁。
+	ro := New("127.0.0.1:0", Options{
+		Mode:    "relay",
+		Version: "v0",
+		Logger:  log,
+		Actions: []Action{{
+			Name:    "kick",
+			Title:   "踢出",
+			Handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) },
+		}},
+	})
+	ro.writable = false
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := ro.Start(ctx); err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	t.Cleanup(cancel)
+	buf.Reset()
+	status, _ = httpPost(t, "http://"+ro.Addr()+"/action/kick", url.Values{"csrf_token": {ro.CSRFToken()}}, nil)
+	if status != http.StatusForbidden {
+		t.Fatalf("只读实例写操作应 403，实际 %d", status)
+	}
+	if !strings.Contains(buf.String(), "reason=read_only") {
+		t.Fatalf("只读门禁的审计 reason 应为 read_only:\n%s", buf.String())
+	}
+}
+
+// TestSecurityHeadersPprof 断言 pprof 调试端点仍带 CSP（SEC-M1），但单独放宽
+// script-src/img-src，否则 /debug/pprof/ 的图表脚本会被 default-src 'none' 全部拦截。
+func TestSecurityHeadersPprof(t *testing.T) {
+	s := startTestServer(t, Options{Title: "pprof", Mode: "relay", Version: "v0", Pprof: true})
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Get("http://" + s.Addr() + "/debug/pprof/")
+	if err != nil {
+		t.Fatalf("GET /debug/pprof/ 失败: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	csp := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "script-src 'unsafe-inline'") || !strings.Contains(csp, "img-src 'self' data:") {
+		t.Fatalf("pprof CSP 应放宽内联脚本与图片，实际: %q", csp)
+	}
+	if resp.Header.Get("X-Frame-Options") != "DENY" {
+		t.Fatalf("pprof 响应也应带 X-Frame-Options: DENY")
 	}
 }

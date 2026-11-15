@@ -217,3 +217,35 @@ func TestConcurrentAccess(t *testing.T) {
 		t.Fatalf("Len = %d, want %d", s.Len(), workers*perWorker)
 	}
 }
+
+func TestPendingAndPendingID(t *testing.T) {
+	clock := newFakeClock()
+	s := NewStore(10 * time.Second)
+	s.SetClock(clock.Now)
+	k := key("web", "c-1")
+	if s.Pending(k) || s.PendingID(k.String()) {
+		t.Fatal("未签发的键不应 Pending")
+	}
+	if _, err := s.Issue(k); err != nil {
+		t.Fatalf("Issue 失败: %v", err)
+	}
+	if !s.Pending(k) || !s.PendingID(k.String()) {
+		t.Fatal("已签发未消费的键应 Pending")
+	}
+	s.Consume(k)
+	if s.Pending(k) || s.PendingID(k.String()) {
+		t.Fatal("已消费的键不应 Pending")
+	}
+	// 重新签发后过期：Pending 必须跟随时间源。
+	k2 := key("web", "c-2")
+	if _, err := s.Issue(k2); err != nil {
+		t.Fatalf("Issue 失败: %v", err)
+	}
+	clock.Advance(11 * time.Second)
+	if s.Pending(k2) {
+		t.Fatal("过期令牌不应 Pending")
+	}
+	if n := s.Len(); n != 2 {
+		t.Fatalf("Len 应包含过期未清理条目 = 2，实际 %d", n)
+	}
+}

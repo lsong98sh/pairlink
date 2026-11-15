@@ -59,7 +59,7 @@ func (a *agent) handleTCP(sess *localSession, key pairing.PairingKey, svc config
 			"pairing_key", key.String(), "detail", "tcp_data_addr 不可用")
 		return
 	}
-	dataConn, err := a.dialTCP(a.ctx, tcpDataAddr, a.dialTimeout())
+	dataConn, err := a.dialDataPlane(a.ctx, tcpDataAddr, a.dialTimeout())
 	if err != nil {
 		a.log.Warn("连接 relay TCP 数据面失败，放弃本次配对", "event", "data_open",
 			"pairing_key", key.String(), "remote", tcpDataAddr, "err", err)
