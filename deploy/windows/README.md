@@ -144,8 +144,10 @@ Get-ChildItem .\*.ps1 | ForEach-Object {
 }
 ```
 
-注意：解析通过只证明语法正确；`install/start/stop/uninstall` 的真实 SCM 生命周期
-需要管理员环境验证（本仓库开发机非管理员，未执行）。
+注意：解析通过只证明语法正确。**v0.5.1 已用 `-service` 子命令在管理员提权会话实测 SCM 全流程**
+（install→start→stop→uninstall、按日日志落盘、管理页 200、卸载后 `sc query` 1060，见仓库
+README §13.20）；但本目录的 `install-*.ps1` 脚本本身仍未逐个在 SCM 下跑过（它们调用同一套
+`-service` 操作），首次在目标机使用时建议先 `-WhatIf` 观察一遍。
 
 ## 8. 从旧脚本迁移
 

@@ -39,10 +39,10 @@
 | task.md §9（交付物与 e2e） | 7 | 7 | 0 | 0 | 0 | 源码/README/e2e 五类验收项齐全 |
 | task.md §10（验收标准） | 6 | 5 | 0 | 0 | 1 | 唯一受限项是 Windows 服务完整生命周期（需管理员） |
 | task.md §11（五个自由度说明） | 5 | 5 | 0 | 0 | 0 | ①client_conn_id 生成方、②管理页 HTML 组织=阶段 6E 已在 README 补齐 |
-| task.md §12（版本/许可） | 2 | 2 | 0 | 0 | 0 | tag `v0.1.0`/`v0.2.0`/`v0.3.0`/`v0.4.0`/`v0.5.0`；Apache-2.0 |
+| task.md §12（版本/许可） | 2 | 2 | 0 | 0 | 0 | tag `v0.1.0`/`v0.2.0`/`v0.3.0`/`v0.4.0`/`v0.5.0`/`v0.5.1`；Apache-2.0 |
 | task2.txt（UDP 承载模式改造） | 6 | 6 | 0 | 0 | 0 | `udp_mode` 三处下发、`carrier`、隧道帧、README 取舍全部落地 |
 | 阶段 8D/8E 安全增量（SEC-T1/SEC-A2/SEC-D3） | 3 | 3 | 0 | 0 | 0 | 数据面 TLS 三态 + 服务名白名单/上限/归属 + 原生 UDP DTLS-PSK，见 §1.6.1 |
-| **合计** | **88** | **87** | **0** | **0** | **1** | 需求缺口 = 0；唯一未了项 = Windows 服务完整生命周期（环境受限，需管理员） |
+| **合计** | **88** | **88** | **0** | **0** | **0** | 需求缺口 = 0；原唯一未了项（Windows 服务完整生命周期）已于 **v0.5.1** 在管理员提权会话实测通过，见 README §13.20 |
 | 工程增强（§5.2，不计入需求统计） | 13 | 13 | 0 | 0 | 0 | E1–E9（阶段 6C/6D/6G/7）、E10–E13（v0.5.0：日志按日切割、goleak、html/template、DTLS+限速）全部落地；不计入需求统计 |
 
 **一句话结论**：v0.5.0 对 `task.md` + `task2.txt` 的**功能需求已全部实现且可验证**；
@@ -228,7 +228,7 @@
 | README 内容（架构/协议/ini/部署/管理页/首句） | 六项在 [README.md:3](../README.md#L3)、[:31-57](../README.md#L31-L57)、[:88-145](../README.md#L88-L145)、[:272-386](../README.md#L272-L386)、[:389-403](../README.md#L389-L403)、[:427-495](../README.md#L427-L495)；`Config` 结构体字段 100% 覆盖 | ✅ 满足 |
 | e2e 覆盖（HTTP/TCP/UDP/多服务/异常） | `test` 包 29 个顶层用例（Windows，含 1 个 `//go:build windows`）/28 个（Linux）；五类验收项各有独立用例，见 §1.9 五行 | ✅ 满足 |
 | 双平台 | 交叉编译 3 目标通过（[TestCrossCompile](../test/binary_test.go#L495)）；Windows 真实三子进程（[TestSubprocessTCPEcho](../test/binary_test.go#L288)）；WSL2 Ubuntu 真实 Linux 三进程 116 条断言（[README.md:928-972](../README.md#L928-L972)）+ 跨 OS 联调 13 条（[:974-1001](../README.md#L974-L1001)） | ✅ 满足 |
-| Windows 服务（4 子命令 + `pairlink-<mode>`） | 代码与命名单测齐全；真实 SCM 生命周期未执行（非管理员） | 🔒 环境受限（§5 G3） |
+| Windows 服务（4 子命令 + `pairlink-<mode>`） | **v0.5.1 实测**：install（AUTO_START/LocalSystem）→ start（RUNNING）→ 按日日志落盘（旧单文件不存在）→ 管理页 200 → stop（STOPPED、进程 0）→ uninstall（`sc query` 1060）；重复 install 返回 1。见 [README §13.20](../README.md#L1513) | ✅ 满足 |
 | `v0.1.0` / `v0.2.0` 标签 | `git tag -l` → `v0.1.0`、`v0.2.0`；`-version` 输出 `pairlink v0.2.0` | ✅ 满足 |
 | Apache-2.0 | `LICENSE` 正文 + README §14 | ✅ 满足 |
 
@@ -267,11 +267,11 @@
 > **口径**：`部分实现`/`仅环境受限` = 与 task.md 字面要求存在差距，计入需求侧；
 > `工程增强` = task.md/task2 未要求、属后续可用性与可运维性投入，**不计入需求缺口**。
 
-### 5.1 需求侧差距（1 项）
+### 5.1 需求侧差距（0 项；G3 已于 v0.5.1 闭环）
 
 | ID | 差距 | 类型 | 影响 | 优先级 | 处置 |
 | --- | --- | --- | --- | --- | --- |
-| G3 | Windows 服务完整生命周期未验证：`install → start → stop → uninstall` 的 SCM 状态迁移、`pairlink-<mode>-YYYY-MM-DD.log` 落盘（v0.5.0 起按日期分文件） | 🔒 仅环境受限 | §10.6 只能证明"代码在、错误路径正确"；交付验收存在"未证明"项 | **P1**（需管理员环境） | 人工管理员复核：`deploy/windows/install-relay.ps1` → `sc query pairlink-relay` → `install-relay.ps1 -Uninstall`（非代码改动） |
+| G3 | ~~Windows 服务完整生命周期未验证~~ **已于 v0.5.1 实测闭环**：`install → start → stop → uninstall` 的 SCM 状态迁移、`pairlink-<mode>-YYYY-MM-DD.log` 落盘均通过（管理员提权会话，`elevated=True`） | ✅ 已闭环 | 隔离目录 `E:\TEMP\pl-scm` + `dist/pairlink-windows-amd64.exe`；证据见 [README §13.20](../README.md#L1513) | — | 无（非代码改动，无需修复） |
 
 > G1（README 未说明 `client_conn_id` 生成方）与 G2（README 未说明管理页 HTML 组织方式）
 > 已由阶段 6E 在 README §3.2 / §6 补齐并闭环，见 §1 表 `task.md §11.1`、`§11.2` 两行。

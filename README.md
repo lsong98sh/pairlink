@@ -748,11 +748,12 @@ docker compose -f deploy/docker-compose.yml down
     （真跑，非 `CGO_ENABLED=0` 降级）与真实三进程端到端（HTTP / TCP echo / UDP 两种承载 /
     三个管理页 / 踢出 / SIGTERM 优雅关停 / 端口释放），并做了跨 OS 联调与 TLS 复核，
     详见 §13.15。systemd 真实托管已由阶段 6D 在 WSL2 验证（见 §13.16）；仍未覆盖非 loopback 多网卡、长时间 soak、非 root `User=pairlink` 运行。
-12. **Windows 服务未做完整生命周期验证**：本机非管理员，只验证了 `-service install` 的
-    "需要管理员权限"错误路径与服务命名 `pairlink-<mode>`；install→start→stop→uninstall
-    的实际 SCM 状态、`pairlink-<mode>-YYYY-MM-DD.log` 落盘（按日期分文件）需管理员环境复核。阶段 6F 已把脚本拆为
-    `deploy/windows/install-{relay,agent,client}.ps1`（每个只操作自己的服务），
-    但真实 SCM 生命周期仍需管理员环境复核。
+12. **Windows 服务生命周期已验证（v0.5.1）**：此前因本机非管理员只验证了
+    `-service install` 的权限错误路径与服务命名 `pairlink-<mode>`；v0.5.1 在管理员提权会话里
+    实测 install→start→stop→uninstall：`AUTO_START`/`LocalSystem`、`RUNNING`/`STOPPED` 状态迁移、
+    `pairlink-<mode>-YYYY-MM-DD.log` 落盘、管理页 200、停后无残留进程、卸载后 `sc query` 1060，
+    证据见 §13.20。阶段 6F 的 `deploy/windows/install-{relay,agent,client}.ps1` 仍未在 SCM 下逐个跑过
+    （验证走的是 `-service` 子命令直连 SCM），这属于脚本自身的冒烟项。
 13. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；广域网下的
     TCP/UDP 行为（尤其 UDP over TCP 的队头阻塞）可能不同。
 14. **TLS 公网 CA 正向路径仍未实测**：e2e 覆盖自签 CA（`tls_ca`）、`tls_insecure_skip_verify`、
@@ -917,7 +918,7 @@ GOOS=linux go test -c -tags soak -o /tmp/soak_linux.test ./test
 | --- | --- |
 | 操作系统 | Windows 10 专业版 10.0.19045（amd64） |
 | Go | `go1.24.4 windows/amd64` |
-| 权限 | **非管理员**（Windows 服务完整生命周期未执行，见 §13.10） |
+| 权限 | 阶段 3/4 时**非管理员**（当时未执行 SCM 生命周期，见 §13.11）；**v0.5.1 起**在管理员提权会话补测通过，见 §13.20 |
 | WSL | 阶段 3/4 时**不可用**（`wsl -l -q` 退出码 1）；**阶段 6A 起可用**：Ubuntu 26.04 / WSL 2 / `go1.24.4 linux/amd64` / `gcc 15.2` / `CGO_ENABLED=1`，真机结果见 §13.15 |
 | CGO | Windows 构建与交叉编译均 `CGO_ENABLED=0`（纯 Go）；Linux 单测/`-race` 用 `CGO_ENABLED=1` |
 | 网络范围 | 全部为 `127.0.0.1` loopback，未做公网/NAT/防火墙验证 |
@@ -1093,10 +1094,10 @@ Run 的 `net/http` goroutine 必须随 Run 退出，因此没有添加任何 ign
 
 - 本机**非管理员**：`pairlink.exe -relay -config <有效 ini> -service install` 退出码 1，
   输出 `错误: service: 连接 SCM（需要管理员权限）: Access is denied.`，
-  未出现 panic，也未静默成功；服务名由 `service.Name(mode)` 生成 `pairlink-relay`。
+  未出现 panic，也未静默成功；服务名由 `service.Name(mode)` 生成 `pairlink-relay`（v0.5.1 起有管理员分支实测，见 §13.20）。
 - 若以管理员运行，测试会执行完整 `install → start → sc query(RUNNING) →
-  pairlink-relay-YYYY-MM-DD.log → stop → uninstall` 分支（本机未触发）。
-- 因此 **Windows 服务完整生命周期未在本机验证**，只验证了非管理员错误路径与服务命名约定。
+  pairlink-relay-YYYY-MM-DD.log → stop → uninstall` 分支（v0.5.1 已在提权会话触发并通过，见 §13.20）。
+- 本节记录的是阶段 3/4 的**非管理员**结论；v0.5.1 已补齐管理员分支的完整 SCM 生命周期（§13.20），本条不再是缺口。
 
 ### 13.12 回归
 
@@ -1148,9 +1149,9 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
 1. **Linux 真机验证已补齐（阶段 6A）**：本条在阶段 3/4 成立，现由 §13.15 取代——
    WSL2 Ubuntu 上跑了全量单测 + `-race` + 真实 Linux 二进制三进程 + 跨 OS 联调 + TLS。
    仍然未验证：systemd 托管、非 loopback 网络、长时间 soak。
-2. **Windows 服务完整生命周期未验证**：本机非管理员。已验证非管理员错误路径、
-   `pairlink-<mode>` 命名（`internal/service` 单测 + 代码路径），但 install/start/stop/uninstall
-   的实际 RUNNING/STOPPED 状态与 `pairlink-<mode>-YYYY-MM-DD.log` 落盘未在本机执行。
+2. **Windows 服务完整生命周期已验证（v0.5.1，管理员提权会话）**：本条在 v0.5.0 及之前成立，
+   现由 §13.20 取代——install → start（RUNNING）→ 按日日志落盘 → 管理页 200 → stop（STOPPED，
+   无残留进程）→ uninstall（`sc query` 1060）全部实测通过；非管理员错误路径此前已覆盖。
 3. **TLS e2e 只覆盖自签 CA 与 insecure 组合**（阶段 4 补充）：`TestE2ETLS*` 已覆盖
    relay `tls.Listen` + agent/client `tls_ca`、`tls_insecure_skip_verify`，以及
    "明文连 TLS / TLS 连明文"必须失败的路径；未覆盖公网 CA（系统根证书）、证书过期、
@@ -1406,8 +1407,8 @@ go test ./test/... -v -count=1  # ok 21.701s；27 个顶层 --- PASS、0 个 ---
   - WSL2：只装 relay 时 `pairlink-agent` 报 `could not be found`、`agent.ini` 不存在；
     管理页 17090 返回 200；无残留 unit 才删共享二进制；agent unit 仍在时卸载 relay 保留二进制。
   - 逐条断言与命令见 §13.18。
-- 未验证：Docker/Podman 构建与 compose、Windows 管理员 SCM 生命周期、
-  systemd 非 root `User=pairlink`、真实证书 TLS。
+- 未验证：Docker/Podman 构建与 compose、systemd 非 root `User=pairlink`、真实证书 TLS
+  （Windows 管理员 SCM 生命周期已于 v0.5.1 补齐，见 §13.20）。
 
 ### 13.17 阶段 6C：运行期健壮性验证
 
@@ -1553,8 +1554,25 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 - DTLS-PSK：`TestUDPDTLS*` 8 个用例（转发/回收、大报文边界、明文拒绝、篡改记录、错误 token、禁用回退）+ `TestE2EUDPModeNative`；
 - 按 IP 限速：`TestTokenRateLimiterBurstAndExpiry`、`TestTokenRateLimitConnectRequest`、`TestTokenRateLimitDisabled`。
 
-> 本轮仍未验证（环境所限，见 §13.14）：Windows SCM 完整生命周期（需管理员）、Docker 构建/compose、
-> 公网 CA 正向路径、非 loopback 真实网络、非 root `User=pairlink` 的 systemd 运行、长时间 soak。
+**Windows 服务完整生命周期（v0.5.1，管理员提权会话实测）**：
+
+隔离环境：`E:\TEMP\pl-scm\pairlink.exe`（`dist/pairlink-windows-amd64.exe` 副本）+
+`relay.ini`（`tunnel/tcp/udp = 127.0.0.1:19700/19701/19702`，`manage_listen = 127.0.0.1:19090`）。
+
+| 步骤 | 结果 |
+| --- | --- |
+| `-service install` | exit 0；`sc qc pairlink-relay`：`AUTO_START`、`LocalSystem`、`BINARY_PATH_NAME` 为 exe + 绝对 ini + `-service run`；状态 `STOPPED` |
+| `-service start` | exit 0；1.5s 内 `RUNNING`（PID 22992），进程数 1 |
+| 运行期日志 | 生成 `pairlink-relay-2026-11-15.log`（13 行，首行 `event=service_start ... version=v0.5.1`）；**旧单文件 `pairlink-relay.log` 不存在** |
+| 监听 | TCP 19090/19700/19701 均 `listen=True`；19702 为 UDP（`Test-NetConnection` 只探 TCP，故显示 False，属预期） |
+| 管理页 | `GET http://127.0.0.1:19090/relay` → **200**，标题含 `PairLink relay` |
+| `-service stop` | exit 0；`STOPPED`，进程数 **0**（无僵尸、端口释放） |
+| `-service uninstall` | exit 0；`sc query` → **1060**（服务不存在），2s 内生效 |
+| 重复 `install` | exit **1**，提示"服务已存在，请先 uninstall"（幂等错误路径符合预期） |
+| 再 `uninstall` | exit 0，服务再次消失 |
+
+> 仍属环境限制、本轮未验证：Docker 构建/compose、公网 CA 正向路径、非 loopback 真实网络、
+> 非 root `User=pairlink` 的 systemd 运行、长时间 soak（见 §13.14）。
 
 ## 14. 版本与许可证
 
