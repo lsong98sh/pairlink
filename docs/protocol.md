@@ -256,6 +256,21 @@ relay 推送 `updated` 事件。
   保证字节流不被污染。
 - **原生 UDP（`udp_mode=native`）**：第一个数据报携带该帧，`carrier` 为空；relay 校验通过后
   登记 `(IP,Port)` 并回 `MsgBindOK`。
+- **原生 UDP 的传输层（v0.5.0，`udp_dtls = true` 默认）**：`MsgBind` 不在明文 UDP 里传，
+  而是作为 **DTLS 1.2 会话**建立后的首个内层数据报。参数：
+
+  | 项 | 值 |
+  | --- | --- |
+  | 版本/密码套件 | DTLS 1.2，`TLS_PSK_WITH_AES_128_GCM_SHA256` |
+  | PSK | `HKDF-SHA256(ikm = auth_token, salt = nil, info = "pairlink-udp-dtls/v1\|" + pairing_key)`，32 字节 |
+  | PSK identity（client→relay） | `pairing_key` 的规范字符串 |
+  | 内层帧 | 原 `len(4B BE) \| sess_len(1B) \| session \| payload`，**格式不变** |
+  | 记录预筛 | relay 只看 13 字节记录头（content type 20/21/22/23，版本 `0xFEFC/FEFD/FEFF`）；非 DTLS 首包直接丢弃并限流 WARN |
+
+  relay 侧按源地址为每个对端建一个 DTLS 服务端（共享一个 UDP socket，虚拟 `net.PacketConn`，
+  每对端队列上限 32 个数据报、全局对端上限 4096），`Bind` 的令牌校验与配对键绑定逻辑与 TCP
+  路径完全一致；DTLS 只保证"对端持有 `auth_token`"并提供加密/完整性/重放保护。三端
+  `udp_dtls` 必须一致：老端（v0.4.0）明文首包会被预筛丢弃。
 - **UDP over TCP（`udp_mode=tcp_tunnel`）**：连接首帧携带 `carrier="udp-over-tcp"` 与该会话的
   配对键+令牌；relay 校验通过后把连接切换为 UDP 隧道帧解析模式，并回一个
   `session=""` 的控制帧（payload 为 `MsgBindOK`）表示承载连接就绪。后续其它 UDP 会话

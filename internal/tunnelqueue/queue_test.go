@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"net"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -293,9 +292,9 @@ func TestTunnelQueueEnqueueNeverBlocks(t *testing.T) {
 	}
 }
 
-// TestTunnelQueueNoGoroutineLeak 校验 Close 后 writer goroutine 退出。
+// TestTunnelQueueNoGoroutineLeak 校验 Close 后 writer goroutine 退出；
+// "退出"由包级 TestMain 的 goleak 在整包结束时判定，不再用数字容差。
 func TestTunnelQueueNoGoroutineLeak(t *testing.T) {
-	before := runtime.NumGoroutine()
 	for i := 0; i < 20; i++ {
 		conn := newRecordingConn()
 		q := New(conn, Options{})
@@ -303,16 +302,5 @@ func TestTunnelQueueNoGoroutineLeak(t *testing.T) {
 		if err := q.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
 		}
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		runtime.GC()
-		if runtime.NumGoroutine() <= before+2 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("goroutine 泄漏：before=%d now=%d", before, runtime.NumGoroutine())
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }

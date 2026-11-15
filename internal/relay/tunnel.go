@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/lsong98sh/pairlink/internal/logx"
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
@@ -30,6 +32,39 @@ type TunnelListener struct {
 	mu     sync.Mutex
 	conns  map[*tunnelConn]struct{}
 	agents map[string]*tunnelConn
+
+	// tokenRate 按来源 IP 限制配对令牌签发速率（v0.5.0）。
+	//
+	// 首次签发时按 [relay] token_rate_per_ip / token_burst_per_ip 构造；
+	// nil 表示不限速（rate = 0）。
+	tokenRateOnce sync.Once
+	tokenRate     *tokenRateLimiter
+}
+
+// tokenLimiter 返回按来源 IP 的令牌签发限速器（首次使用时按配置构造）。
+func (l *TunnelListener) tokenLimiter() *tokenRateLimiter {
+	l.tokenRateOnce.Do(func() {
+		l.tokenRate = newTokenRateLimiter(l.srv.cfg.Relay.TokenRatePerIP, l.srv.cfg.Relay.TokenBurstPerIP)
+	})
+	return l.tokenRate
+}
+
+// warnTokenRateLimited 记录一次限速拒绝（每 tokenRateWarnInterval 最多一条
+// WARN，其余降为 Debug：一个高频来源就能刷满日志，不能每条都 WARN）。
+func (l *TunnelListener) warnTokenRateLimited(log *slog.Logger, host string, key pairing.PairingKey) {
+	attrs := []any{
+		"event", "token_rate_limited",
+		"reason", "token_rate_per_ip",
+		"host", host,
+		"pairing_key", key.String(),
+		"rate", l.srv.cfg.Relay.TokenRatePerIP,
+		"burst", l.srv.cfg.Relay.TokenBurstPerIP,
+	}
+	if l.tokenRate == nil || l.tokenRate.allowWarn(time.Now()) {
+		log.Warn("来源 IP 的令牌签发速率超限，拒绝接入请求", attrs...)
+		return
+	}
+	log.Debug("来源 IP 的令牌签发速率超限，拒绝接入请求", attrs...)
 }
 
 // tunnelConn 是一条控制面连接。
@@ -702,6 +737,16 @@ func (l *TunnelListener) handleConnectRequest(tc *tunnelConn, req *protocol.Conn
 		return
 	}
 
+	// v0.5.0：按来源 IP 限制配对令牌的签发速率（默认 10/s，突发 30；
+	// token_rate_per_ip = 0 表示不限速）。超限不签发令牌，回既有协议错误语义。
+	limiter := s.tunnel.tokenLimiter()
+	host := remoteHost(tc.RemoteAddr())
+	if !limiter.allow(host) {
+		s.tunnel.warnTokenRateLimited(tc.log, host, key)
+		_ = tc.writeErrorFor(protocol.ErrCodeTooManyPending, "该来源 IP 的接入请求过于频繁，请稍后重试", connID)
+		return
+	}
+
 	// SEC-D2：单连接"已签发但未完成配对"的请求数上限（默认 64）。
 	if !tc.reservePending(key) {
 		tc.log.Warn("单连接未完成请求数已达上限，拒绝接入请求",
@@ -1036,4 +1081,132 @@ func (l *TunnelListener) shutdown() {
 		}, shutdownWriteTimeout)
 		tc.close()
 	}
+}
+
+// tokenRateLimiter 按来源 IP 限制配对令牌的签发速率（v0.5.0）。
+//
+// 每个来源 IP 一个 token bucket（golang.org/x/time/rate），容量 = burst，
+// 速率 = rate（每秒可签发数）。表项带最后活动时间：空闲超过"令牌桶回满时间"
+// 的条目会在周期清理时删除，因此表不会随来源 IP 数量无限增长。
+//
+// 清理不依赖额外 goroutine：allow 自身按 sweepInterval 做一次惰性全表扫描
+// （relay 的签发量级为每秒数十次，成本可忽略）；没有请求时也不会新增表项。
+type tokenRateLimiter struct {
+	limit         rate.Limit // 每秒可签发数（0 = 不限速，此实例不会被使用）
+	burst         int
+	ttl           time.Duration // 表项空闲多久后删除（此时令牌桶已回满）
+	sweepInterval time.Duration // 惰性清理的最小间隔
+	now           func() time.Time
+
+	mu        sync.Mutex
+	entries   map[string]*tokenRateEntry
+	lastSweep time.Time
+	lastWarn  time.Time
+}
+
+// tokenRateEntry 是一个来源 IP 的限速状态。
+type tokenRateEntry struct {
+	lim      *rate.Limiter
+	lastSeen time.Time
+}
+
+// tokenRateWarnInterval 是 token_rate_limited WARN 的最小间隔（其余降为 Debug）。
+const tokenRateWarnInterval = 5 * time.Second
+
+// newTokenRateLimiter 按配置构造限速器；perIP <= 0 返回 nil（不限速）。
+func newTokenRateLimiter(perIP, burst int) *tokenRateLimiter {
+	if perIP <= 0 {
+		return nil
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	// 表项空闲到令牌桶回满后即可安全删除（再来的请求会拿到一个满桶）。
+	// 最坏情况：rate=1/s、burst=30 → 30s 后回收。
+	ttl := time.Duration(float64(burst) / float64(perIP) * float64(time.Second))
+	if ttl < time.Second {
+		ttl = time.Second
+	}
+	// 清理间隔不超过 1 分钟，也不超过 ttl（保证短窗口配置下也能及时回收）。
+	interval := ttl
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	return &tokenRateLimiter{
+		limit:         rate.Limit(perIP),
+		burst:         burst,
+		ttl:           ttl,
+		sweepInterval: interval,
+		now:           time.Now,
+		entries:       make(map[string]*tokenRateEntry),
+	}
+}
+
+// allow 判断该来源 IP 现在是否还有签发额度（nil 限速器 = 不限速）。
+//
+// host 为空（无法解析来源地址）时归入 "" 桶，仍然受限，不会变成无限额度。
+func (l *tokenRateLimiter) allow(host string) bool {
+	if l == nil {
+		return true
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sweepLocked(now)
+
+	e, ok := l.entries[host]
+	if !ok {
+		e = &tokenRateEntry{lim: rate.NewLimiter(l.limit, l.burst)}
+		l.entries[host] = e
+	}
+	e.lastSeen = now
+	return e.lim.AllowN(now, 1)
+}
+
+// sweepLocked 按需清理空闲表项（调用方持有锁）。
+func (l *tokenRateLimiter) sweepLocked(now time.Time) {
+	if !l.lastSweep.IsZero() && now.Sub(l.lastSweep) < l.sweepInterval {
+		return
+	}
+	l.lastSweep = now
+	for host, e := range l.entries {
+		if now.Sub(e.lastSeen) >= l.ttl {
+			delete(l.entries, host)
+		}
+	}
+}
+
+// allowWarn 判断现在是否可以为该限速器打一条 WARN（限速日志）。
+func (l *tokenRateLimiter) allowWarn(now time.Time) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.lastWarn.IsZero() && now.Sub(l.lastWarn) < tokenRateWarnInterval {
+		return false
+	}
+	l.lastWarn = now
+	return true
+}
+
+// entryCount 返回当前记录的来源 IP 数（测试与排障用）。
+func (l *tokenRateLimiter) entryCount() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.entries)
+}
+
+// has 报告某个来源 IP 是否仍有记录（测试用：确认空闲表项已被回收）。
+func (l *tokenRateLimiter) has(host string) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.entries[host]
+	return ok
 }

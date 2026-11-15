@@ -97,7 +97,6 @@ func soakParamsFromEnv(t *testing.T) soakParams {
 
 // runSoak 启动一套真实 relay/agent/client，按参数循环并采样。
 func runSoak(t *testing.T, p soakParams) {
-	guardGoroutines(t)
 
 	echoAddr := startTCPEchoServer(t)
 	udpEchoAddr := startUDPEchoServer(t, "soak:")

@@ -315,6 +315,51 @@ type mappingView struct {
 	Actual    string
 }
 
+// clientMappingForms 是映射行上的写表单数据；Show=false 时只显示“只读”。
+type clientMappingForms struct {
+	Show        bool
+	SaveToken   string
+	DeleteToken string
+}
+
+// clientMappingRow 是「本地端口映射表」表格一行的渲染数据。
+//
+// service_id / 监听地址 / 实际绑定都是普通 string（外部可控值也只以 string
+// 传入），由 html/template 转义；这里不携带任何 template.HTML。
+type clientMappingRow struct {
+	ServiceID string
+	Listen    string
+	Actual    string
+	Proto     string
+	Forms     clientMappingForms
+}
+
+// clientMappingRows 装配映射表行（含每行的修改/删除表单与一次性 CSRF 令牌）。
+//
+// 主服务（default）在表格里只读：与写 Action 的白名单一致。
+func (c *client) clientMappingRows() []clientMappingRow {
+	views := c.mappingViews()
+	writable := c.adminWritable()
+	rows := make([]clientMappingRow, 0, len(views))
+	for _, m := range views {
+		row := clientMappingRow{
+			ServiceID: m.ServiceID,
+			Listen:    m.Listen,
+			Actual:    orDash(m.Actual),
+			Proto:     m.Proto,
+		}
+		if writable && m.ServiceID != config.DefaultServiceID {
+			row.Forms = clientMappingForms{
+				Show:        true,
+				SaveToken:   c.csrfToken(),
+				DeleteToken: c.csrfToken(),
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
 // mappingViews 返回映射表视图。
 //
 // 以**已打开的本地监听**为准而不是映射表：启动阶段映射表先于监听建立，

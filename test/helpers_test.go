@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -134,6 +133,8 @@ type relaySpec struct {
 	HeartbeatTimeout    time.Duration
 	UDPSessionTimeout   time.Duration
 	TokenTTL            time.Duration
+	// UDPDTLS 非 nil 时写入 [relay] udp_dtls（true/false）；nil 表示不写（默认 true）。
+	UDPDTLS *bool
 }
 
 type serverService struct {
@@ -155,6 +156,8 @@ type agentSpec struct {
 	LogLevel          string
 	Heartbeat         time.Duration
 	UDPSessionTimeout time.Duration
+	// UDPDTLS 非 nil 时写入 [server] udp_dtls（true/false）；nil 表示不写（默认 true）。
+	UDPDTLS *bool
 	// NoReconnect 写 reconnect = false（阶段 6C 之前的行为：控制连接断开即退出）。
 	NoReconnect bool
 	// ReconnectMaxBackoff 覆盖 reconnect_max_backoff。
@@ -181,6 +184,8 @@ type clientSpec struct {
 	PairTimeout       time.Duration
 	UDPSessionTimeout time.Duration
 	NoSubscribe       bool
+	// UDPDTLS 非 nil 时写入 [client] udp_dtls（true/false）；nil 表示不写（默认 true）。
+	UDPDTLS *bool
 	// NoReconnect 写 reconnect = false（阶段 6C 之前的行为：控制连接断开即退出）。
 	NoReconnect bool
 	// ReconnectMaxBackoff 覆盖 reconnect_max_backoff。
@@ -226,6 +231,7 @@ func writeRelayINI(t *testing.T, s relaySpec) (*config.Config, string) {
 	writeDuration(&b, "heartbeat_timeout", s.HeartbeatTimeout)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
 	writeDuration(&b, "token_ttl", s.TokenTTL)
+	writeUDPDTLS(&b, s.UDPDTLS)
 	return loadConfig(t, writeINI(t, "relay.ini", b.String()), config.ModeRelay)
 }
 
@@ -262,6 +268,7 @@ func writeAgentINI(t *testing.T, s agentSpec) (*config.Config, string) {
 	writeDataTLS(&b, s.DataTLS)
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
+	writeUDPDTLS(&b, s.UDPDTLS)
 	if s.NoReconnect {
 		b.WriteString("reconnect = false\n")
 	}
@@ -302,6 +309,7 @@ func writeClientINI(t *testing.T, s clientSpec) (*config.Config, string) {
 	writeDuration(&b, "heartbeat", s.Heartbeat)
 	writeDuration(&b, "pair_timeout", s.PairTimeout)
 	writeDuration(&b, "udp_session_timeout", s.UDPSessionTimeout)
+	writeUDPDTLS(&b, s.UDPDTLS)
 	if s.NoReconnect {
 		b.WriteString("reconnect = false\n")
 	}
@@ -334,6 +342,14 @@ func writeDataTLS(b *strings.Builder, mode string) {
 	if strings.TrimSpace(mode) != "" {
 		fmt.Fprintf(b, "data_tls = %s\n", mode)
 	}
+}
+
+// writeUDPDTLS 写入 udp_dtls 开关（nil 表示不写，默认 true）。
+func writeUDPDTLS(b *strings.Builder, enabled *bool) {
+	if enabled == nil {
+		return
+	}
+	fmt.Fprintf(b, "udp_dtls = %v\n", *enabled)
 }
 
 func writeINI(t *testing.T, name, content string) string {
@@ -1115,63 +1131,8 @@ func rawEchoRoundTrip(t *testing.T, conn net.Conn, payload string) {
 }
 
 // ---------------------------------------------------------------------------
-// goroutine 泄漏看护
+// goroutine 泄漏诊断
 // ---------------------------------------------------------------------------
-
-// guardGoroutines 在测试开始时记录稳定的 goroutine 基数，并在所有其它
-// t.Cleanup（栈关停、服务关闭）执行完之后检查是否回落到基数 +2 以内。
-//
-// 必须作为测试的第一个 Cleanup 注册（即最先调用），这样它最后执行。
-func guardGoroutines(t *testing.T) {
-	t.Helper()
-	base := stableGoroutines(t)
-	t.Logf("goroutine 基线: %d", base)
-	t.Cleanup(func() {
-		deadline := time.Now().Add(8 * time.Second)
-		for {
-			n := runtime.NumGoroutine()
-			if n <= base+2 {
-				t.Logf("goroutine 回落: base=%d now=%d（容差 +2）", base, n)
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Errorf("goroutine 泄漏: base=%d now=%d（容差 +2）\n%s",
-					base, n, goroutineProfile())
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	})
-}
-
-// stableGoroutines 连续采样，返回一个稳定值（相邻差异不超过 1）。
-func stableGoroutines(t *testing.T) int {
-	t.Helper()
-	last := runtime.NumGoroutine()
-	for i := 0; i < 40; i++ {
-		time.Sleep(25 * time.Millisecond)
-		n := runtime.NumGoroutine()
-		if absInt(n-last) <= 1 {
-			return n
-		}
-		last = n
-	}
-	return last
-}
-
-func absInt(v int) int {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
-
-// goroutineProfile 返回全部 goroutine 的栈（调试泄漏用）。
-func goroutineProfile() string {
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	return string(buf[:n])
-}
 
 // goroutineProfilePprof 用 runtime/pprof 采集 goroutine profile（debug=1）。
 func goroutineProfilePprof() string {

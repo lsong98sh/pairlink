@@ -17,8 +17,6 @@ var kickFormRe = regexp.MustCompile(
 // TestE2EFailureKick 验收项：从 relay 管理页 POST /action/kick 踢出 agent；
 // 断言 agent 下线、服务注销、client 访问失败；并验证 GET 405、无 CSRF 403。
 func TestE2EFailureKick(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startTCPEchoServer(t)
 
 	relayManage := hostPort(freeTCPPort(t))
@@ -145,8 +143,6 @@ func TestE2EFailureKick(t *testing.T) {
 // TestE2EFailureIdleTimeout 验收项：relay idle_timeout 调小后，已建立配对在
 // 无流量时被关闭，管理页配对表回落为 0。
 func TestE2EFailureIdleTimeout(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startTCPEchoServer(t)
 
 	relayManage := hostPort(freeTCPPort(t))

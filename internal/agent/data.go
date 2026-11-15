@@ -136,11 +136,22 @@ func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc 
 			"pairing_key", key.String(), "remote", udpDataAddr, "err", err)
 		return
 	}
-	if !sess.track(relayConn) {
+	// v0.5.0：原生 UDP 数据面默认 DTLS-PSK；udp_dtls = false 时保持明文直连。
+	var conn net.Conn = relayConn
+	if a.cfg.Server.UDPDTLS {
+		dtlsConn, derr := a.dialUDPDTLS(relayConn, key)
+		if derr != nil {
+			a.log.Warn("与 relay 的 UDP DTLS 握手失败，放弃本次配对", "event", "udp_dtls_handshake_fail",
+				"pairing_key", key.String(), "remote", udpDataAddr, "err", derr)
+			return
+		}
+		conn = dtlsConn
+	}
+	if !sess.track(conn) {
 		return
 	}
 	sess.setCarrier(carrierNative)
-	sess.setRemote(remoteString(relayConn, udpDataAddr))
+	sess.setRemote(remoteString(conn, udpDataAddr))
 
 	localConn, err := a.dialUDP(svc.Addr)
 	if err != nil {
@@ -161,14 +172,14 @@ func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc 
 		a.log.Warn("编码 UDP 报到帧失败", "event", "bind", "pairing_key", key.String(), "err", err)
 		return
 	}
-	if _, err := relayConn.Write(frame); err != nil {
+	if _, err := conn.Write(frame); err != nil {
 		a.log.Warn("发送 UDP 报到数据报失败，放弃本次配对", "event", "bind",
 			"pairing_key", key.String(), "err", err)
 		return
 	}
 	sess.touch()
 
-	if err := a.awaitBindOK(sess, key, relayConn, localConn, frame); err != nil {
+	if err := a.awaitBindOK(sess, key, conn, localConn, frame); err != nil {
 		a.log.Warn("UDP 报到未被确认，放弃本次配对", "event", "bind",
 			"pairing_key", key.String(), "remote", udpDataAddr, "err", err)
 		return
@@ -187,9 +198,9 @@ func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc 
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		a.udpLocalToRelay(sess, localConn, relayConn)
+		a.udpLocalToRelay(sess, localConn, conn)
 	}()
-	a.udpRelayToLocal(sess, relayConn, localConn)
+	a.udpRelayToLocal(sess, conn, localConn)
 }
 
 // awaitBindOK 在 pair_timeout 内等待 relay 的 MsgBindOK 数据报。
@@ -198,7 +209,7 @@ func (a *agent) handleUDPNative(sess *localSession, key pairing.PairingKey, svc 
 // 最多重发 udpBindMaxResends 次（重发只在 pair_timeout 内进行）；
 // 收到 MsgBindOK 或**首个业务数据报**即视为就绪（relay 半开会重复回 BindOK，
 // 因此重发是幂等的）。若先收到业务数据，先把该数据报转给本地目标。
-func (a *agent) awaitBindOK(sess *localSession, key pairing.PairingKey, relayConn, localConn *net.UDPConn, frame []byte) error {
+func (a *agent) awaitBindOK(sess *localSession, key pairing.PairingKey, relayConn, localConn net.Conn, frame []byte) error {
 	timeout := a.pairTimeout()
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, udpDatagramSize)
@@ -257,7 +268,7 @@ func (a *agent) awaitBindOK(sess *localSession, key pairing.PairingKey, relayCon
 }
 
 // udpRelayToLocal 读 relay 数据报并转发给本地目标。
-func (a *agent) udpRelayToLocal(sess *localSession, relayConn, localConn *net.UDPConn) {
+func (a *agent) udpRelayToLocal(sess *localSession, relayConn, localConn net.Conn) {
 	buf := make([]byte, udpDatagramSize)
 	for {
 		n, err := relayConn.Read(buf)
@@ -283,7 +294,7 @@ func (a *agent) udpRelayToLocal(sess *localSession, relayConn, localConn *net.UD
 }
 
 // udpLocalToRelay 读本地目标的 UDP 回包并写回 relay。
-func (a *agent) udpLocalToRelay(sess *localSession, localConn, relayConn *net.UDPConn) {
+func (a *agent) udpLocalToRelay(sess *localSession, localConn, relayConn net.Conn) {
 	buf := make([]byte, udpDatagramSize)
 	for {
 		n, err := localConn.Read(buf)

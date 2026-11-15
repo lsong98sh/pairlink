@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lsong98sh/pairlink/internal/logx"
 )
 
 // Mode 是 PairLink 的运行模式，与命令行 -relay / -agent / -client 一一对应。
@@ -87,6 +89,9 @@ type CommonConfig struct {
 	LogLevel string
 	// LogFormat 是日志格式：text / json，默认 text。
 	LogFormat string
+	// LogKeepDays 是日志日文件的保留天数：默认 7，0 = 永久保留，负数校验失败。
+	// 只在 log_path 非空（写文件）时生效；文件名规则见 internal/logx（<base>-YYYY-MM-DD<ext>）。
+	LogKeepDays int
 }
 
 // RelayConfig 对应 [relay] 段。
@@ -134,6 +139,17 @@ type RelayConfig struct {
 	UDPSessionTimeout time.Duration
 	// TokenTTL 是一次性配对令牌有效期，默认 15s。
 	TokenTTL time.Duration
+	// UDPDTLS 表示原生 UDP 数据面（udp_listen）使用 DTLS-PSK 加密，默认 true。
+	//
+	// false 时回退到 v0.4.0 的明文 UDP 数据面（混合版本过渡/排障用）。
+	// 注意：默认值只在 Load（ini）路径填充；直接构造 Config 时零值为 false，
+	// 即明文路径（与 Reconnect 的做法一致）。
+	UDPDTLS bool
+	// TokenRatePerIP 是单个来源 IP 每秒可签发的配对令牌数，默认 10；0 = 不限。
+	TokenRatePerIP int
+	// TokenBurstPerIP 是单个来源 IP 的令牌签发突发上限，默认 30；
+	// token_rate_per_ip = 0 时该值被忽略。
+	TokenBurstPerIP int
 }
 
 // ServerService 描述 [server] 段中的一个服务映射。
@@ -173,6 +189,10 @@ type ServerConfig struct {
 	DialTimeout time.Duration
 	// UDPSessionTimeout 是客户端侧 UDP 本地会话空闲清理时间，默认 60s。
 	UDPSessionTimeout time.Duration
+	// UDPDTLS 表示原生 UDP 数据面使用 DTLS-PSK 加密，默认 true（须与 relay 一致）。
+	//
+	// 注意：默认值只在 Load（ini）路径填充；直接构造 Config 时零值为 false。
+	UDPDTLS bool
 	// Reconnect 表示控制连接断开后是否自动重连，默认 true。
 	//
 	// 注意：默认值只在 Load（ini）路径填充；直接构造 Config 时零值为 false，
@@ -235,6 +255,10 @@ type ClientConfig struct {
 	//
 	// 与 [server] udp_session_timeout 对应；第一版曾用包内常量，阶段 4 起可配置。
 	UDPSessionTimeout time.Duration
+	// UDPDTLS 表示原生 UDP 数据面使用 DTLS-PSK 加密，默认 true（须与 relay 一致）。
+	//
+	// 注意：默认值只在 Load（ini）路径填充；直接构造 Config 时零值为 false。
+	UDPDTLS bool
 	// Reconnect 表示控制连接断开后是否自动重连，默认 true。
 	//
 	// 注意：默认值只在 Load（ini）路径填充；直接构造 Config 时零值为 false。
@@ -247,8 +271,9 @@ type ClientConfig struct {
 func newDefault() *Config {
 	return &Config{
 		Common: CommonConfig{
-			LogLevel:  "info",
-			LogFormat: "text",
+			LogLevel:    "info",
+			LogFormat:   "text",
+			LogKeepDays: 7,
 		},
 		Relay: RelayConfig{
 			TLS:                 TLSAuto,
@@ -262,6 +287,9 @@ func newDefault() *Config {
 			HeartbeatTimeout:    90 * time.Second,
 			UDPSessionTimeout:   60 * time.Second,
 			TokenTTL:            15 * time.Second,
+			UDPDTLS:             true,
+			TokenRatePerIP:      10,
+			TokenBurstPerIP:     30,
 		},
 		Server: ServerConfig{
 			TLS:                 TLSAuto,
@@ -269,6 +297,7 @@ func newDefault() *Config {
 			Heartbeat:           30 * time.Second,
 			DialTimeout:         10 * time.Second,
 			UDPSessionTimeout:   60 * time.Second,
+			UDPDTLS:             true,
 			Reconnect:           true,
 			ReconnectMaxBackoff: 60 * time.Second,
 		},
@@ -280,6 +309,7 @@ func newDefault() *Config {
 			DialTimeout:         10 * time.Second,
 			PairTimeout:         10 * time.Second,
 			UDPSessionTimeout:   60 * time.Second,
+			UDPDTLS:             true,
 			Reconnect:           true,
 			ReconnectMaxBackoff: 60 * time.Second,
 		},
@@ -364,10 +394,10 @@ func (b *builder) duration(section, key string, def time.Duration) (time.Duratio
 	}
 	d, err := time.ParseDuration(v.Value)
 	if err != nil {
-		return 0, fmt.Errorf("第 %d 行: [%s] %s = %q 不是合法的 duration（例如 10s / 300s / 5m）", v.Line, section, key, v.Value)
+		return 0, fmt.Errorf("[%s] %s = %q 不是合法的 duration（例如 10s / 300s / 5m）", section, key, v.Value)
 	}
 	if d <= 0 {
-		return 0, fmt.Errorf("第 %d 行: [%s] %s = %q 必须大于 0", v.Line, section, key, v.Value)
+		return 0, fmt.Errorf("[%s] %s = %q 必须大于 0", section, key, v.Value)
 	}
 	return d, nil
 }
@@ -384,12 +414,31 @@ func (b *builder) boolean(section, key string, def bool) (bool, error) {
 	case "false", "0", "no", "off":
 		return false, nil
 	default:
-		return false, fmt.Errorf("第 %d 行: [%s] %s = %q 不是合法的布尔值（true/false）", v.Line, section, key, v.Value)
+		return false, fmt.Errorf("[%s] %s = %q 不是合法的布尔值（true/false）", section, key, v.Value)
+	}
+}
+
+// booleanStrict 解析布尔键，只接受 true / false（大小写不敏感）。
+//
+// 与 boolean 的差别：不接受 1/0/yes/on 之类别名。udp_dtls 这类"加密开关"
+// 的语义必须毫无歧义，写错值应当直接报错，而不是被猜成某个布尔值
+// （否则两端取值不一致会退化成明文）。
+func (b *builder) booleanStrict(section, key string, def bool) (bool, error) {
+	v, ok := b.raw(section, key)
+	if !ok || strings.TrimSpace(v.Value) == "" {
+		return def, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(v.Value)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("[%s] %s = %q 非法，只允许 true / false", section, key, v.Value)
 	}
 }
 
 // integer 解析非负整数键；键不存在或值为空时返回默认值。
-//
 // 用于 max_conns / max_conns_per_ip / max_pending_pairs 这类上限（0 = 不限制）。
 func (b *builder) integer(section, key string, def int) (int, error) {
 	v, ok := b.raw(section, key)
@@ -398,10 +447,10 @@ func (b *builder) integer(section, key string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(v.Value))
 	if err != nil {
-		return def, fmt.Errorf("第 %d 行: [%s] %s = %q 不是合法的整数", v.Line, section, key, v.Value)
+		return def, fmt.Errorf("[%s] %s = %q 不是合法的整数", section, key, v.Value)
 	}
 	if n < 0 {
-		return def, fmt.Errorf("第 %d 行: [%s] %s = %q 不能为负数（0 表示不限制）", v.Line, section, key, v.Value)
+		return def, fmt.Errorf("[%s] %s = %q 不能为负数（0 表示不限制）", section, key, v.Value)
 	}
 	return n, nil
 }
@@ -414,7 +463,7 @@ func (b *builder) tlsMode(section, key string, def TLSMode) (TLSMode, error) {
 	}
 	m, err := ParseTLSMode(v.Value)
 	if err != nil {
-		return def, fmt.Errorf("第 %d 行: [%s] %s = %q: %w", v.Line, section, key, v.Value, err)
+		return def, fmt.Errorf("[%s] %s = %q: %w", section, key, v.Value, err)
 	}
 	return m, nil
 }
@@ -472,6 +521,14 @@ func (b *builder) loadCommon() error {
 	if v := b.str("common", "log_format"); v != "" {
 		c.LogFormat = strings.ToLower(v)
 	}
+	keepDays, err := b.integer("common", "log_keep_days", logx.DefaultKeepDays)
+	if err != nil {
+		return err
+	}
+	if err := logx.ValidateKeepDays(keepDays); err != nil {
+		return err
+	}
+	c.LogKeepDays = keepDays
 	return nil
 }
 
@@ -520,6 +577,15 @@ func (b *builder) loadRelay() error {
 	if r.TokenTTL, err = b.duration("relay", "token_ttl", r.TokenTTL); err != nil {
 		return err
 	}
+	if r.UDPDTLS, err = b.booleanStrict("relay", "udp_dtls", r.UDPDTLS); err != nil {
+		return err
+	}
+	if r.TokenRatePerIP, err = b.integer("relay", "token_rate_per_ip", r.TokenRatePerIP); err != nil {
+		return err
+	}
+	if r.TokenBurstPerIP, err = b.integer("relay", "token_burst_per_ip", r.TokenBurstPerIP); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -551,6 +617,9 @@ func (b *builder) loadServer() error {
 	if s.UDPSessionTimeout, err = b.duration("server", "udp_session_timeout", s.UDPSessionTimeout); err != nil {
 		return err
 	}
+	if s.UDPDTLS, err = b.booleanStrict("server", "udp_dtls", s.UDPDTLS); err != nil {
+		return err
+	}
 	if s.Reconnect, err = b.boolean("server", "reconnect", s.Reconnect); err != nil {
 		return err
 	}
@@ -572,14 +641,14 @@ func (b *builder) loadServer() error {
 			continue
 		}
 		if strings.EqualFold(id, DefaultServiceID) {
-			return fmt.Errorf("第 %d 行: [server] 中不允许显式配置 service.default，主服务请用 protocol + local 配置", v.Line)
+			return fmt.Errorf("[server] 中不允许显式配置 service.default，主服务请用 protocol + local 配置")
 		}
 		if err := validateServiceID(id); err != nil {
-			return fmt.Errorf("第 %d 行: [server] 键 %q: %w", v.Line, v.Key, err)
+			return fmt.Errorf("[server] 键 %q: %w", v.Key, err)
 		}
 		proto, addr, err := parseServerServiceValue(v.Value)
 		if err != nil {
-			return fmt.Errorf("第 %d 行: [server] 键 %q = %q: %w", v.Line, v.Key, v.Value, err)
+			return fmt.Errorf("[server] 键 %q = %q: %w", v.Key, v.Value, err)
 		}
 		s.Services = upsertServerService(s.Services, ServerService{ID: id, Proto: proto, Addr: addr})
 	}
@@ -618,6 +687,9 @@ func (b *builder) loadClient() error {
 	if c.UDPSessionTimeout, err = b.duration("client", "udp_session_timeout", c.UDPSessionTimeout); err != nil {
 		return err
 	}
+	if c.UDPDTLS, err = b.booleanStrict("client", "udp_dtls", c.UDPDTLS); err != nil {
+		return err
+	}
 	if c.Reconnect, err = b.boolean("client", "reconnect", c.Reconnect); err != nil {
 		return err
 	}
@@ -636,11 +708,11 @@ func (b *builder) loadClient() error {
 			continue
 		}
 		if err := validateServiceID(id); err != nil {
-			return fmt.Errorf("第 %d 行: [client] 键 %q: %w", v.Line, v.Key, err)
+			return fmt.Errorf("[client] 键 %q: %w", v.Key, err)
 		}
 		listen, err := normalizeListenAddr(v.Value)
 		if err != nil {
-			return fmt.Errorf("第 %d 行: [client] 键 %q = %q: %w", v.Line, v.Key, v.Value, err)
+			return fmt.Errorf("[client] 键 %q = %q: %w", v.Key, v.Value, err)
 		}
 		c.Services = upsertClientService(c.Services, ClientService{ID: id, Listen: listen})
 	}

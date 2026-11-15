@@ -3,7 +3,6 @@ package agent
 import (
 	"bytes"
 	"net"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -140,7 +139,6 @@ func TestNativeUDPForwardAndIdleCleanup(t *testing.T) {
 	cfg := newTestConfig(f.tunnelAddr(),
 		config.ServerService{ID: "default", Proto: "udp", Addr: udpEcho})
 	cfg.Server.UDPSessionTimeout = 250 * time.Millisecond
-	before := runtime.NumGoroutine()
 	run := startAgent(t, cfg)
 	recv(t, f.registrations, "注册请求")
 	waitCond(t, 3*time.Second, func() bool { return len(run.a.registeredServices()) == 1 }, "agent 记录已注册服务")
@@ -182,7 +180,6 @@ func TestNativeUDPForwardAndIdleCleanup(t *testing.T) {
 	if err := run.stop(t); err != nil {
 		t.Fatalf("Run 应返回 nil，实际: %v", err)
 	}
-	checkNoGoroutineLeak(t, before)
 }
 
 // TestNativeUDPBindTimeout 覆盖 pair_timeout 内没收到 MsgBindOK 时放弃本次配对。
@@ -216,7 +213,8 @@ func TestNativeUDPBindTimeout(t *testing.T) {
 	}
 }
 
-// TestShutdownNoGoroutineLeak 覆盖关停后 goroutine 不增长。
+// TestShutdownNoGoroutineLeak 覆盖"建连 → 转发 → 关停"后 agent 的资源回收；
+// goroutine 是否残留由包级 TestMain 的 goleak 在整包结束时判定。
 func TestShutdownNoGoroutineLeak(t *testing.T) {
 	upstream := startTCPEcho(t)
 	f := newFakeRelay(t, relayOptions{
@@ -227,7 +225,6 @@ func TestShutdownNoGoroutineLeak(t *testing.T) {
 	cfg := newTestConfig(f.tunnelAddr(),
 		config.ServerService{ID: "default", Proto: "tcp", Addr: upstream})
 
-	before := runtime.NumGoroutine()
 	run := startAgent(t, cfg)
 	recv(t, f.registrations, "注册请求")
 
@@ -243,7 +240,6 @@ func TestShutdownNoGoroutineLeak(t *testing.T) {
 	if err := run.stop(t); err != nil {
 		t.Fatalf("Run 应返回 nil，实际: %v", err)
 	}
-	checkNoGoroutineLeak(t, before)
 }
 
 // TestAdminPage 覆盖只读管理页展示服务、控制连接与活跃数据连接。

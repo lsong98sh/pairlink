@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -890,23 +889,6 @@ func expectEOF(t *testing.T, conn net.Conn, what string) {
 	}
 	if n != 0 {
 		t.Fatalf("%s: 预期 EOF，读到 %d 字节", what, n)
-	}
-}
-
-// checkNoGoroutineLeak 在 agent 退出后校验 goroutine 数量未增长（±2 容差）。
-func checkNoGoroutineLeak(t *testing.T, before int) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		runtime.GC()
-		n := runtime.NumGoroutine()
-		if n <= before+2 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("goroutine 泄漏：agent 启动前 %d，退出后 %d", before, n)
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 

@@ -38,7 +38,6 @@ func waitEchoState(t *testing.T, addr string, want bool, desc string) {
 // 同名服务被在线 agent 占用时第二个 agent 被拒；原 owner 下线后允许接管，
 // client 的服务列表随之热更新（本地监听关闭/恢复）。
 func TestE2EServiceOwnership(t *testing.T) {
-	guardGoroutines(t)
 	echoA := startTCPEchoServer(t)
 	echoB := startTCPEchoServer(t)
 
@@ -128,7 +127,6 @@ func TestE2EServiceOwnership(t *testing.T) {
 // TestE2EServiceWhitelist 覆盖 [relay] service_allow：未列入白名单的服务名注册失败，
 // agent 得到可读提示；已列入的主服务仍可正常注册。
 func TestE2EServiceWhitelist(t *testing.T) {
-	guardGoroutines(t)
 	echoAddr := startTCPEchoServer(t)
 	extraEcho := startTCPEchoServer(t)
 

@@ -12,11 +12,11 @@
 #   因此**不提供镜像内 HEALTHCHECK**（见 deploy/README.md 的说明与替代命令）。
 #
 # 构建（在仓库根目录）：
-#   docker build -t pairlink:v0.4.0 .
+#   docker build -t pairlink:v0.5.0 .
 # 运行（示例，配置从宿主机只读挂载）：
 #   docker run --rm -p 127.0.0.1:9000:9000 \
 #     -v "$PWD/examples/docker/relay.ini:/etc/pairlink/relay.ini:ro" \
-#     pairlink:v0.4.0 -relay -config /etc/pairlink/relay.ini
+#     pairlink:v0.5.0 -relay -config /etc/pairlink/relay.ini
 #
 # 注意：EXPOSE 只是文档性声明（README 的默认生产端口），不会发布端口；
 #       docker-compose.yml 使用 17000 段端口并显式 publish。
@@ -44,7 +44,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 # 版本号与 internal/version.Version 保持一致（升级版本时同步修改）。
 LABEL org.opencontainers.image.title="PairLink" \
       org.opencontainers.image.description="PairLink 配对式中继系统（relay / agent / client）" \
-      org.opencontainers.image.version="v0.4.0" \
+      org.opencontainers.image.version="v0.5.0" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/lsong98sh/pairlink"
 

@@ -3,7 +3,6 @@ package relay
 import (
 	"context"
 	"net"
-	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -12,7 +11,8 @@ import (
 	"github.com/lsong98sh/pairlink/internal/protocol"
 )
 
-// TestRunShutdownCleanup 验证 Run 返回后 goroutine 不增长、监听端口已释放。
+// TestRunShutdownCleanup 验证 Run 返回后监听端口已释放；Run 退出后是否
+// 残留 goroutine 由包级 TestMain 的 goleak 判定（不再用数字容差采样）。
 func TestRunShutdownCleanup(t *testing.T) {
 	tunnelAddr := reserveTCPAddr(t)
 	tcpAddr := reserveTCPAddr(t)
@@ -26,9 +26,6 @@ func TestRunShutdownCleanup(t *testing.T) {
 		c.Common.ManageListen = adminAddr
 		c.Relay.PairTimeout = 500 * time.Millisecond
 	})
-
-	runtime.GC()
-	base := runtime.NumGoroutine()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -80,19 +77,6 @@ func TestRunShutdownCleanup(t *testing.T) {
 		}
 	case <-time.After(8 * time.Second):
 		t.Fatal("Run 关停超时")
-	}
-
-	// 3 次采样，允许 ±2 的容差。
-	maxGoroutines := 0
-	for i := 0; i < 3; i++ {
-		runtime.GC()
-		time.Sleep(40 * time.Millisecond)
-		if n := runtime.NumGoroutine(); n > maxGoroutines {
-			maxGoroutines = n
-		}
-	}
-	if maxGoroutines > base+2 {
-		t.Fatalf("goroutine 泄漏：启动前 %d，关停后 %d", base, maxGoroutines)
 	}
 
 	assertTCPPortFree(t, tunnelAddr)

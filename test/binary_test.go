@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lsong98sh/pairlink/internal/version"
+	"go.uber.org/goleak"
 )
 
 // pairlinkExe 是 TestMain 构建出的真实二进制路径。
@@ -57,9 +58,20 @@ func TestMain(m *testing.M) {
 	}
 	pairlinkExe = exe
 
-	code := m.Run()
-	_ = os.RemoveAll(dir)
-	os.Exit(code)
+	// 整包用例结束后用 goleak 兜底 goroutine 泄漏检查：所有 t.Cleanup
+	// （Run 关停、echo 服务关闭、子进程 Kill+Wait）都执行完，m.Run() 才返回。
+	//
+	// e2e 包里有真实子进程与监听端口：startChild 为每个子进程启动的
+	// os/exec.(*Cmd).Wait 回收 goroutine 会在 cleanup 的 Kill+Wait 中结束，
+	// net/http 服务器 goroutine 属于产品 Run 必须随 Run 退出——两类都不
+	// ignore，报出来的栈帧按真实泄漏处理。goleak 默认过滤器已跳过 testing
+	// 包自身的调度 goroutine。
+	goleak.VerifyTestMain(m,
+		goleak.Cleanup(func(code int) {
+			_ = os.RemoveAll(dir)
+			os.Exit(code)
+		}),
+	)
 }
 
 // runBin 运行真实二进制并返回退出码与合并输出。
@@ -82,8 +94,6 @@ func runBin(t *testing.T, args ...string) (int, string) {
 // TestBinaryVersionUsageAndConfigErrors 验收项：真实二进制的 -version 输出、
 // 退出码 2 的参数错误、退出码 1 的配置错误。
 func TestBinaryVersionUsageAndConfigErrors(t *testing.T) {
-	guardGoroutines(t)
-
 	code, out := runBin(t, "-version")
 	if code != 0 {
 		t.Fatalf("-version 退出码 = %d，期望 0（输出=%q）", code, out)
@@ -286,8 +296,6 @@ func waitChild(t *testing.T, timeout time.Duration, desc string, procs []*childP
 
 // TestSubprocessTCPEcho 验收项：真实二进制三个子进程完成一次完整 TCP echo。
 func TestSubprocessTCPEcho(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startTCPEchoServer(t)
 
 	relayManage := hostPort(freeTCPPort(t))
@@ -372,8 +380,6 @@ func TestSubprocessTCPEcho(t *testing.T) {
 // Windows 上 Go 无法向子进程投递 Ctrl+C，interrupt() 回退 Process.Kill，
 // 因此只断言"进程确实退出"；这一平台差异在 README 的诚实清单里写明。
 func TestSubprocessGracefulShutdown(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startTCPEchoServer(t)
 
 	relayManage := hostPort(freeTCPPort(t))
@@ -493,8 +499,6 @@ func exeNameFor(goos, base string) string {
 
 // TestCrossCompile 验收项：纯 Go（无 CGO）跨平台编译通过。
 func TestCrossCompile(t *testing.T) {
-	guardGoroutines(t)
-
 	targets := []struct {
 		goos, goarch string
 	}{

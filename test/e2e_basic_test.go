@@ -16,8 +16,6 @@ import (
 // TestE2EHTTPZeroChange 验收项：真实 net/http 服务零改造，经 agent 注册、
 // client 本地端口访问成功（task.md §9.3 第 1 条）。
 func TestE2EHTTPZeroChange(t *testing.T) {
-	guardGoroutines(t)
-
 	httpAddr := startHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-PairLink-Test", "zero-change")
 		fmt.Fprintf(w, "pairlink-http-ok path=%s", r.URL.RequestURI())
@@ -102,8 +100,6 @@ func TestE2EHTTPZeroChange(t *testing.T) {
 // 本用例直接操纵数据面连接顺序（task.md §9.3 允许），用 fake agent / fake client
 // 控制面 + 原始数据面连接精确构造两种顺序。
 func TestE2ETCPPairingBothOrders(t *testing.T) {
-	guardGoroutines(t)
-
 	relayManage := hostPort(freeTCPPort(t))
 	relayCfg, _ := writeRelayINI(t, relaySpec{
 		Tunnel:      hostPort(freeTCPPort(t)),
@@ -182,8 +178,6 @@ func TestE2ETCPPairingBothOrders(t *testing.T) {
 // TestE2ETCPEchoConcurrent20 验收项：20 组并发 TCP echo 互不干扰，全部关闭后
 // relay 配对表回落为 0，agent/client 活跃配对表为空（task.md §9.3 第 2、4 条）。
 func TestE2ETCPEchoConcurrent20(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startTCPEchoServer(t)
 
 	relayManage := hostPort(freeTCPPort(t))
@@ -276,8 +270,6 @@ func TestE2ETCPEchoConcurrent20(t *testing.T) {
 // TestE2EAgentMultiServiceConcurrent 验收项：同一 agent 注册至少 3 个 TCP 服务，
 // client 分别监听，三个端口并发访问互不串流（task.md §9.3 第 4 条）。
 func TestE2EAgentMultiServiceConcurrent(t *testing.T) {
-	guardGoroutines(t)
-
 	defaultAddr := startHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "service-default")
 	}))

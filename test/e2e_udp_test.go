@@ -16,8 +16,6 @@ import (
 // relay 配置 udp_listen 时走原生 UDP；会话映射、转发、空闲超时清理都真实发生，
 // 清理后同一本地会话的报文被丢弃，新的本地源端口会重新走信号配对。
 func TestE2EUDPModeNative(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startUDPEchoServer(t, "echo:")
 
 	relayManage := hostPort(freeTCPPort(t))
@@ -115,8 +113,6 @@ func TestE2EUDPModeNative(t *testing.T) {
 // relay 不配置 udp_listen 时 udp_mode=tcp_tunnel，UDP 数据仍通；两个并发 UDP
 // 会话复用同一条承载 TCP（管理页只有 2 个不同承载对端地址），互不干扰。
 func TestE2EUDPModeTCPTunnel(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startUDPEchoServer(t, "echo:")
 
 	relayManage := hostPort(freeTCPPort(t))
@@ -219,8 +215,6 @@ func TestE2EUDPModeTCPTunnel(t *testing.T) {
 // TestE2EUDPModeNegotiation 验证 udp_mode 在 HelloOK、ServiceRegistered、
 // ServiceList 三处都下发，并且 native / tcp_tunnel 的数据面端口字段一致。
 func TestE2EUDPModeNegotiation(t *testing.T) {
-	guardGoroutines(t)
-
 	cases := []struct {
 		name   string
 		want   string
@@ -283,4 +277,61 @@ func TestE2EUDPModeNegotiation(t *testing.T) {
 			t.Logf("%s: HelloOK / ServiceRegistered / ServiceList 均下发 udp_mode=%s", tc.name, tc.want)
 		})
 	}
+}
+
+// TestE2EUDPModeNativePlaintext 验收 v0.5.0 兼容开关：三端都写 udp_dtls = false
+// 时原生 UDP 数据面回到 v0.4.0 明文路径，端到端仍然可用（同时验证三端配置一致）。
+func TestE2EUDPModeNativePlaintext(t *testing.T) {
+	echoAddr := startUDPEchoServer(t, "echo:")
+	off := false
+
+	relayManage := hostPort(freeTCPPort(t))
+	relayCfg, _ := writeRelayINI(t, relaySpec{
+		Tunnel:            hostPort(freeTCPPort(t)),
+		TCP:               hostPort(freeTCPPort(t)),
+		UDP:               hostPort(freeUDPPort(t)),
+		Manage:            relayManage,
+		PairTimeout:       5 * time.Second,
+		UDPSessionTimeout: 30 * time.Second,
+		UDPDTLS:           &off,
+	})
+	relayH := startRelay(t, relayCfg)
+
+	agentCfg, _ := writeAgentINI(t, agentSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    hostPort(freeTCPPort(t)),
+		Protocol:  "udp",
+		Local:     echoAddr,
+		UDPDTLS:   &off,
+	})
+	startAgent(t, agentCfg)
+	waitServicesRegistered(t, relayH, relayManage, "default")
+
+	clientPort := freeUDPPort(t)
+	clientCfg, _ := writeClientINI(t, clientSpec{
+		RelayAddr: relayCfg.Relay.TunnelListen,
+		Manage:    hostPort(freeTCPPort(t)),
+		Services:  []clientService{{ID: "default", Listen: hostPort(clientPort)}},
+		UDPDTLS:   &off,
+	})
+	startClient(t, clientCfg)
+
+	// 三端解析结果必须一致为 false（udp_dtls 只有完全一致才能互通）。
+	if relayCfg.Relay.UDPDTLS || agentCfg.Server.UDPDTLS || clientCfg.Client.UDPDTLS {
+		t.Fatalf("udp_dtls 三端解析不一致: relay=%t agent=%t client=%t",
+			relayCfg.Relay.UDPDTLS, agentCfg.Server.UDPDTLS, clientCfg.Client.UDPDTLS)
+	}
+
+	target, err := net.ResolveUDPAddr("udp", hostPort(clientPort))
+	if err != nil {
+		t.Fatalf("解析 client 本地 UDP 地址: %v", err)
+	}
+	c := newUDPClient(t)
+	udpEchoEventually(t, c, target, "plaintext-probe", "echo:plaintext-probe", 5*time.Second)
+	waitUDPSessionCount(t, relayH, relayManage, true, 1)
+	keys := relayUDPPairingKeys(relayPage(t, relayManage))
+	if len(keys) != 1 {
+		t.Fatalf("udp_dtls=false 时原生 UDP 会话表配对键数量 = %d，期望 1 (%v)", len(keys), keys)
+	}
+	t.Logf("udp_dtls=false 明文数据面端到端可用: pairing_key=%s", keys[0])
 }

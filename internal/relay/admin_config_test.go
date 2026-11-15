@@ -210,8 +210,10 @@ func TestAdminConfigAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "pair_timeout      = 30s") {
-		t.Fatalf("ini 未按原对齐写回:\n%s", data)
+	// v0.5.0 起写回用 gopkg.in/ini.v1 重新生成文件：不再保持手工对齐，
+	// 但必须写入新值，且注释与其它键仍在（格式归一，见 docs/contract.md §3.10）。
+	if !strings.Contains(string(data), "pair_timeout = 30s") {
+		t.Fatalf("ini 未写回新值:\n%s", data)
 	}
 	if !strings.Contains(string(data), "; relay 配置") {
 		t.Fatalf("注释丢失:\n%s", data)

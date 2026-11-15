@@ -271,6 +271,9 @@ type CommonConfig struct {
 type RelayConfig struct {
     TunnelListen, TCPListen, UDPListen, TLSCert, TLSKey, AuthToken string
     PairTimeout, IdleTimeout, HeartbeatTimeout, UDPSessionTimeout, TokenTTL time.Duration
+    UDPDTLS bool        // v0.5.0：[relay] udp_dtls，默认 true；只接受 true/false
+    TokenRatePerIP int  // v0.5.0：[relay] token_rate_per_ip，默认 10；0 = 不限速
+    TokenBurstPerIP int // v0.5.0：[relay] token_burst_per_ip，默认 30；rate>0 时须 ≥1
 }
 type ServerService struct{ ID, Proto, Addr string }
 type ServerConfig struct {
@@ -279,6 +282,7 @@ type ServerConfig struct {
     TLSCA string
     TLSInsecureSkipVerify bool
     Heartbeat, DialTimeout, UDPSessionTimeout time.Duration
+    UDPDTLS bool // v0.5.0：[server] udp_dtls，默认 true，必须与 relay 一致
 }
 func (c ServerConfig) All() []ServerService   // 主服务 default 在前
 type ClientService struct{ ID, Listen string }
@@ -291,6 +295,7 @@ type ClientConfig struct {
     Subscribe bool
     DialTimeout, PairTimeout time.Duration
     UDPSessionTimeout time.Duration // 阶段 4 新增：[client] udp_session_timeout，默认 60s
+    UDPDTLS bool                    // v0.5.0：[client] udp_dtls，默认 true，必须与 relay 一致
 }
 ```
 
@@ -645,16 +650,23 @@ func IsWindowsService() bool
 不可改：`relay_addr`、`token`、`auth_token`、监听端口、`tls*`、证书路径、`manage_listen`、
 日志、重连参数、其它未列出的键。
 
-**持久化语义**（`config.PatchValue` / `config.DeleteKey`）：
+**持久化语义**（`config.PatchValue` / `config.DeleteKey`；v0.5.0 起改用 `gopkg.in/ini.v1`）：
 
-- 只替换目标键 `=` 之后的值，保留前导空白、键名写法与 `=` 前对齐；注释、空行、
-  未知键、键顺序原样保留；
-- 键不存在时插到该段最后一个非空行之后；段不存在时在文件末尾空一行后追加；
-- 保留 LF/CRLF 与结尾换行状态、BOM 与权限位；
-- 同目录临时文件 + `os.Rename` 原子替换；进程内用包级互斥锁串行化；
-  不清理多余空行、不做任何重新格式化；
-- 同一段重复键：Patch 替换全部同名键（解析器以最后一个为准），Delete 删除全部同名行；
-  同名段重复出现时同样覆盖全部段（解析器会合并重复段）。
+- 读取 `ini.Load`（`Insensitive` 由本包实现：键名/段名大小写不敏感；只支持整行注释，
+  值中的 `;`/`#` 属于值本身；值两侧空白被裁剪，不做引号/转义处理）；
+- 写回流程：`ini.Load` → `SetValue`/`DeleteKey` → `WriteTo` 重新生成整份文件 →
+  同目录临时文件 → `Sync` → `Chmod` → `Close` → `os.Rename` → **父目录 fsync**；
+- **写回会重写该 ini 文件**：注释尽量保留，但空行、键顺序、`=` 对齐、LF/CRLF、
+  键名大小写、重复键/重复段的写法都可能被归一（换行统一为 LF，文件以换行结尾）；
+  保证的是"原子替换 + 权限位不变 + 写回后 `Load` 能读回目标值"，不再承诺逐字节保留原格式；
+- 键不存在时追加到该段末尾；段不存在时在文件末尾追加 `[section]`；
+- 同一段内重复键按解析语义（后者覆盖）归一为一行；同名段合并为一段；
+- 保留原文件 BOM 与权限位；段前键值（缺少 `[section]` 段头）与保留段名 `DEFAULT`
+  拒绝写入；
+- 进程内用包级互斥锁串行化（读整份文件 → 改 → 原子替换）；跨进程同时编辑同一文件
+  不在保证范围内，仍是"后写覆盖先写"；
+- Linux/类 Unix 在 `Rename` 后对父目录 `fsync`，保证崩溃/掉电后 rename 不丢；
+  Windows 没有目录 fsync 的等价操作，跳过该步骤（NTFS 日志兜底，语义略弱）。
 
 **值校验**：duration 必须 `>0`；`service_id` 必须 `[a-z0-9-_]{1,64}` 且附加服务不得为
 `default`；地址必须可解析为 host:port（端口 1..65535，裸端口补 127.0.0.1）；
@@ -716,7 +728,7 @@ func IsWindowsService() bool
     `true` = 必须 TLS，relay 未启用 → **永久错误**；`false` = 强制明文，relay 要求 TLS →
     明确报错（不得静默降级）。
 - **范围**：`tcp_listen` 上的全部内容——`MsgBind` 帧、`pairing_token`、业务字节、
-  `udp-over-tcp` 承载帧。原生 UDP（`udp_mode = native`）**无 DTLS，仍是明文**。
+  `udp-over-tcp` 承载帧。原生 UDP（`udp_mode = native`）的加密见 §4.3.3（v0.5.0 起默认 DTLS）。
 - **失败语义**：
   - relay 对 TLS 数据面做 `tls.Listen`；accept 不握手，因此明文连接在首次读 `MsgBind` 时
     握手失败 → 关闭并记 WARN `event=data_plane_tls_handshake_fail`（含提示三端 ≥ v0.4.0）；
@@ -741,6 +753,40 @@ func IsWindowsService() bool
   全部服务，并写入"最近归属"（容量 1024，最旧淘汰）。
 - relay 必须推送 `updated` 事件，让 client 的服务列表跟随归属变化；agent 重连后重新注册
   当前全部服务（既有语义不变）。
+
+### 4.3.3 原生 UDP 的 DTLS-PSK（`udp_dtls`，v0.5.0 / SEC-D3）
+
+- **决策**：`udp_mode = native` 且 `udp_dtls = true`（`[relay]`/`[server]`/`[client]` 三处默认
+  `true`，只接受 `true`/`false`）时，原生 UDP 数据面的**外层**是 DTLS 1.2 + PSK，
+  内层帧格式（`len(4B)|sess_len(1B)|session|payload`）与 `MsgBind` 鉴权**完全不变**。
+- **密钥**：`PSK = HKDF-SHA256(ikm = auth_token, salt = nil,
+  info = "pairlink-udp-dtls/v1|" + pairing_key)`，长度 32；PSK identity = `pairing_key`；
+  三端各自本地派生，链路上不传密钥。密码套件固定
+  `TLS_PSK_WITH_AES_128_GCM_SHA256`。
+- **relay 侧**：非法 identity（空/超长/非合法配对键）→ PSK 回调返回错误 → 握手失败，
+  **禁止**回退到任何全局/默认密钥。单 UDP socket + 唯一读循环 + 每对端虚拟
+  `net.PacketConn`；13 字节 DTLS 记录头预筛（content type 20–23，版本 `0xFEFC/FEFD/FEFF`）
+  丢弃明文与垃圾，不为其建对端；对端上限 4096、每对端队列上限 32 个数据报、
+  空闲阈值 `udp_session_timeout + pair_timeout`、1s 粒度回收。
+- **agent/client 侧**：`dtls.Client` + `HandshakeContext(pair_timeout)`，之后 Bind 与数据
+  全走 DTLS；断开沿用既有会话清理，下次数据重新配对 + 重新握手。
+- **开关与回退**：`udp_dtls = false`（三端一致）→ v0.4.0 明文路径，relay/agent/client 各自
+  启动 WARN `event=udp_dtls_disabled`；不得只在一端设 false。
+- **失败与观测**：非 DTLS 首包、握手失败、超时 → 丢弃 + 5s 限流 WARN
+  `event=udp_dtls_handshake_fail`（reason = `non_dtls|handshake|handshake_timeout|peer`）；
+  已建连后读错只记 Debug `udp_evict`。
+- **协议兼容**：不改 `ProtocolVersion` 与 `HelloOK`；一致性只靠配置约定，三端版本
+  必须 ≥ v0.5.0（或同时 `udp_dtls = false`）。
+
+### 4.3.4 relay 的按 IP 令牌签发限速（v0.5.0）
+
+- `[relay] token_rate_per_ip`（默认 10/s，`0` = 不限）与 `token_burst_per_ip`（默认 30，
+  `rate > 0` 时必须 ≥ 1，`rate = 0` 时忽略）。
+- 入口固定：`handleConnectRequest` 中在**配对占位之前**、agent 在线检查之后；超限**不签发**
+  令牌，回既有 `MsgError{code: too_many_pending}`（message 提示"该来源 IP 的接入请求过于
+  频繁"）并记 `event=token_rate_limited`（5s 限流 WARN）。
+- 按来源 IP（`RemoteAddr` 的 host）独立计数；限速器表必须有过期清理（按最后使用时间，
+  `ttl = ceil(burst/rate)`，≥ 1s），禁止无界增长；`rate = 0` 时不得分配任何限速器状态。
 
 ### 4.4 超时使用
 
@@ -858,4 +904,13 @@ go test -race ./internal/...   # 必须全绿
 
 4. 若发现冻结包确实缺少必要能力：**不要改冻结包**，在最终报告中列出契约变更请求
    （目标文件、符号、建议签名、理由、对另外两个模式的影响）。
-5. 不要新增第三方依赖；Windows 服务已由 `golang.org/x/sys` 完成。
+5. **优先标准库；引入第三方库必须说明理由**（`task.md` §7.1）。当前依赖清单与引入理由见
+   README §12.1；新增依赖时同步更新该表，并在提交信息里写明"为什么标准库不可行 / 维护成本 /
+   二进制体积影响 / 是否仅测试依赖"。v0.5.0 的取舍示例：
+   - `gopkg.in/ini.v1`（运行期）：替代自研行级 ini 补丁，接受"写回会重写文件"的代价；
+   - `github.com/pion/dtls/v3` + `github.com/pion/transport/v4`（运行期）：原生 UDP 数据面的
+     DTLS-PSK，避免自研密码协议；
+   - `golang.org/x/time/rate`（运行期）：标准库无令牌桶；
+   - `go.uber.org/goleak`（**仅测试**）：替代 `runtime.NumGoroutine()` 计数容差。
+   禁止引入与功能无关的框架（Web 框架、ORM、日志框架等）；渲染用 `html/template`、日志用
+   `log/slog`、配置解析除 ini 外一律手写（当前无其他格式）。

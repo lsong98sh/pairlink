@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -404,7 +403,8 @@ func TestDataAddrUnavailableDoesNotFailRun(t *testing.T) {
 	}
 }
 
-// TestGoroutineCleanup 覆盖关停后 goroutine 不增长（±2）。
+// TestGoroutineCleanup 覆盖"完整配对与转发 → 关停"路径；关停后是否残留
+// goroutine 由包级 TestMain 的 goleak 在整包结束时判定（不再用数字容差）。
 func TestGoroutineCleanup(t *testing.T) {
 	r := newFakeRelay(t, fakeRelayOptions{
 		services: []protocol.ServiceInfo{tcpService("svc-g")},
@@ -412,8 +412,6 @@ func TestGoroutineCleanup(t *testing.T) {
 	})
 	cfg := testConfig(r.addr())
 	cfg.Client.Services = []config.ClientService{{ID: "svc-g", Listen: "127.0.0.1:0"}}
-
-	base := runtime.NumGoroutine()
 
 	// 先建立一次完整配对与转发，再关停，确保转发 goroutine 也被回收。
 	tc := startTestClient(t, cfg)
@@ -445,16 +443,4 @@ func TestGoroutineCleanup(t *testing.T) {
 	}
 	_ = local.Close()
 	_ = dc.conn.Close()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		now := runtime.NumGoroutine()
-		if now <= base+2 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("关停后 goroutine 未回落: base=%d now=%d", base, now)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }

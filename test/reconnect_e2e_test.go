@@ -133,8 +133,6 @@ func (p *tunnelProxy) pipe(dst, src net.Conn) {
 // 掐断 agent/client 到 relay 的控制连接（模拟 relay 被杀/网络中断）后，
 // 两端按指数退避自动重连并恢复注册；随后 TCP echo 与 UDP 仍可用。
 func TestE2EReconnectAfterControlCut(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startTCPEchoServer(t)
 	udpEchoAddr := startUDPEchoServer(t, "udp:")
 

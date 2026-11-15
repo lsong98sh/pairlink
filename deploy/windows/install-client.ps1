@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     只安装/卸载 PairLink client 的 Windows 服务（服务名固定 pairlink-client）。
@@ -10,7 +10,7 @@
 
     安装：校验二进制/配置存在 → 配置转绝对路径 → -service install → 默认 -service start。
     卸载：-service stop → -service uninstall；服务不存在视为成功（幂等）。
-    日志固定写在 pairlink.exe 同目录的 pairlink-client.log。
+    日志按日期分文件，写在 pairlink.exe 同目录的 pairlink-client-YYYY-MM-DD.log（保留天数由 [common] log_keep_days 控制，默认 7 天，0 = 永久）。
     ini 配置与证书不会被删除。
 
     必须使用“以管理员身份运行”的 PowerShell；非管理员会被 #Requires 直接拦截。
@@ -28,7 +28,7 @@
     服务已存在时先 stop + uninstall，再重新安装（仅安装时生效）。
 
 .PARAMETER KeepLogs
-    卸载时保留 pairlink-client.log（仅卸载时生效；默认删除日志）。
+    卸载时保留 pairlink-client-*.log（仅卸载时生效；默认删除全部日文件）。
 
 .PARAMETER NoStart
     安装后只注册服务、不自动启动。
@@ -116,7 +116,7 @@ if ($Uninstall) {
 
     if ($null -ne $binaryPath) {
         $logPath = Get-PairLinkLogPath -BinaryPath $binaryPath -ServiceName $ServiceName
-        Remove-PairLinkLog -LogPath $logPath -KeepLogs ([bool]$KeepLogs)
+        Remove-PairLinkLog -BinaryPath $binaryPath -ServiceName $ServiceName -KeepLogs ([bool]$KeepLogs)
     }
 
     Write-Host ''

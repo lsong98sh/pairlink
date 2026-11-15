@@ -235,6 +235,11 @@ func (c *client) run() error {
 	c.log.Info("client 启动", "event", "start",
 		"detail", fmt.Sprintf("relay=%s services=%d reconnect=%t",
 			c.cfg.Client.RelayAddr, len(c.mappingSnapshot()), c.reconnectEnabled()))
+	// v0.5.0：原生 UDP 数据面默认 DTLS-PSK；关闭时启动即提示风险（须与 relay 一致）。
+	if !c.cfg.Client.UDPDTLS {
+		c.log.Warn("udp_dtls = false：原生 UDP 数据面按 v0.4.0 明文运行（业务数据可被链路上的人读取），且必须与 relay 的 udp_dtls 一致",
+			"event", "udp_dtls_disabled", "udp_dtls", false)
+	}
 
 	if err := c.startAdmin(); err != nil {
 		c.shutdown()

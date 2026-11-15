@@ -60,6 +60,9 @@ type Page struct {
 	Title string
 	// Render 负责写出页面主体 HTML（会被套入统一布局）。
 	Render func(w io.Writer, r *http.Request)
+	// ShowForms 可选地报告页面主体是否含表单；含表单的页面默认暂停 1s
+	// 自动刷新，避免用户输入被整页重载清空。为 nil 时按无表单处理。
+	ShowForms func(*http.Request) bool
 }
 
 // Options 是管理页构造参数。
@@ -223,9 +226,18 @@ func (s *Server) AddPage(p Page) {
 	s.mux.HandleFunc(page.Path, func(w http.ResponseWriter, r *http.Request) {
 		var buf bytes.Buffer
 		page.Render(&buf, r)
-		s.WriteHTML(w, r, template.HTML(buf.String()))
+		data := pageRenderData{forms: page.ShowForms != nil && page.ShowForms(r)}
+		s.WritePage(w, r, data, template.HTML(buf.String()))
 	})
 }
+
+// pageRenderData 把 Page.ShowForms 适配为布局所需的 FormReporter。
+type pageRenderData struct {
+	forms bool
+}
+
+// ShowForms 报告该页面是否含表单。
+func (d pageRenderData) ShowForms() bool { return d.forms }
 
 // Pages 返回已注册页面的副本。
 func (s *Server) Pages() []Page {

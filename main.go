@@ -9,12 +9,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/lsong98sh/pairlink/internal/agent"
 	"github.com/lsong98sh/pairlink/internal/client"
@@ -193,9 +195,10 @@ func serveAsWindowsService(mode config.Mode, cfg *config.Config) int {
 		return 1
 	}
 	logger, closer, err := logx.NewFileLogger(logPath, logx.Config{
-		Level:  cfg.Common.LogLevel,
-		Format: cfg.Common.LogFormat,
-		Mode:   string(mode),
+		Level:    cfg.Common.LogLevel,
+		Format:   cfg.Common.LogFormat,
+		Mode:     string(mode),
+		KeepDays: &cfg.Common.LogKeepDays,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
@@ -203,11 +206,20 @@ func serveAsWindowsService(mode config.Mode, cfg *config.Config) int {
 	}
 	defer closer.Close()
 
-	// Windows 服务没有控制台：把 stderr/stdout 一并指向日志文件，
-	// 这样各包内用 logx.New（默认写 os.Stderr）创建的 logger 也能落盘。
-	if f, ok := closer.(*os.File); ok {
-		os.Stderr = f
-		os.Stdout = f
+	// Windows 服务没有控制台：把 logx.New 的默认输出也指向日志文件，这样
+	// 各包内用 logx.New（Config.Output 为空）创建的 logger 同样落盘，并且
+	// 跟着日志文件一起按日期切换（不把 os.Stderr 钉死在某一天的文件上）。
+	if w, ok := closer.(io.Writer); ok {
+		logx.SetDefaultOutput(w)
+	}
+	// 裸 stderr（panic 栈、flag 解析错误等非 slog 输出）也要落盘：指向**当天**的
+	// 日文件。跨天后 stderr 仍指向启动当天的文件（panic 是致命路径，可接受）。
+	if p, derr := logx.DatedPath(logPath, time.Now()); derr == nil {
+		if f, ferr := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
+			os.Stderr = f
+			os.Stdout = f
+			defer f.Close()
+		}
 	}
 
 	logger.Info("服务模式启动",

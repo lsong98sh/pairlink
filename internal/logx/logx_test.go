@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewText(t *testing.T) {
@@ -76,8 +77,13 @@ func TestParseLevel(t *testing.T) {
 }
 
 func TestNewFileLogger(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "logs", "pairlink-relay.log")
-	log, closer, err := NewFileLogger(path, Config{Level: "info", Format: "text", Mode: "relay"})
+	dir := t.TempDir()
+	base := filepath.Join(dir, "logs", "pairlink-relay.log")
+	day := time.Date(2026, 11, 15, 9, 30, 0, 0, time.Local)
+	log, closer, err := NewFileLogger(base, Config{
+		Level: "info", Format: "text", Mode: "relay",
+		now: func() time.Time { return day },
+	})
 	if err != nil {
 		t.Fatalf("NewFileLogger 失败: %v", err)
 	}
@@ -85,6 +91,7 @@ func TestNewFileLogger(t *testing.T) {
 	if err := closer.Close(); err != nil {
 		t.Fatalf("关闭日志文件失败: %v", err)
 	}
+	path := filepath.Join(dir, "logs", "pairlink-relay-2026-11-15.log")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读取日志文件失败: %v", err)

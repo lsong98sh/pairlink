@@ -5,32 +5,80 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pion/dtls/v3"
 
 	"github.com/lsong98sh/pairlink/internal/logx"
 	"github.com/lsong98sh/pairlink/internal/pairing"
 	"github.com/lsong98sh/pairlink/internal/protocol"
 	"github.com/lsong98sh/pairlink/internal/registry"
+	"github.com/lsong98sh/pairlink/internal/udpdtls"
 )
 
 // UDPDataListener 是原生 UDP 数据面监听器（仅 udp_mode=native）。
 //
 // 单 goroutine 读循环：已登记端点直接按源地址反查转发；未知端点尝试按
 // MsgBind 数据报完成报到。绝不为每个数据报起 goroutine。
+//
+// v0.5.0 起默认在同一个 socket 上跑 DTLS-PSK：读循环只做「DTLS 记录头预筛 +
+// 按源地址投递到对端队列」，每个对端一个读 goroutine 做握手与解密，再交给
+// handleDatagram。udp_dtls = false 时保持 v0.4.0 的明文直通路径。
 type UDPDataListener struct {
 	srv  *server
 	conn *net.UDPConn
 	// lastAuthWarn 是上一次令牌校验失败 WARN 的 UnixNano（限速用）。
 	lastAuthWarn atomic.Int64
+	// lastDTLSWarn 是上一次 DTLS 握手失败 WARN 的 UnixNano（限速用）。
+	lastDTLSWarn atomic.Int64
+
+	// DTLS 状态（init 后只读，除了 peers/closed 由 mu 保护）。
+	initOnce         sync.Once
+	dtlsOn           atomic.Bool // DTLS 开关（init 发布，热路径无锁读）
+	dtlsCfg          *dtls.Config
+	handshakeTimeout time.Duration
+
+	mu        sync.Mutex
+	peers     map[registry.UDPEndpoint]*udpPeer
+	closed    bool
+	closeCh   chan struct{}
+	closeOnce sync.Once
+}
+
+// log 返回带 listen 属性的 UDP 数据面 logger。
+func (l *UDPDataListener) log() *slog.Logger {
+	return logx.Component(l.srv.log, "udp-data").With("listen", l.conn.LocalAddr().String())
 }
 
 // loop 是唯一读循环。
 func (l *UDPDataListener) loop() {
 	defer l.srv.wg.Done()
-	log := logx.Component(l.srv.log, "udp-data").With("listen", l.conn.LocalAddr().String())
-	buf := make([]byte, 65535)
+	l.init()
+	log := l.log()
+	if l.dtlsOn.Load() {
+		log.Info("原生 UDP 数据面使用 DTLS-PSK（DTLS 1.2 / AES-128-GCM）",
+			"event", "start", "udp_dtls", true,
+			"detail", "PSK = HKDF-SHA256(auth_token, salt=nil, info="+udpdtls.InfoPrefix+"pairing_key)")
+	} else {
+		log.Warn("原生 UDP 数据面按 v0.4.0 明文运行（udp_dtls = false）：业务数据与 pairing_token 可被链路上的人读取",
+			"event", "udp_dtls_disabled", "udp_dtls", false)
+	}
 
+	// 对端空闲清理：与唯一读循环同生命周期，loop 退出时 sweeper 必须退出，
+	// 否则 shutdown 的 wg.Wait 会等到超时。
+	done := make(chan struct{})
+	var sweeper sync.WaitGroup
+	sweeper.Add(1)
+	go func() {
+		defer sweeper.Done()
+		l.sweepLoop(done)
+	}()
+	defer sweeper.Wait()
+	defer close(done)
+
+	buf := make([]byte, protocol.MaxUDPDatagram)
 	for {
 		n, from, err := l.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -40,8 +88,72 @@ func (l *UDPDataListener) loop() {
 			l.srv.fail(fmt.Errorf("relay: UDP 数据面读取: %w", err))
 			return
 		}
+		if l.dtlsOn.Load() {
+			l.dispatchDTLS(buf[:n], from, log)
+			continue
+		}
 		l.handleDatagram(buf[:n], from, log)
 	}
+}
+
+// dispatchDTLS 把 DTLS 数据报按源地址投递给对应对端（必要时先建立对端）。
+//
+// 只在唯一读循环里调用：建对端/握手不会阻塞读循环（握手在独立 goroutine 里），
+// 队列满或非 DTLS 数据报直接丢弃。
+func (l *UDPDataListener) dispatchDTLS(data []byte, from *net.UDPAddr, log *slog.Logger) {
+	ep, err := registry.UDPEndpointFromNetAddr(from)
+	if err != nil {
+		log.Debug("丢弃非法 UDP 源地址", "event", "udp_evict", "err", err)
+		return
+	}
+
+	if p := l.lookupPeer(ep); p != nil {
+		p.touch()
+		if _, werr := p.conn.enqueue(data); werr != nil {
+			log.Debug("DTLS 对端接收队列已满，丢弃数据报",
+				"event", "udp_evict", "remote", ep.String(), "err", werr)
+		}
+		return
+	}
+
+	// 新对端：先用记录头预筛，把 v0.4.0 明文端与随机垃圾挡在握手之外。
+	if !looksLikeDTLSRecord(data) {
+		head := data
+		if len(head) > 8 {
+			head = head[:8]
+		}
+		l.warnDTLSFail(log, ep, "non_dtls",
+			fmt.Errorf("%w: len=%d head=% x", errUDPDTLSNotRecord, len(data), head))
+		return
+	}
+	p, err := l.startPeer(from, ep)
+	if err != nil {
+		l.warnDTLSFail(log, ep, "peer", err)
+		return
+	}
+	log.Debug("原生 UDP 数据面出现新对端，开始 DTLS 握手",
+		"event", "udp_dtls_peer", "remote", ep.String(), "len", len(data))
+	p.touch()
+	if _, werr := p.conn.enqueue(data); werr != nil {
+		log.Debug("DTLS 对端接收队列已满，丢弃数据报",
+			"event", "udp_evict", "remote", ep.String(), "err", werr)
+	}
+}
+
+// writeDatagram 把 data 发给指定端点。
+//
+// DTLS 模式必须经对端表的 DTLS Write（数据加密、按对端串行）；明文模式保持
+// v0.4.0 的直接 WriteToUDP。
+func (l *UDPDataListener) writeDatagram(ep registry.UDPEndpoint, data []byte) error {
+	if !l.dtlsOn.Load() {
+		_, err := l.conn.WriteToUDPAddrPort(data, ep.AddrPort())
+		return err
+	}
+	p := l.lookupPeer(ep)
+	if p == nil {
+		return errUDPDTLSPeerGone
+	}
+	return p.write(data)
 }
 
 // handleDatagram 在单读循环内同步处理一个数据报。
@@ -80,7 +192,7 @@ func (l *UDPDataListener) handleDatagram(data []byte, from *net.UDPAddr, log *sl
 		}
 
 		l.srv.udpTable.Touch(key, time.Now())
-		if _, err := l.conn.WriteToUDPAddrPort(data, peer.AddrPort()); err != nil {
+		if err := l.writeDatagram(peer, data); err != nil {
 			log.Debug("UDP 转发失败",
 				"event", "udp_evict",
 				"pairing_key", key.String(),
@@ -193,7 +305,7 @@ func (l *UDPDataListener) sendBindOK(ep registry.UDPEndpoint, key pairing.Pairin
 		log.Warn("编码 MsgBindOK 失败", "event", "internal", "err", err)
 		return
 	}
-	if _, err := l.conn.WriteToUDPAddrPort(bindOK, ep.AddrPort()); err != nil {
+	if err := l.writeDatagram(ep, bindOK); err != nil {
 		log.Debug("写 MsgBindOK 失败", "event", "bind_fail", "remote", ep.String(), "err", err)
 		return
 	}
@@ -228,9 +340,17 @@ func parseBindKey(data []byte) (pairing.PairingKey, bool) {
 	return key, true
 }
 
-// close 关闭 UDP 数据面监听。
+// close 关闭 UDP 数据面监听（同时回收全部 DTLS 对端）。
 func (l *UDPDataListener) close() {
-	if l.conn != nil {
-		_ = l.conn.Close()
-	}
+	l.init()
+	l.closeOnce.Do(func() {
+		close(l.closeCh)
+		if l.conn != nil {
+			_ = l.conn.Close()
+		}
+		l.mu.Lock()
+		l.closed = true
+		l.mu.Unlock()
+		l.closePeers()
+	})
 }

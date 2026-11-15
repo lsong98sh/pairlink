@@ -15,7 +15,19 @@ type navItem struct {
 	Title string
 }
 
+// FormReporter 由页面数据实现，用来报告页面主体是否含有表单。
+//
+// 含表单的页面默认暂停 1s 自动刷新（?refresh=1 可显式开启），避免用户正在
+// 输入的内容被整页重载清空。框架据此判断，**不再扫描生成后的 HTML**；未实现
+// 该接口的页面数据按"不含表单"处理。
+type FormReporter interface {
+	ShowForms() bool
+}
+
 // layoutData 是统一布局的渲染数据。
+//
+// 除 Body（页面主体，由各模式页面自行完成转义后以 template.HTML 嵌入）外，
+// 所有字段都是普通 string/bool，由布局模板自动转义。
 type layoutData struct {
 	Title     string
 	Mode      string
@@ -25,7 +37,7 @@ type layoutData struct {
 	RefreshOn bool
 	ToggleURL string
 	Writable  bool
-	Notice    template.HTML
+	Notice    notice
 	Nav       []navItem
 	Body      template.HTML
 }
@@ -105,29 +117,30 @@ const layoutHTML = `<!DOCTYPE html>
 {{if .Nav}}<nav>{{range .Nav}}<a href="{{.Path}}">{{.Title}}</a>{{end}}</nav>{{end}}
 <main>
 {{if not .Writable}}<div class="banner readonly">只读模式：manage_listen 绑定在非回环地址，出于安全考虑写操作已禁用</div>{{end}}
-{{.Notice}}
+{{template "notice" .Notice}}
 {{.Body}}
 </main>
-<footer>PairLink 管理页{{if .Writable}} · 写操作会先改运行时并写回 ini（保留注释与格式）{{else}}（只读） · 配置修改请编辑 ini 后重启进程{{end}}</footer>
+<footer>PairLink 管理页{{if .Writable}} · 写操作会先改运行时并写回该 ini（注释/排版可能归一），原子替换且权限不变{{else}}（只读） · 配置修改请编辑 ini 后重启进程{{end}}</footer>
 </body>
 </html>
 `
 
-// layoutTemplate 是预编译的页面骨架。
-var layoutTemplate = template.Must(template.New("layout").Parse(layoutHTML))
+// layoutTemplate 是预编译的页面骨架；notice 片段通过 define 复用，只解析一次。
+var layoutTemplate = template.Must(template.New("layout").Parse(
+	`{{define "notice"}}` + noticeMarkup + `{{end}}` + layoutHTML))
 
-// WriteHTML 把页面主体套入统一布局后写出。
+// WritePage 把页面主体套入统一布局后写出。
 //
-// 页面渲染函数应当只写主体 HTML（如 <section>…），布局负责 charset、样式、
-// 顶栏（mode / version / 运行时长）与自动刷新开关。
-//
-// 自动刷新默认值（P1-2）：只读页且页面内没有写表单时开启（1s）；**可写页或
-// 含 <form> 的页面默认暂停**——否则浏览器每秒整页重载会把用户正在输入的值清空。
-// 需要临时恢复刷新时点顶栏「开启自动刷新」（?refresh=1），或用 ?refresh=0 强制关闭。
-func (s *Server) WriteHTML(w http.ResponseWriter, r *http.Request, pageBody template.HTML) {
-	hasForm := bytes.Contains([]byte(pageBody), []byte("<form"))
+// data 是页面自己的数据：若实现 FormReporter，则其 ShowForms 决定默认是否
+// 注入 1s 自动刷新。整页先渲染到内存缓冲，成功后才写响应；渲染失败返回 500
+// 且不会写出半截页面。
+func (s *Server) WritePage(w http.ResponseWriter, r *http.Request, data any, pageBody template.HTML) {
+	hasForm := false
+	if fr, ok := data.(FormReporter); ok {
+		hasForm = fr.ShowForms()
+	}
 	refresh := refreshOn(r, s.writable, hasForm)
-	data := layoutData{
+	layout := layoutData{
 		Title:     s.opts.Title,
 		Mode:      s.opts.Mode,
 		Version:   s.opts.Version,
@@ -136,16 +149,52 @@ func (s *Server) WriteHTML(w http.ResponseWriter, r *http.Request, pageBody temp
 		RefreshOn: refresh,
 		ToggleURL: toggleRefreshURL(r, refresh),
 		Writable:  s.writable,
-		Notice:    NoticeBar(r),
+		Notice:    noticeFor(r),
 		Nav:       s.navItems(),
 		Body:      pageBody,
+	}
+	var buf bytes.Buffer
+	if err := layoutTemplate.Execute(&buf, layout); err != nil {
+		s.renderFailed(w, r, err)
+		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	if err := layoutTemplate.Execute(w, data); err != nil {
-		s.log.Warn("管理页渲染失败", "event", "admin_render_error", "path", r.URL.Path, "err", err)
+	_, _ = w.Write(buf.Bytes())
+}
+
+// WriteHTML 把页面主体套入统一布局后写出（兼容入口）。
+//
+// 该入口只拿到最终 HTML，无法得知页面是否含表单。为保持原有行为：可写模式
+// 本就默认暂停刷新；只读模式按"不含表单"处理（框架只在可写模式渲染写表单，
+// 只读页面默认 1s 刷新）。需要按页面数据精确控制时使用 WritePage 并让数据
+// 实现 FormReporter（AddPage 则见 Page.ShowForms）。
+func (s *Server) WriteHTML(w http.ResponseWriter, r *http.Request, pageBody template.HTML) {
+	s.WritePage(w, r, legacyPage{forms: s.writable}, pageBody)
+}
+
+// legacyPage 是 WriteHTML 兼容入口的表单声明：可写页按含表单保守处理，只读页
+// 按不含表单处理，从而不改变既有页面的默认刷新行为。
+type legacyPage struct {
+	forms bool
+}
+
+// ShowForms 报告该兼容页面是否按含表单处理。
+func (p legacyPage) ShowForms() bool { return p.forms }
+
+// renderFailed 记录渲染失败并返回 500；此时整页尚未写出，不会留下半截页面。
+func (s *Server) renderFailed(w http.ResponseWriter, r *http.Request, err error) {
+	path := ""
+	if r != nil && r.URL != nil {
+		path = r.URL.Path
 	}
+	s.log.Error("管理页渲染失败",
+		"event", "admin_render_failed",
+		"path", sanitizeLog(path),
+		"err", sanitizeLog(fmt.Sprint(err)),
+	)
+	http.Error(w, "管理页渲染失败", http.StatusInternalServerError)
 }
 
 // navItems 返回顶栏导航（首页 + 已注册页面）。
@@ -165,8 +214,8 @@ func (s *Server) navItems() []navItem {
 // refreshOn 报告当前请求是否注入 1s 自动刷新（P1-2）。
 //
 // 优先级：显式 ?refresh=0 / ?refresh=1 > 页面默认值。
-// 默认值：可写页（Writable=true）或页面里含写表单时**暂停**（否则输入的内容每秒
-// 被整页重载清空），只读页保持 1s 刷新。
+// 默认值：可写页（Writable=true）或页面数据声明含表单（FormReporter）时暂停
+// （否则输入的内容每秒被整页重载清空），只读页保持 1s 刷新。
 func refreshOn(r *http.Request, writable, hasForm bool) bool {
 	if r != nil {
 		switch r.URL.Query().Get("refresh") {

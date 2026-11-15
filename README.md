@@ -7,7 +7,7 @@ PairLink 是一个**协议无关的字节流中转**：同一套系统可以承�
 数据库、自定义 TCP/UDP 服务，中继不解析也不终止上层协议（HTTPS/SSH 的端到端加密由
 第三方客户端与真实服务自行完成，中继透明转发）。
 
-- 版本：`v0.4.0`
+- 版本：`v0.5.0`
 - 许可证：Apache-2.0
 - 语言：Go 1.24.4，单二进制三模式
 - 唯一第三方依赖：`golang.org/x/sys`（Windows 服务 SCM）
@@ -50,9 +50,10 @@ graph LR
   配对信息下发、心跳、错误、踢出。
 - **TCP 数据面**（`tcp_listen`）：纯字节流。连接建立瞬间只发一帧 `MsgBind`（配对键+令牌），
   之后双向 `io.Copy` 原样透传；**relay 在配对成功前不写任何字节**。
-- **UDP 数据面**（`udp_listen`，可选）：配置了就走原生 UDP——首个数据报是 `MsgBind`，
-  relay 记录两侧 `(IP,Port)` 建立会话映射，之后按源地址反查配对键转发数据报；
-  未配置则复用 `tcp_listen`，UDP 数据报封装进 UDP 隧道帧（见 §3.4）。
+- **UDP 数据面**（`udp_listen`，可选）：配置了就走原生 UDP——**v0.5.0 起默认由 DTLS-PSK 包住**
+  （`udp_dtls = true`）：DTLS 会话建立后，首个内层数据报是 `MsgBind`，relay 记录两侧 `(IP,Port)`
+  建立会话映射，之后按源地址反查配对键转发数据报；未配置则复用 `tcp_listen`，UDP 数据报封装进
+  UDP 隧道帧（见 §3.4）。
 - 详细协议见 [`docs/protocol.md`](docs/protocol.md)，架构与并发模型见
   [`docs/architecture.md`](docs/architecture.md)，阶段 2 契约见 [`docs/contract.md`](docs/contract.md)。
 
@@ -166,10 +167,21 @@ UDP-over-TCP 承载帧）全部走 TLS，`pairing_token` 不再明文；证书�
 | `true` | 强制 TLS；缺证书对 → 启动校验失败 | 必须 TLS；relay 未启用 → 拨号永久失败（可读错误） |
 | `false` | 强制明文（即使隧道 TLS），启动 WARN | 强制明文；relay 要求 TLS → 明确报错，不静默降级 |
 
-`udp_mode = native` 时原生 UDP 数据面**没有 DTLS，仍是明文**；需要加密 UDP 请改用
-`udp_mode = tcp_tunnel`（承载在 TCP 数据面上，随 `data_tls` 一起加密）。启用数据面 TLS 要求
-relay/agent/client 三端 ≥ v0.4.0：旧端忽略 `HelloOK.data_tls`，会以明文连 TLS 端口并握手失败，
-relay 记录 `data_plane_tls_handshake_fail` WARN 便于定位。
+**原生 UDP 数据面的加密（v0.5.0，SEC-D3）**：`udp_mode = native` 时默认 `udp_dtls = true`，
+UDP 数据面外层是 **DTLS 1.2 + PSK**（`TLS_PSK_WITH_AES_128_GCM_SHA256`）：
+
+- PSK = `HKDF-SHA256(auth_token, info="pairlink-udp-dtls/v1|" + pairing_key)`，客户端把
+  `pairing_key` 作为 PSK identity 发出，relay 按同一公式派生；identity 不认识的握手直接失败。
+- 内层仍是原来的 `len(4B)|sess_len(1B)|session|payload` 帧与 `MsgBind` 握手，**鉴权逻辑不变**；
+  DTLS 只负责"证明对端持有 `auth_token`" + 机密性 + 完整性 + 重放保护。
+- 效果：链路上的第三方既读不到 UDP 业务数据与 `pairing_token`，也无法伪造源地址注入数据报。
+- **三端必须一致**：v0.4.0 及更早的对端不认 DTLS，握手失败（relay 记
+  `udp_dtls_handshake_fail` WARN）；混跑期间把三端一起设 `udp_dtls = false`，并接受明文风险
+  （启动会 WARN）。
+
+启用 TCP 数据面 TLS（`data_tls`）要求 relay/agent/client 三端 ≥ v0.4.0：旧端忽略
+`HelloOK.data_tls`，会以明文连 TLS 端口并握手失败，relay 记录 `data_plane_tls_handshake_fail`
+WARN 便于定位。
 
 ### 3.4 UDP 数据面承载模式与取舍
 
@@ -224,6 +236,12 @@ tunnel_listen     = 0.0.0.0:7000
 tcp_listen        = 0.0.0.0:7001
 ; udp_listen 可选：配置则走原生 UDP；留空/删除则 UDP 数据面走 TCP 隧道（省一个公网端口）
 udp_listen        = 0.0.0.0:7002
+; 原生 UDP 数据面的传输层加密：true（默认，DTLS 1.2 + PSK，v0.5.0）| false（明文，仅过渡用）
+; 三端必须一致
+udp_dtls          = true
+; 按来源 IP 的配对令牌签发限速（令牌桶）；0 = 不限制
+token_rate_per_ip = 10
+token_burst_per_ip = 30
 ; 三态开关：auto（默认，按证书推断）| true（强制 TLS）| false（强制明文）
 tls               = true
 tls_cert          = /etc/pairlink/cert.pem
@@ -321,7 +339,8 @@ udp_session_timeout = 60s
 - `[section]` 段名大小写不敏感；同名段重复出现会合并；
 - 同一段内重复键**后者覆盖**（`service.<ID>` 也是后者覆盖且保留首次出现的位置）；
 - 未知段、未知键**不报错**，只在启动时打印警告（`event=config_warning`）；
-- 值不做引号/转义处理，直接取字符串；
+- 值不做引号/转义处理，直接取字符串（v0.5.0 起改用 `gopkg.in/ini.v1` 解析：以 `"""` 或反引号
+  `` ` `` 开头的值按库的"带引号值"语义处理，行尾 `\` **不**续行；其余不变，值两侧空白会被裁剪）；
 - 证书/CA 路径支持 `/` 分隔符，**相对路径相对于 ini 文件所在目录**解析为绝对路径
   （服务模式下工作目录不是 exe 目录，这一点很重要）。
 
@@ -346,6 +365,9 @@ udp_session_timeout = 60s
 | `tls_key` | 路径 | `tls=true` 时是 | 空 | 隧道 TLS 私钥；`tls = true` 时必须与 `tls_cert` 成对 |
 | `data_tls` | enum | 否 | `auto` | TCP 数据面 TLS 三态：`auto`（跟随隧道 TLS，启用则数据面也 TLS）/ `true`（强制 TLS，复用 `tls_cert`/`tls_key`，缺证书对启动失败）/ `false`（强制明文，即使隧道 TLS，启动 WARN）；只接受 `auto`/`true`/`false`。原生 UDP 不受影响（SEC-T1） |
 | `auth_token` | string | 公网**是** | 空 | agent/client 接入密钥。**为空时只允许回环来源**（`127.0.0.0/8`、`::1`）接入，非回环一律 `auth_failed`（SEC-A1）；非回环 `tunnel_listen` + 空 token 直接启动校验失败。公网请用 `openssl rand -hex 32` 生成 |
+| `udp_dtls` | bool | 否 | `true` | 原生 UDP 数据面（`udp_listen`）的 DTLS-PSK 加密开关（v0.5.0，只接受 `true`/`false`）。`true`：DTLS 1.2 + `TLS_PSK_WITH_AES_128_GCM_SHA256`，PSK = `HKDF(auth_token, "pairlink-udp-dtls/v1|" + pairing_key)`；`false`：退回 v0.4.0 明文并启动 WARN。三端必须一致（§3.4） |
+| `token_rate_per_ip` | int | 否 | `10` | 单个来源 IP 每秒可签发的配对令牌数（令牌桶速率）；`0` = 不限制。超限不签发并记 `event=token_rate_limited` |
+| `token_burst_per_ip` | int | 否 | `30` | 单个来源 IP 的签发突发上限；`token_rate_per_ip = 0` 时忽略；`rate > 0` 时必须 ≥ 1 |
 | `pair_timeout` | duration | 否 | `10s` | 待配对表占位超时 / 数据面报到读帧超时（可在管理页修改） |
 | `idle_timeout` | duration | 否 | `300s` | TCP 数据面空闲超时（无流量即断开）（可在管理页修改） |
 | `heartbeat_timeout` | duration | 否 | `90s` | 控制面无心跳判死时间（可在管理页修改） |
@@ -371,6 +393,7 @@ udp_session_timeout = 60s
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过 relay 证书校验（仅测试，启动 WARN） |
 | `data_tls` | enum | 否 | `auto` | 数据面 TLS 三态：`auto`（跟随 `HelloOK.data_tls`；旧 relay 未下发则明文 + WARN）/ `true`（必须 TLS，relay 未启用时拨号永久失败）/ `false`（强制明文，relay 要求 TLS 时明确报错，不静默降级）；复用 `tls_ca`/`tls_insecure_skip_verify` 与 `minVersion TLS 1.2` |
 | `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
+| `udp_dtls` | bool | 否 | `true` | 原生 UDP 数据面的 DTLS-PSK 开关（v0.5.0）；**必须与 relay 一致**。`false` 时与 v0.4.0 明文互通，实际部署应保持 `true` |
 | `dial_timeout` | duration | 否 | `10s` | 连接 relay / 本地目标超时 |
 | `udp_session_timeout` | duration | 否 | `60s` | agent 侧本地 UDP 会话空闲清理 |
 | `reconnect` | bool | 否 | `true` | 控制连接断开后是否自动重连（指数退避：1s 起、每次 ×2、上限 `reconnect_max_backoff`、±20% 抖动）；`false` = 阶段 6C 之前的旧行为（断开即 `Run` 返回错误，由守护进程重启） |
@@ -387,6 +410,7 @@ udp_session_timeout = 60s
 | `tls_ca` | 路径 | 否 | 空 | 校验 relay 证书的 CA；`tls = auto` 时为空且未开 `tls_insecure_skip_verify` 则走**明文**，`tls = true` 时为空则用**系统根证书**校验（见 §7.1） |
 | `tls_insecure_skip_verify` | bool | 否 | `false` | 跳过证书校验（仅测试，启动 WARN） |
 | `data_tls` | enum | 否 | `auto` | 数据面 TLS 三态：`auto`（跟随 `HelloOK.data_tls`；旧 relay 未下发则明文 + WARN）/ `true`（必须 TLS，relay 未启用时拨号永久失败）/ `false`（强制明文，relay 要求 TLS 时明确报错，不静默降级）；复用 `tls_ca`/`tls_insecure_skip_verify` 与 `minVersion TLS 1.2` |
+| `udp_dtls` | bool | 否 | `true` | 原生 UDP 数据面的 DTLS-PSK 开关（v0.5.0）；**必须与 relay 一致**。`false` 时与 v0.4.0 明文互通，实际部署应保持 `true` |
 | `heartbeat` | duration | 否 | `30s` | 控制面心跳间隔 |
 | `subscribe` | bool | 否 | `true` | 是否订阅服务列表变更 |
 | `dial_timeout` | duration | 否 | `10s` | 连接 relay / 数据面超时 |
@@ -475,9 +499,12 @@ service.ssh = :2222
 - 顶栏显示模式、版本、运行时长与刷新开关。**只读页默认 1 秒自动刷新**；
   **可写页（回环 `manage_listen`）或含写表单的页面默认暂停刷新**，避免整页重载清空正在输入的值（P1-2）；
   点右上角「开启自动刷新」即可临时恢复（`?refresh=1`），`?refresh=0` 强制关闭。
-- **持久化**：写操作同时改运行时并**写回 ini**。ini 补丁只替换目标键的值，**保留注释、空行、
-  键顺序、对齐与换行风格**（LF/CRLF），按行插入/删除键，同目录临时文件 + `Rename` 原子替换并
-  保留权限位；不支持跨行值与行尾注释（值中的 `;`/`#` 属于值本身）。
+- **持久化**：写操作同时改运行时并**写回 ini**。写回用 `gopkg.in/ini.v1` 读取后**重新生成整份
+  文件**，因此**会重写该 ini**：注释尽量保留，但空行、键顺序、`=` 对齐、LF/CRLF、键名大小写、
+  重复键/重复段的写法都可能被归一（换行统一为 LF，文件以换行结尾）；保证的是**原子替换**
+  （同目录临时文件 + `Rename` + 父目录 `fsync`）**与权限位不变**，且写回后能重新 `Load` 到目标值。
+  仍**不支持行尾注释**（值中的 `;`/`#` 属于值本身），值两侧空白会被裁剪；含段前键值或
+  `[DEFAULT]`/`[default]` 段的文件会拒绝写回。
   写回要求 **ini 所在目录对服务进程可写**（临时文件 + `rename` 必须能建/改名）：
   - systemd 启用 `User=pairlink` 时，`/etc/pairlink` 需 `2775`（或 `chown -R pairlink:pairlink`），
     且 unit 里必须放行 `ReadWritePaths=/etc/pairlink`（`ProtectSystem=strict` 下默认只读，P1-1）；
@@ -530,9 +557,10 @@ service.ssh = :2222
 4. **数据面 TLS（SEC-T1，阶段 8D）**：`data_tls` 三态默认 `auto`——隧道启用 TLS 时 TCP 数据面
    自动加密（`MsgBind`、`pairing_token`、业务字节与 UDP-over-TCP 承载帧都在 TLS 内），relay
    复用隧道证书、agent/client 复用 `tls_ca` 与 `minVersion TLS 1.2`。`false` 强制明文会 WARN；
-   两端不匹配时握手失败并给出可读错误（不静默降级）。**原生 UDP（`udp_mode = native`）没有
-   DTLS，仍是明文**，公网/多租户建议改用 `udp_mode = tcp_tunnel`。HTTPS/SSH 等端到端加密仍应
-   由业务自身完成，relay 始终是哑管道、不解密。
+   两端不匹配时握手失败并给出可读错误（不静默降级）。**原生 UDP（`udp_mode = native`）
+   自 v0.5.0 起默认由 DTLS-PSK 加密**（`udp_dtls = true`，见 §3.3/§10.1 第 20 条），
+   只有显式 `udp_dtls = false` 或与 v0.4.0 老端混跑时才回到明文（启动 WARN）。
+   HTTPS/SSH 等端到端加密仍应由业务自身完成，relay 始终是哑管道、不解密。
 5. **管理页无鉴权**：只监听 `127.0.0.1`；不要 `0.0.0.0:9000` 直接暴露。写 Action 另有
    Host/Origin 回环校验 + 一次性 CSRF（SEC-M1）；所有响应带 CSP/X-Frame-Options/nosniff。
 6. **日志（SEC-M2）**：不打印 `pairing_token` 明文；`auth_token` 也不打印。来自对端的字符串
@@ -607,7 +635,7 @@ sudo journalctl -u pairlink-relay -f
 ```
 
 - 每个脚本只操作 `pairlink-<mode>` 一个服务；服务名固定、启动类型自动；
-- 日志在 **exe 同目录的 `pairlink-<mode>.log`**；`-Config` 解析为绝对路径；
+- 日志在 **exe 同目录的 `pairlink-<mode>-YYYY-MM-DD.log`**（按日期分文件，`log_keep_days` 默认保留 7 天，0 = 永久）；`-Config` 解析为绝对路径；
 - `-NoStart` 只注册不启动；服务已存在默认提示，`-Force` 才 stop+uninstall+重装；
 - 查看：`sc.exe query pairlink-relay` / `Get-Service pairlink-relay`；
 - 非管理员会被 `#Requires -RunAsAdministrator` 直接拦截；详见 `deploy/windows/README.md`。
@@ -660,8 +688,16 @@ docker compose -f deploy/docker-compose.yml down
   重连 `reconnect_scheduled`/`reconnect_ok`/`reconnect_failed`、
   本地监听热切换 `listen_hot_switch`、隧道发送队列丢弃 `tunnel_drop`、
   原生 UDP 重复报到帧丢弃 `bind_dup_drop`（阶段 6C 新增）。
-- **Windows 服务模式**：日志文件为 exe 同目录的 `pairlink-<mode>.log`（追加写）；
-  标准输出/错误也重定向到该文件，保证所有日志落盘。
+- **按日期分文件（v0.5.0）**：`log_path` 视为**基名**，实际写 `<base>-YYYY-MM-DD<ext>`，
+  日期取**本地时区**：`/var/log/pairlink/relay.log` → `relay-2026-11-15.log`；
+  无扩展名时 `C:\Logs\relay` → `relay-2026-11-15`。写入时发现日期变化就关闭旧文件、
+  打开新文件（多 goroutine 安全，不丢行）；**不做体积切割**，单文件体积上限仍需 logrotate。
+- **保留 N 天**：`[common] log_keep_days`（默认 `7`，`0` = 永久保留，负数启动校验失败）。
+  启动与每次跨天切换时清理同目录、同基名且日期早于 `today - log_keep_days` 的日文件；
+  只删严格匹配 `<base>-YYYY-MM-DD[.ext]` 的文件（`other-2026-01-01.log`、原始 `relay.log`、
+  日期格式非法的文件一律不动）；删除失败（Windows 文件被占用等）只 WARN，不影响服务。
+- **Windows 服务模式**：日志文件为 exe 同目录的 `pairlink-<mode>-YYYY-MM-DD.log`；
+  各包内 `logx.New` 的默认输出也指向同一个日文件（`logx.SetDefaultOutput`），保证日志落盘。
 - 前台模式：日志输出到标准错误（text）或标准输出 JSON，交给 systemd/容器收集。
 
 ---
@@ -696,15 +732,16 @@ docker compose -f deploy/docker-compose.yml down
    （relay 会改发全量 `ServiceList` 兜底，见 §3.2）。
 7. **管理页无账号鉴权，写能力仅限回环**：`manage_listen` 绑定 `127.0.0.0/8`、`::1`、`localhost` 时页面可写，
    绑定 `0.0.0.0`/`::` 时只读且所有写 Action 返回 403。可写时表单仍受一次性 CSRF 保护，
-   写操作会同时更新运行时并写回 ini；ini patch 保留注释、空行、键顺序、对齐与换行风格，但
-   **不支持跨行值、行尾注释**（值中的 `;`/`#` 属于值本身）**与同名段/重复键之外的复杂结构**；
+   写操作会同时更新运行时并写回 ini；**写回会重写该 ini 文件**（注释与原有排版可能丢失/归一，
+   换行统一为 LF），但保证原子替换、权限位不变、写回后仍能 `Load`；**不支持行尾注释**（值中的
+   `;`/`#` 属于值本身）与跨行值，含段前键值或 `[DEFAULT]`/`[default]` 段的文件拒绝写回；
    同一 ini 被其它进程或编辑器同时修改时**后写覆盖先写**。页面自动刷新：只读页 1s，
    可写页/含表单页默认暂停（`?refresh=1` 恢复、`?refresh=0` 强制关闭），间隔 1s 不可配置。
 8. **relay 状态全在内存**：重启后服务注册与配对关系丢失，agent/client 需要重启恢复。
 9. **单 relay 进程**：没有集群/多活；relay 是单点。
-10. **数据面 TLS 默认跟随隧道，原生 UDP 仍无 DTLS（见第 19 条）**：启用隧道 TLS 后 TCP 数据面
-    默认也加密（`data_tls = auto`）；但 `udp_mode = native` 的原生 UDP 数据面没有 DTLS，
-    仍是明文，公网 UDP 场景请改用 `udp_mode = tcp_tunnel`。
+10. **数据面默认加密（TCP `data_tls` 跟随隧道，原生 UDP 自 v0.5.0 默认 DTLS）**：启用隧道 TLS 后 TCP 数据面
+    默认也加密（`data_tls = auto`）；`udp_mode = native` 的原生 UDP 数据面自 v0.5.0 起
+    默认由 DTLS-PSK 加密（`udp_dtls = true`）；两者都显式设 `false` 时才是明文（启动 WARN）。
 11. **Linux 已在真机（WSL2 Ubuntu）验证**：阶段 6A 起在 WSL2 的 Ubuntu 26.04
     （`go1.24.4 linux/amd64` / `gcc 15.2` / `CGO_ENABLED=1`）上跑通了全量单测、`-race`
     （真跑，非 `CGO_ENABLED=0` 降级）与真实三进程端到端（HTTP / TCP echo / UDP 两种承载 /
@@ -712,7 +749,7 @@ docker compose -f deploy/docker-compose.yml down
     详见 §13.15。systemd 真实托管已由阶段 6D 在 WSL2 验证（见 §13.16）；仍未覆盖非 loopback 多网卡、长时间 soak、非 root `User=pairlink` 运行。
 12. **Windows 服务未做完整生命周期验证**：本机非管理员，只验证了 `-service install` 的
     "需要管理员权限"错误路径与服务命名 `pairlink-<mode>`；install→start→stop→uninstall
-    的实际 SCM 状态、`pairlink-<mode>.log` 落盘需管理员环境复核。阶段 6F 已把脚本拆为
+    的实际 SCM 状态、`pairlink-<mode>-YYYY-MM-DD.log` 落盘（按日期分文件）需管理员环境复核。阶段 6F 已把脚本拆为
     `deploy/windows/install-{relay,agent,client}.ps1`（每个只操作自己的服务），
     但真实 SCM 生命周期仍需管理员环境复核。
 13. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；广域网下的
@@ -735,8 +772,9 @@ docker compose -f deploy/docker-compose.yml down
 
 ### 10.1 阶段 8C/8D 深层风险：已修复项与仍在范围的 SEC-D3
 
-SEC-T1（数据面 TLS）与 SEC-A2（服务名归属）在 **v0.4.0 / 阶段 8D 已修复**，下面保留历史记录
-并写清启用方式与残差；SEC-D3（原生 UDP 会话反伪造）仍未修复。
+SEC-T1（数据面 TLS）与 SEC-A2（服务名归属）在 **v0.4.0 / 阶段 8D 已修复**；
+SEC-D3（原生 UDP 会话反伪造）在 **v0.5.0 已修复**（DTLS-PSK，见第 20 条）。
+下面保留历史记录并写清启用方式与残差。
 
 19. **SEC-T1（High）：数据面 TLS —— 已修复（v0.4.0）**
     - **启用方式**：`[relay] tls = true`（或 `auto` + `tls_cert`/`tls_key`）时，`data_tls = auto`
@@ -746,19 +784,27 @@ SEC-T1（数据面 TLS）与 SEC-A2（服务名归属）在 **v0.4.0 / 阶段 8D
     - **失败语义**：`data_tls = true` 缺证书对 → relay 启动校验失败；本端 `true` 而 relay 未启用
       → 拨号永久失败；本端 `false` 而 relay 要求 TLS → 明确报错，不静默降级；明文连接打到
       TLS 数据面 → 握手失败 + relay `data_plane_tls_handshake_fail` WARN。
-    - **仍存在的边界**：原生 UDP（`udp_mode = native`）无 DTLS，仍是明文；relay 仍是哑管道，
-      不会替上层做端到端加密（HTTPS/SSH 仍应端到端启用）。启用数据面 TLS 要求三端 ≥ v0.4.0。
-20. **SEC-D3（Medium）：原生 UDP 会话可被源地址伪造/抢注**
-    - **现状**：`Bind` 只凭一次性令牌 + 配对键绑定会话，之后按源 IP:端口识别端点；
-      同一 NAT 后的攻击者或能嗅探令牌的链路攻击者，可在令牌有效期内抢先以受害者配对键
-      报到（会话抢注/源地址漂移），或伪造数据报注入会话。
-    - **临时缓解**：① 令牌 TTL 默认 15s，缩短可减小窗口（`token_ttl`）；② 对 UDP 服务
-      优先使用应用层鉴权（如 WireGuard 的 cookie、DTLS）；③ 对来源不稳定的场景改用
-      `udp_mode = tcp_tunnel`（TCP 三次握手 + 隧道/数据面 TLS，天然抗源地址伪造）；
-      ④ 公网部署给 `udp_listen` 加 ACL/限速。
-    - **计划（v0.4.x）**：引入 UDP 会话 cookie（HMAC(源地址, 密钥) 挑战-应答）或
-      QUIC/DTLS 类握手，把"源地址"纳入会话凭证；同时评估 `max_conns_per_ip` 之外的
-      UDP 每源配额。
+    - **仍存在的边界**：relay 仍是哑管道，不会替上层做端到端加密（HTTPS/SSH 仍应端到端启用）；
+      原生 UDP 数据面的加密见第 20 条（v0.5.0 起默认 DTLS）。启用 TCP 数据面 TLS 要求三端 ≥ v0.4.0。
+20. **SEC-D3（Medium）：原生 UDP 会话源地址伪造/抢注 —— 已修复（v0.5.0）**
+    - **原问题**：`Bind` 只凭一次性令牌 + 配对键绑定会话，之后按源 IP:端口识别端点；
+      能嗅探令牌或与受害者同 NAT 的攻击者可在令牌有效期内抢先报到（会话抢注/源地址漂移），
+      或伪造数据报注入既有会话。
+    - **修复方式**：`udp_mode = native` 时默认 `udp_dtls = true`，UDP 数据面外层为
+      **DTLS 1.2 + PSK**（`TLS_PSK_WITH_AES_128_GCM_SHA256`），
+      PSK = `HKDF-SHA256(auth_token, info="pairlink-udp-dtls/v1|" + pairing_key)`；
+      `pairing_key` 作为 PSK identity 在握手中发送。**没有 `auth_token` 的攻击者无法完成握手**
+      （算不出 PSK），因此既不能抢注会话也不能注入数据报；DTLS 还提供机密性、完整性、
+      重放窗口（`ReplayProtectionWindow` 默认 64）。
+    - **残差与前提**：① 三端必须一致且 ≥ v0.5.0；v0.4.0 老端发明文会被丢弃（relay 记
+      `udp_dtls_handshake_fail` 限流 WARN）。混跑期显式 `udp_dtls = false`，此时回到
+      v0.4.0 明文行为并启动 WARN。② `auth_token` 仍是**集群共享密钥**，持有它的 agent/client
+      之间不互相隔离（与 TCP 数据面 `data_tls` 同一信任模型）；需要按服务隔离请叠加应用层鉴权。
+      ③ DTLS 记录层受 MTU 约束：接近/超过路径 MTU 的大数据报会被 IP 分片，丢一片即整报丢失；
+      需要大报文请用 `udp_mode = tcp_tunnel`。④ PSK 由 `auth_token` 派生，轮换 `auth_token`
+      会同时影响控制面、TCP 数据面与 UDP 数据面（三端需一起换）。
+    - **仍建议**：令牌 TTL 保持默认 15s 或更短；公网给 `udp_listen` 加 ACL；对来源极不稳定的
+      场景用 `udp_mode = tcp_tunnel`。
 21. **SEC-A2（High）：服务名归属 —— 已修复（v0.4.0）**
     - **启用方式**：`[relay] service_allow = web,ssh,default` 显式列出允许的服务名；
       `max_services_per_agent`（默认 64）限制单 agent 服务数。`RegisterService` 依序校验
@@ -800,13 +846,14 @@ pairlink/
 ├── test/                    # e2e / 真实二进制 / examples / soak 测试
 └── internal/
     ├── config/              # ini 解析 + 默认值 + 按模式校验
-    ├── logx/                # slog 封装 + 文件日志
+    ├── logx/                # slog 封装 + 文件日志 + 按日切割/保留（v0.5.0）
+    ├── udpdtls/             # 原生 UDP DTLS-PSK 参数与派生（三端共用）
     ├── protocol/            # 帧编解码 + 消息结构体
     ├── token/               # 一次性配对令牌
     ├── pairing/             # PairingKey + PairingTable
     ├── registry/            # ServiceRegistry / AgentRegistry / UDPTable
     ├── forward/             # Bidirectional / WithIdleTimeout / JoinContext
-    ├── admin/               # 管理页框架 + CSRF + pprof
+    ├── admin/               # 管理页框架 + html/template 布局 + CSRF + pprof
     ├── service/             # Windows 服务集成
     ├── version/             # 唯一版本号常量（main 与三模式管理页共用）
     ├── reconnect/           # 指数退避 + 抖动 + 可取消等待（阶段 6C）
@@ -835,6 +882,26 @@ GOOS=linux go test -c -tags soak -o /tmp/soak_linux.test ./test
 
 协议与状态机的细节以 [`docs/protocol.md`](docs/protocol.md) 为准；
 阶段 2 的 relay/agent/client 只能改各自的目录，其余包已冻结（见 [`docs/contract.md`](docs/contract.md)）。
+
+### 12.1 第三方依赖与引入理由
+
+原则（`task.md` §7.1）：**优先标准库；引入第三方库必须说明理由**。当前全部依赖如下
+（`go.mod` 里只有这些，没有隐藏传递依赖）：
+
+| 模块 | 用途 | 为什么不用标准库 | 范围 |
+| --- | --- | --- | --- |
+| `golang.org/x/sys` | Windows 服务 SCM（`svc`）、Unix `fsync` 目标平台调用 | 标准库无 SCM API | 运行期 |
+| `gopkg.in/ini.v1` | ini 解析与写回（v0.5.0 起） | 自研行级补丁维护成本高、边界多；接受"写回重写整份文件"的代价换取可靠解析 | 运行期 |
+| `github.com/pion/dtls/v3` | 原生 UDP 数据面的 DTLS 1.2 + PSK（v0.5.0 起） | 标准库只有流式 TLS，没有 DTLS；自研 cookie/HMAC 等于自制密码协议，风险更高 | 运行期 |
+| `github.com/pion/transport/v4` | 单 UDP 端口的多 peer 分发（`udp.Listen`，DTLS 的传递依赖） | 标准库无按源地址分发的 `net.PacketConn` | 运行期 |
+| `github.com/pion/logging` | `pion/dtls` 的日志接口（传递依赖） | — | 运行期 |
+| `golang.org/x/crypto` | `hkdf` 派生 UDP 数据面 PSK（`pion/dtls` 的依赖） | 标准库无 HKDF（`crypto/hkdf` 在 Go 1.24 尚未进入标准库） | 运行期 |
+| `golang.org/x/time` | `rate` 令牌桶，relay 按 IP 限制签发 | 标准库无令牌桶 | 运行期 |
+| `go.uber.org/goleak` | 测试期 goroutine 泄漏判定 | 自研 `NumGoroutine` 计数容差会误报 | **仅测试** |
+
+引入新依赖的门槛：必须在上表登记理由、说明对二进制体积的影响、确认 `go vet`/测试覆盖；
+**禁止**为"用起来顺手"引入 Web 框架、ORM、日志框架、工具库集合。渲染用 `html/template`、
+日志用 `log/slog`、CLI 用 `flag`、配置以外的格式一律不引入。
 
 ## 13. 端到端验证
 
@@ -894,7 +961,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
 | 7 | task2：配置 `udp_listen` 时走原生 UDP | `TestE2EUDPModeNative` | **PASS**：relay 管理页显示 `UDP 承载模式 = native`，UDP 会话表为 `native`，数据不经过 TCP 承载 |
 | 8 | task2：`udp_mode` 在三处下发 | `TestE2EUDPModeNegotiation` | **PASS**：`HelloOK`、`ServiceRegistered`、`ServiceList` 的 `udp_mode` 在 native 与 tcp_tunnel 两种模式下都与 relay 判定一致；`tcp_data_port > 0`，native 的 `udp_data_port > 0`，tcp_tunnel 为 0 |
 | 9 | 三种模式管理页 + pprof | `TestE2EAdminPagesThreeModes` | **PASS**：relay/agent/client 页面均 200；标题分别为 `PairLink relay/agent/client 管理页`；关键表头齐全；无 `<script src=`；三个端口的 `/debug/pprof/goroutine?debug=1` 均返回 200 且含 `goroutine profile: total` |
-| 10 | 无僵尸配对 / 无 goroutine 泄漏 | `TestE2EGoroutineNoLeak` | **PASS**：5 次完整配对流量后运行中 pprof `total=30`，无 `internal/forward.Bidirectional` 残留；全部 `Run` 退出后 goroutine `2 → 3`（容差 +2），`runtime/pprof` 中无 `internal/{relay,agent,client,forward}` 栈帧；每个测试的看护基线均 `2 → 2` |
+| 10 | 无僵尸配对 / 无 goroutine 泄漏 | `TestE2EGoroutineNoLeak` | **PASS**：5 次完整配对流量后运行中 pprof `total=30`，无 `internal/forward.Bidirectional` 残留；全部 `Run` 退出后 `runtime/pprof` 中无 `internal/{relay,agent,client,forward}` 栈帧；整包结束时 `TestMain` 的 goleak `VerifyTestMain` 通过（无未退出 goroutine，无 ignore） |
 | 11 | 单二进制：版本/参数/配置错误退出码 | `TestBinaryVersionUsageAndConfigErrors` | **PASS**：`-version` → `pairlink v0.4.0` 且退出码 0；无模式/多模式/未知 flag → 退出码 **2**；`-relay -config 不存在` / `-agent -config 非法 ini` → 退出码 **1** 且有中文错误 |
 | 12 | 真实二进制三子进程 TCP echo | `TestSubprocessTCPEcho` | **PASS**：`go build` 出的真实 `pairlink.exe` 分别以 relay/agent/client 三个子进程运行，未改造的第三方 TCP 客户端回显成功；阶段 6A 起收尾统一用跨平台的 `os.Process.Kill()`（Windows/Linux 通用，不再依赖 `taskkill`） |
 | 13 | 跨平台编译（纯 Go 无 CGO） | `TestCrossCompile` | **PASS**：`linux/amd64` 13,895,704 B；`windows/amd64` 14,444,032 B；`windows/arm64` 13,505,024 B；三个平台 `go build ./...` 均通过 |
@@ -990,17 +1057,21 @@ HTTP 层完全不知道 PairLink 存在，符合“第三方客户端零改造�
 
 ### 13.9 无僵尸与 goroutine/pprof 佐证
 
-`TestE2EGoroutineNoLeak` 在测试开始时记录稳定基线，跑 5 次完整 TCP 配对流量后：
+`TestE2EGoroutineNoLeak` 跑 5 次完整 TCP 配对流量后：
 
 ```text
 运行中 pprof: relay goroutine total=30，无 internal/forward.Bidirectional 残留
-goroutine 实测: 基线=2 Run 全部退出后=3（容差 +2）
 pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|agent|client|forward 栈帧
 优雅关停：relay/agent/client 三个 Run 在 ctx 取消后均返回 nil
+整包结束时由 TestMain 的 goleak 兜底检查进程内无未退出 goroutine
 ```
 
-每个 e2e 测试还带一个 goroutine 看护：cleanup 末尾轮询回落到 `基线 +2` 以内，
-实测所有用例均为 `base=2 now=2`。
+v0.5.0 起 goroutine 泄漏判定交给 `go.uber.org/goleak`：`test/` 的 `TestMain`
+在 `m.Run()` 之后调用 `goleak.VerifyTestMain`，整包所有用例（含 `t.Cleanup`
+关停与子进程回收）结束后统一按栈帧校验；不再用 `runtime.NumGoroutine` 的
+"基线 +2" 容差，也不再给每个用例挂数字看护。e2e 有真实子进程与监听端口，
+但 `os/exec.(*Cmd).Wait` 由 `childProc.kill` 的 Kill+Wait 保证结束、产品
+Run 的 `net/http` goroutine 必须随 Run 退出，因此没有添加任何 ignore。
 
 ### 13.10 真实二进制、子进程与跨平台
 
@@ -1023,7 +1094,7 @@ pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|
   输出 `错误: service: 连接 SCM（需要管理员权限）: Access is denied.`，
   未出现 panic，也未静默成功；服务名由 `service.Name(mode)` 生成 `pairlink-relay`。
 - 若以管理员运行，测试会执行完整 `install → start → sc query(RUNNING) →
-  pairlink-relay.log → stop → uninstall` 分支（本机未触发）。
+  pairlink-relay-YYYY-MM-DD.log → stop → uninstall` 分支（本机未触发）。
 - 因此 **Windows 服务完整生命周期未在本机验证**，只验证了非管理员错误路径与服务命名约定。
 
 ### 13.12 回归
@@ -1078,11 +1149,12 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
    仍然未验证：systemd 托管、非 loopback 网络、长时间 soak。
 2. **Windows 服务完整生命周期未验证**：本机非管理员。已验证非管理员错误路径、
    `pairlink-<mode>` 命名（`internal/service` 单测 + 代码路径），但 install/start/stop/uninstall
-   的实际 RUNNING/STOPPED 状态与 `pairlink-<mode>.log` 落盘未在本机执行。
+   的实际 RUNNING/STOPPED 状态与 `pairlink-<mode>-YYYY-MM-DD.log` 落盘未在本机执行。
 3. **TLS e2e 只覆盖自签 CA 与 insecure 组合**（阶段 4 补充）：`TestE2ETLS*` 已覆盖
    relay `tls.Listen` + agent/client `tls_ca`、`tls_insecure_skip_verify`，以及
    "明文连 TLS / TLS 连明文"必须失败的路径；未覆盖公网 CA（系统根证书）、证书过期、
-   主机名不匹配。数据面 TLS 已由阶段 8D 覆盖（`TestE2EDataPlaneTLS*`），原生 UDP 仍是明文。
+   主机名不匹配。数据面 TLS 已由阶段 8D 覆盖（`TestE2EDataPlaneTLS*`）；原生 UDP 的 DTLS-PSK
+   已由 v0.5.0 覆盖（`TestUDPDTLS*`、`TestUDPNativeDTLS*`），明文回退路径另行覆盖。
 4. **只在 loopback 验证**：未模拟公网 NAT、防火墙、丢包/延迟、真实多网卡；
    TCP/UDP 行为在真实广域网下可能不同。
 5. **UDP over TCP 首包可能丢失**：会话刚建立、对端尚未完成登记时，第一个数据帧可能被
@@ -1098,7 +1170,7 @@ GOOS=windows GOARCH=arm64 go build ./...   # 通过（无输出）
    管理页所有用户可控字段（服务ID/地址/agent_id/配对键）均 `html` 转义；
    全仓日志（含 debug/错误路径）无明文 `pairing_token`。
    **仍需管理员/真机验证的只有：真实 Linux 运行、Windows 服务完整生命周期（本节第 1、2 条）。**
-8. **未做长时间 soak**：资源泄漏用 e2e goroutine 计数 + `pprof` 佐证，未做数小时压测。
+8. **未做长时间 soak**：资源泄漏用 goleak（整包结束按栈帧判定）+ `pprof` 栈帧佐证，未做数小时压测。
 
 ### 13.15 阶段 6A：Linux / WSL2 真机验证
 
@@ -1414,20 +1486,96 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
 | 响应头 | CSP / `X-Frame-Options: DENY` / `nosniff` / `no-referrer` 全部命中 |
 | 可写页默认刷新 | 无 `<meta http-equiv="refresh">`（P1-2） |
 
-> 说明：SEC-T1（数据面 TLS）、SEC-D3（UDP 反伪造）、SEC-A2（服务名归属）**不在本轮范围**，
-> 已在 README §10.1、`docs/architecture.md` §7.10、`docs/review-security.md` §0 记录
-> 现状/临时缓解/计划；其复现步骤仍然有效，不能视为已修复。
+> 说明：该轮（v0.3.0）验收时 SEC-T1（数据面 TLS）、SEC-A2（服务名归属）、SEC-D3（UDP 反伪造）
+> **不在当轮范围**；其中 T1/A2 已在 v0.4.0 修复，D3 已在 v0.5.0 用 DTLS-PSK 修复。
+> 历史记录与残差见 README §10.1、`docs/architecture.md` §7.10、`docs/review-security.md` §0。
 
 ## 14. 版本与许可证
 
-- 版本：`v0.4.0`
+- 版本：`v0.5.0`
 - 许可证：[Apache-2.0](LICENSE)
 
 ---
 
 ## 15. 变更记录（Changelog）
 
-### v0.4.0（当前）
+### v0.5.0（当前）
+
+**日志（按日期分文件，替换按大小切割）**
+
+- 日志从"单文件 + 按大小切割"改为**按本地日期分文件**：`pairlink-<mode>-YYYY-MM-DD.log`
+  （无扩展名时 `pairlink-<mode>-YYYY-MM-DD`）。跨天自动切换、启动与滚动时清理过期日文件；
+  保留天数由新增 `[common] log_keep_days` 控制（默认 7，`0` = 永久，负数非法）。
+- 服务模式下 `os.Stdout/os.Stderr` 也指向**启动当天**的文件，panic 栈不会丢；
+  裸 `stderr` 的 slog handler 保持兼容（不传 `KeepDays` 即旧行为）。
+- 切割失败/清理失败只记 WARN，不影响业务；文件名严格匹配 `<base>-YYYY-MM-DD<ext>`，
+  不会误删同名备份。
+- `internal/logx/rotate.go` + `rotate_test.go`（并发写不丢行、跨天切换、保留策略、
+  非法 `log_keep_days`、与 `DatedPath` 一致性）。
+
+**测试（goleak 取代手写 goroutine 计数）**
+
+- 5 个内部包（agent/client/relay/tunnelqueue/forward）与 `test/` 全部用
+  `go.uber.org/goleak` 的 `TestMain` + `VerifyTestMain`，**0 个 ignore**；
+  删除了按 `runtime.NumGoroutine()` 做数值基线的脆弱断言。
+- 反向验证：故意泄漏一个 goroutine 时 goleak 会 FAIL（测试里有对照用例）。
+
+**管理页（html/template）**
+
+- 布局、索引页与三种模式的页面主体全部改为 `html/template` **预编译**（`template.Must`
+  只解析一次），不再 `fmt.Fprintf` + 手工 `EscapeString` 拼 HTML。
+- 框架值与页面数据（服务 ID、端点、连接 ID、错误信息等）一律普通 `string`/`bool` 交给
+  模板上下文转义；**页面数据里没有任何 `template.HTML`**，只有页面主体本身允许。
+- 整页先渲染到缓冲，成功才 `WriteHeader(200)+Write`；渲染失败 500 +
+  `event=admin_render_failed`，不会写半截页面。
+- "页面是否含表单"改由 `admin.FormReporter`/`Page.ShowForms` 报告，不再 `bytes.Contains("<form")`。
+- 新增 XSS 矩阵测试：4 类载荷 × 各页面全部字符串字段，断言原文不出现、转义形式出现。
+
+**配置（ini 库 + 目录 fsync）**
+
+- ini 解析与写回改用 `gopkg.in/ini.v1`：`LoadSources` → `SetValue`/`DeleteKey` →
+  写临时文件 → `fsync(tmp)` → `Chmod` → `Rename` → **`fsync(父目录)`**（Windows 为 no-op）。
+- **行为变化**：写回会**重写整份文件**，注释、空行、对齐与 CRLF 可能归一（管理员手工注释
+  不保证保留）；值语义、键顺序与权限保持不变。
+- 新增 `internal/config/patch_unix.go` / `patch_windows.go`，单测含并发写与目录 fsync 断言。
+
+**原生 UDP（DTLS-PSK，SEC-D3 修复）**
+
+- `[relay]/[server]/[client]` 新增 `udp_dtls`（默认 `true`）：原生 UDP 数据面外层为
+  **DTLS 1.2 + PSK**（`TLS_PSK_WITH_AES_128_GCM_SHA256`），
+  `PSK = HKDF-SHA256(auth_token, info="pairlink-udp-dtls/v1|" + pairing_key)`，
+  `pairing_key` 作为 PSK identity；没有 `auth_token` 无法完成握手，因此**会话抢注与
+  数据报注入被阻断**（内层 `MsgBind` 鉴权逻辑不变）。
+- relay 侧单 UDP socket + 唯一读循环 + 每对端虚拟 `net.PacketConn`（`packetio` 队列上限
+  32、对端上限 4096、1s 粒度回收）；13 字节 DTLS 记录头预筛丢弃明文/垃圾报文，
+  不为其建对端。
+- `udp_dtls = false` 回退 v0.4.0 明文并启动 WARN；三端必须一致。
+- 已知限制：DTLS 单数据报上限（pion 入站缓冲 8192B，应用层建议 ≤1200B）、
+  与 v0.4.0 原生 UDP 不互通（升级窗口需临时关 DTLS）、每新源地址一次 1-RTT 握手。
+
+**relay 按 IP 签发限速**
+
+- 新增 `[relay] token_rate_per_ip`（默认 10/s，`0` = 不限）与 `token_burst_per_ip`
+  （默认 30）：`golang.org/x/time/rate` 按来源 IP 做令牌桶，超限不签发配对令牌，
+  回既有 `too_many_pending` 并记 `event=token_rate_limited`（5s 限速 WARN）；
+  限速器表按最后使用时间惰性清理，不会无界增长。
+
+**依赖（`task.md` §7.1：引入须说明理由，见 README §12.1）**
+
+- 新增运行期依赖：`gopkg.in/ini.v1`、`github.com/pion/dtls/v3`（+`transport/v4`、
+  `pion/logging`、`x/crypto`）、`golang.org/x/time`；新增**仅测试**依赖 `go.uber.org/goleak`。
+- 仍保持 `go 1.24.4` 与单一静态二进制；`go mod tidy` 后无多余间接依赖。
+
+**兼容性**
+
+- 日志文件名变化：升级后旧 `pairlink-<mode>.log` 不再写入（Windows 卸载脚本会一并清理
+  旧名与日文件），日志采集/告警规则需同步。
+- ini 写回会重写文件（见上）；依赖注释/格式保真的流程需调整。
+- 原生 UDP 三端需一起升级，或临时 `udp_dtls = false`。
+- 管理页 HTML 结构与空白有细微差异（换行/属性顺序），表单字段名、action、CSRF 字节格式
+  未变；既有 e2e 正则不受影响。
+
+### v0.4.0
 
 **安全修复（阶段 8D：数据面 TLS 与服务名归属）**
 
@@ -1476,9 +1624,10 @@ WSL2 另跑 `go test -race ./internal/...`（15 包全绿）与
   承载帧 `sess_len ≤ 129` 读侧校验（P2-6）、已登记会话重复 `MsgBind` 丢弃（P2-7）、
   `traceability.md` 测试锚点脚本重生成 + 标题/基线更新（P2-3，45 处行号修正、0 缺失）。
 
-**未修复（明确不在本轮范围，见 §10.1）**：SEC-D3 UDP 会话反伪造。原生 UDP 数据面
-（`udp_mode = native`）没有 DTLS，仍是明文；公网部署建议改用 `udp_mode = tcp_tunnel`
-复用数据面 TLS。relay 未配置 `service_allow` 时只 WARN，不强制白名单。
+**未修复（v0.4.0 当时明确不在本轮范围，见 §10.1）：SEC-D3 UDP 会话反伪造，v0.5.0 已修复。**
+v0.4.0 时原生 UDP 数据面（`udp_mode = native`）没有 DTLS、仍是明文；v0.5.0 起默认
+`udp_dtls = true`（DTLS-PSK），也可显式设 `false` 回到明文过渡。relay 未配置
+`service_allow` 时只 WARN，不强制白名单。
 
 **兼容性**
 

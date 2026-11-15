@@ -11,8 +11,6 @@ import (
 // TestE2EAdminPagesThreeModes 验收项（task.md §10）：三种模式的 manage_listen
 // 页面均可访问并展示各自状态；页面不依赖任何外部脚本；pprof=true 时可用。
 func TestE2EAdminPagesThreeModes(t *testing.T) {
-	guardGoroutines(t)
-
 	echoAddr := startTCPEchoServer(t)
 
 	relayManage := hostPort(freeTCPPort(t))

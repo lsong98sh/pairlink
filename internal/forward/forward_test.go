@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -205,8 +204,9 @@ func TestBidirectionalNil(t *testing.T) {
 	}
 }
 
+// TestBidirectionalNoGoroutineLeak 覆盖双向转发在取消/关闭后能完全退出；
+// goroutine 是否残留由包级 TestMain 的 goleak 在整包结束时判定。
 func TestBidirectionalNoGoroutineLeak(t *testing.T) {
-	baseline := runtime.NumGoroutine()
 	for i := 0; i < 20; i++ {
 		aRelay, aRemote := net.Pipe()
 		bRelay, bRemote := net.Pipe()
@@ -220,16 +220,6 @@ func TestBidirectionalNoGoroutineLeak(t *testing.T) {
 		_ = aRemote.Close()
 		_ = bRemote.Close()
 	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		runtime.GC()
-		if runtime.NumGoroutine() <= baseline+2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("疑似 goroutine 泄漏：baseline=%d now=%d", baseline, runtime.NumGoroutine())
 }
 
 func TestWithIdleTimeout(t *testing.T) {
@@ -306,8 +296,9 @@ func TestJoinContext(t *testing.T) {
 	}
 }
 
+// TestJoinContextNoLeak 覆盖 JoinContext 的 stop/cancel 两条退出路径；
+// goroutine 是否残留由包级 TestMain 的 goleak 在整包结束时判定。
 func TestJoinContextNoLeak(t *testing.T) {
-	baseline := runtime.NumGoroutine()
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
 		a, b := net.Pipe()
@@ -325,15 +316,6 @@ func TestJoinContextNoLeak(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() <= baseline+2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("JoinContext 疑似 goroutine 泄漏：baseline=%d now=%d", baseline, runtime.NumGoroutine())
 }
 
 // TestBidirectionalWithOutcomeIdleTimeout 覆盖 idle 超时的结束原因可被调用方识别。

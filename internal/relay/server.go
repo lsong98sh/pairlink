@@ -19,6 +19,7 @@ import (
 	"github.com/lsong98sh/pairlink/internal/protocol"
 	"github.com/lsong98sh/pairlink/internal/registry"
 	"github.com/lsong98sh/pairlink/internal/token"
+	"github.com/lsong98sh/pairlink/internal/udpdtls"
 	"github.com/lsong98sh/pairlink/internal/version"
 )
 
@@ -113,6 +114,16 @@ func (s *server) serve(parent context.Context) error {
 		"tcp_listen", s.cfg.Relay.TCPListen,
 		"udp_listen", s.cfg.Relay.UDPListen,
 	)
+	if s.udpMode == protocol.UDPModeNative {
+		if s.cfg.Relay.UDPDTLS {
+			s.log.Info("原生 UDP 数据面: DTLS-PSK（DTLS 1.2 / AES-128-GCM）",
+				"event", "start", "udp_dtls", true,
+				"detail", "PSK = HKDF-SHA256(auth_token, info="+udpdtls.InfoPrefix+"pairing_key)")
+		} else {
+			s.log.Warn("udp_dtls = false：原生 UDP 数据面按 v0.4.0 明文运行，业务数据与 pairing_token 可被链路上的人读取（仅用于混合版本过渡）",
+				"event", "udp_dtls_disabled", "udp_dtls", false)
+		}
+	}
 	if strings.TrimSpace(s.cfg.Relay.AuthToken) == "" {
 		s.log.Warn("auth_token 为空：仅允许回环来源接入隧道（非回环来源将回 auth_failed），仅供本机调试",
 			"event", "config_warning", "detail", "auth_token 未配置")
@@ -283,8 +294,8 @@ func (s *server) prepareTLS() error {
 		}
 		s.log.Warn(detail, "event", "config_warning", "detail", detail, "data_tls", false)
 	}
-	if s.dataTLS && s.udpMode == protocol.UDPModeNative {
-		s.log.Warn("原生 UDP 数据面仍为明文（不引入 DTLS）：已配置 udp_listen，如需加密请移除 udp_listen 改用 udp_mode = tcp_tunnel（承载走已加密的 TCP 数据面）",
+	if s.dataTLS && s.udpMode == protocol.UDPModeNative && !s.cfg.Relay.UDPDTLS {
+		s.log.Warn("原生 UDP 数据面仍为明文（udp_dtls = false，data_tls 不覆盖原生 UDP）：如需加密请设置 udp_dtls = true 改用 DTLS-PSK，或移除 udp_listen 改用 udp_mode = tcp_tunnel（承载走已加密的 TCP 数据面）",
 			"event", "config_warning", "detail", "data_tls 不覆盖原生 UDP")
 	}
 	return nil

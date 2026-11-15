@@ -11,8 +11,6 @@ import (
 // TestE2EFailureWrongToken 验收项：令牌错误时直接关闭数据连接，且不向客户端
 // 写任何字节（TCP 数据面不能回错误帧，否则会污染透传）。
 func TestE2EFailureWrongToken(t *testing.T) {
-	guardGoroutines(t)
-
 	relayManage := hostPort(freeTCPPort(t))
 	relayCfg, _ := writeRelayINI(t, relaySpec{
 		Tunnel:      hostPort(freeTCPPort(t)),
@@ -35,8 +33,6 @@ func TestE2EFailureWrongToken(t *testing.T) {
 
 // TestE2EFailureTokenReuse 验收项：成功配对后同一配对键/令牌再次报到被拒绝。
 func TestE2EFailureTokenReuse(t *testing.T) {
-	guardGoroutines(t)
-
 	relayManage := hostPort(freeTCPPort(t))
 	relayCfg, _ := writeRelayINI(t, relaySpec{
 		Tunnel:      hostPort(freeTCPPort(t)),
@@ -75,8 +71,6 @@ func TestE2EFailureTokenReuse(t *testing.T) {
 
 // TestE2EFailureTokenExpiry 验收项：令牌 TTL 到期后报到被拒绝。
 func TestE2EFailureTokenExpiry(t *testing.T) {
-	guardGoroutines(t)
-
 	relayManage := hostPort(freeTCPPort(t))
 	relayCfg, _ := writeRelayINI(t, relaySpec{
 		Tunnel:      hostPort(freeTCPPort(t)),
@@ -110,8 +104,6 @@ func TestE2EFailureTokenExpiry(t *testing.T) {
 
 // TestE2EFailurePairTimeout 验收项：只一侧报到时，pair_timeout 后连接关闭、表项清理。
 func TestE2EFailurePairTimeout(t *testing.T) {
-	guardGoroutines(t)
-
 	relayManage := hostPort(freeTCPPort(t))
 	relayCfg, _ := writeRelayINI(t, relaySpec{
 		Tunnel:      hostPort(freeTCPPort(t)),
@@ -143,8 +135,6 @@ func TestE2EFailurePairTimeout(t *testing.T) {
 // TestE2EFailureControlDrop 验收项：agent 控制连接断开后 relay 注销服务、
 // 清理未完成配对；client 重新 ListServices 看不到该服务，新的接入请求被拒绝。
 func TestE2EFailureControlDrop(t *testing.T) {
-	guardGoroutines(t)
-
 	relayManage := hostPort(freeTCPPort(t))
 	relayCfg, _ := writeRelayINI(t, relaySpec{
 		Tunnel:      hostPort(freeTCPPort(t)),

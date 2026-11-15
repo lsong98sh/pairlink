@@ -62,7 +62,6 @@ func assertPlaintextDataRejected(t *testing.T, addr string) {
 // relay data_tls=true，agent/client data_tls=true + tls_ca → 注册/配对/TCP echo，
 // 并直接从外部确认数据面要求 TLS、明文连接被拒。
 func TestE2EDataPlaneTLS(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -124,7 +123,6 @@ func TestE2EDataPlaneTLS(t *testing.T) {
 // TestE2EDataPlaneTLSDisabled 覆盖 tunnel TLS + data_tls=false：
 // 控制面加密、数据面显式明文，端到端仍可用；TLS 客户端不能连数据面。
 func TestE2EDataPlaneTLSDisabled(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -180,7 +178,6 @@ func TestE2EDataPlaneTLSDisabled(t *testing.T) {
 
 // TestE2EDataPlaneTLSMismatch 覆盖两侧 data_tls 冲突时**明确失败、不挂起**。
 func TestE2EDataPlaneTLSMismatch(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -228,7 +225,6 @@ func TestE2EDataPlaneTLSMismatch(t *testing.T) {
 // TestE2EDataPlaneTLSRequiresNewRelay 覆盖"客户端 data_tls=true + relay data_tls=false"：
 // 同样必须明确失败（不静默降级）。
 func TestE2EDataPlaneTLSRequiresNewRelay(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 

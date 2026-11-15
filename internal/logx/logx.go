@@ -10,8 +10,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 )
 
@@ -21,12 +22,46 @@ type Config struct {
 	Level string
 	// Format 是输出格式：text / json；空值表示 text。
 	Format string
-	// Output 是输出目标；nil 表示 os.Stderr。
+	// Output 是输出目标；nil 表示 DefaultOutput()（默认 os.Stderr）。
 	Output io.Writer
 	// Mode 是模式名（relay / agent / client），非空时写入每条日志的 mode 字段。
 	Mode string
 	// Component 是组件名，非空时写入每条日志的 component 字段。
 	Component string
+	// KeepDays 是 NewFileLogger 的日文件保留天数：nil 表示默认
+	// DefaultKeepDays（7）天；0 表示永久保留；负数非法（构造时报错）。
+	KeepDays *int
+	// now 是时钟注入点（仅包内可见），nil 表示 time.Now；单测用它模拟跨天。
+	now func() time.Time
+}
+
+// defaultOutput 是 Config.Output 为 nil 时 logx.New 使用的输出目标。
+var (
+	defaultOutMu sync.RWMutex
+	defaultOut   io.Writer
+)
+
+// SetDefaultOutput 设置 Config.Output 为空（nil）时 logx.New 使用的输出目标；
+// w 为 nil 时恢复 os.Stderr。
+//
+// main 在 Windows 服务模式下用它把各包内 logx.New 产生的日志一并写入按日期
+// 切分的日志文件——这样跨天切换对所有 logger 都生效，而不需要把
+// os.Stderr 指向某一天的固定文件。
+func SetDefaultOutput(w io.Writer) {
+	defaultOutMu.Lock()
+	defaultOut = w
+	defaultOutMu.Unlock()
+}
+
+// DefaultOutput 返回当前的默认输出目标（未设置时为 os.Stderr）。
+func DefaultOutput() io.Writer {
+	defaultOutMu.RLock()
+	w := defaultOut
+	defaultOutMu.RUnlock()
+	if w == nil {
+		return os.Stderr
+	}
+	return w
 }
 
 // ParseLevel 把字符串解析为 slog.Level（大小写不敏感）。
@@ -47,7 +82,8 @@ func ParseLevel(s string) (slog.Level, error) {
 
 // New 按 cfg 构造 *slog.Logger。
 //
-// 未指定级别/格式时使用 info/text；Output 为 nil 时写 stderr。
+// 未指定级别/格式时使用 info/text；Output 为 nil 时写 DefaultOutput()
+// （默认 os.Stderr，Windows 服务模式下由 main 指向日志文件）。
 // 返回值可直接交给 slog 包使用，也可用 Component 派生组件 logger。
 func New(cfg Config) *slog.Logger {
 	level, err := ParseLevel(cfg.Level)
@@ -56,7 +92,7 @@ func New(cfg Config) *slog.Logger {
 	}
 	out := cfg.Output
 	if out == nil {
-		out = os.Stderr
+		out = DefaultOutput()
 	}
 	opts := &slog.HandlerOptions{Level: level}
 
@@ -129,20 +165,39 @@ func CleanN(s string, max int) string {
 	return b.String()
 }
 
-// NewFileLogger 构造写入 path 的 logger（追加模式，目录不存在时自动创建）。
+// NewFileLogger 构造按**本地日期**切分写入日志文件的 logger。
 //
-// Windows 服务没有控制台，-service 模式下应使用本函数把日志落到文件
-// （约定路径为 exe 同目录的 pairlink-<mode>.log）。返回的 io.Closer 需要由
-// 调用方在进程退出前关闭。
+// path 视为**基名**，实际写入 <base>-YYYY-MM-DD<ext>：
+//
+//	/var/log/pairlink/relay.log → /var/log/pairlink/relay-2026-11-15.log
+//	C:\Logs\relay              → C:\Logs\relay-2026-11-15（无扩展名）
+//
+// 目录不存在时自动创建。写入时发现本地日期变化就关闭旧文件、打开新文件，
+// 并清理过期日文件（保留天数见 Config.KeepDays：nil = 默认 7 天，0 = 永久
+// 保留）。清理只删除同目录、同基名且严格匹配 <base>-YYYY-MM-DD[.ext] 的文件，
+// 删除失败（Windows 文件被占用等）只记 WARN，不影响主流程。
+//
+// path 为空时退回 logx.New 的默认输出（默认 os.Stderr，等价于前台模式），
+// 此时返回的 Closer 是空操作。返回的 io.Closer 需要由调用方在进程退出前
+// 关闭（可重复调用）。
 func NewFileLogger(path string, cfg Config) (*slog.Logger, io.Closer, error) {
-	path = filepath.Clean(path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, nil, fmt.Errorf("创建日志目录 %q: %w", filepath.Dir(path), err)
+	if strings.TrimSpace(path) == "" {
+		return New(cfg), nopCloser{}, nil
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	days, err := keepDays(cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("打开日志文件 %q: %w", path, err)
+		return nil, nil, err
 	}
-	cfg.Output = f
-	return New(cfg), f, nil
+	w, fails, err := newDateWriter(path, days, cfg.now)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg.Output = w
+	log := New(cfg)
+	// 清理失败的 WARN 用直达文件的专用 logger：slog handler 在 Write 期间
+	// 持有自己的互斥锁，在 Write 里回调同一个 logger 会死锁。
+	w.log.Store(newWarnLogger(w, cfg.Format, cfg.Mode))
+	// 启动清理的失败项：logger 已就绪，走统一的 WARN 出口。
+	w.warn(fails)
+	return log, w, nil
 }

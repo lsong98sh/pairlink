@@ -19,8 +19,6 @@ import (
 // 本机以非管理员运行：断言 -service install 给出可读错误而不是崩溃或静默成功。
 // 如果测试进程是管理员，则完整执行 install → start → RUNNING → stop → uninstall。
 func TestE2EWindowsService(t *testing.T) {
-	guardGoroutines(t)
-
 	// 先验证服务名参数错误（不依赖管理员）。
 	code, out := runBin(t, "-relay", "-service", "no-such-op")
 	if code != 2 {
@@ -84,7 +82,8 @@ func TestE2EWindowsService(t *testing.T) {
 	}
 	t.Logf("sc query：%s", strings.TrimSpace(string(scOut)))
 
-	logPath := filepath.Join(filepath.Dir(pairlinkExe), name+".log")
+	// 日志按日期分文件（v0.5.0 起）：<base>-YYYY-MM-DD.log，取启动当天的本地日期。
+	logPath := filepath.Join(filepath.Dir(pairlinkExe), name+"-"+time.Now().Format("2006-01-02")+".log")
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		data, err := os.ReadFile(logPath)

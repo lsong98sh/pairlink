@@ -3,6 +3,7 @@ package client
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -21,7 +22,8 @@ type localSession interface {
 // udpSession 表示一个「本地 UDP 数据源 + 远端服务」的会话。
 //
 // 两种承载方式共用本结构：
-//   - native：nativeConn 是独立 DialUDP 到 relay udp_listen 的 socket；
+//   - native：nativeConn 是独立 DialUDP 到 relay udp_listen 的 socket（v0.5.0 起
+//     默认在它上面套 DTLS-PSK，此时 nativeConn 是 *dtls.Conn）；
 //   - tcp_tunnel：carrier 指向共享的 UDP over TCP 承载连接，key 是隧道帧会话标识。
 type udpSession struct {
 	svcID     string
@@ -43,7 +45,7 @@ type udpSession struct {
 	proto    string
 	firstPkt []byte // 会话建立前缓存的首个数据报，配对成功后补发
 
-	nativeConn *net.UDPConn
+	nativeConn net.Conn
 	carrier    *udpTunnelCarrier
 }
 
@@ -131,8 +133,8 @@ func (s *udpSession) setForwarding() bool {
 	return true
 }
 
-// setNativeConn 登记原生 UDP socket；会话已关闭时返回 false。
-func (s *udpSession) setNativeConn(conn *net.UDPConn) bool {
+// setNativeConn 登记原生 UDP 连接（明文 socket 或 DTLS 连接）；会话已关闭时返回 false。
+func (s *udpSession) setNativeConn(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == stateClosed {
@@ -220,8 +222,17 @@ func (c *client) attachUDPNative(s *udpSession, key pairing.PairingKey, token st
 	if err != nil {
 		return fmt.Errorf("client: 连接 relay UDP 数据面 %s: %w", neg.udpDataAddr, err)
 	}
-	if !s.setNativeConn(conn) {
-		_ = conn.Close()
+	// v0.5.0：原生 UDP 数据面默认 DTLS-PSK；udp_dtls = false 时保持明文直连。
+	var relayConn net.Conn = conn
+	if c.cfg.Client.UDPDTLS {
+		dtlsConn, derr := c.dialUDPDTLS(conn, key)
+		if derr != nil {
+			return fmt.Errorf("client: 与 relay 的 UDP DTLS 握手失败: %w", derr)
+		}
+		relayConn = dtlsConn
+	}
+	if !s.setNativeConn(relayConn) {
+		_ = relayConn.Close()
 		return errors.New("client: 会话已关闭")
 	}
 
@@ -234,20 +245,20 @@ func (c *client) attachUDPNative(s *udpSession, key pairing.PairingKey, token st
 		return err
 	}
 	if d := c.dialTimeout(); d > 0 {
-		_ = conn.SetWriteDeadline(time.Now().Add(d))
+		_ = relayConn.SetWriteDeadline(time.Now().Add(d))
 	}
-	if _, err := conn.Write(frame); err != nil {
+	if _, err := relayConn.Write(frame); err != nil {
 		return fmt.Errorf("client: 发送 UDP 报到数据报: %w", err)
 	}
-	_ = conn.SetWriteDeadline(time.Time{})
+	_ = relayConn.SetWriteDeadline(time.Time{})
 	c.log.Info("已发送原生 UDP 报到数据报", "event", "bind",
 		"service_id", key.ServiceID, "pairing_key", key.String(),
-		"remote", neg.udpDataAddr, "detail", "udp_mode=native carrier=")
+		"remote", neg.udpDataAddr, "detail", "udp_mode=native")
 
-	if err := c.awaitBindOKNative(s, key, conn, frame); err != nil {
+	if err := c.awaitBindOKNative(s, key, relayConn, frame); err != nil {
 		return err
 	}
-	c.tasks.Go(func() { c.readNativeUDP(s, conn) })
+	c.tasks.Go(func() { c.readNativeUDP(s, relayConn) })
 	return nil
 }
 
@@ -256,7 +267,7 @@ func (c *client) attachUDPNative(s *udpSession, key pairing.PairingKey, token st
 // 丢包处理（阶段 6C，docs/protocol.md §5.2.1）：每约 300ms 未收到应答就重发报到帧，
 // 最多重发 udpBindMaxResends 次；收到 MsgBindOK 或**首个业务数据报**即视为就绪
 // （relay 半开会重复回 BindOK，因此重发是幂等的）。
-func (c *client) awaitBindOKNative(s *udpSession, key pairing.PairingKey, conn *net.UDPConn, frame []byte) error {
+func (c *client) awaitBindOKNative(s *udpSession, key pairing.PairingKey, conn net.Conn, frame []byte) error {
 	timeout := c.pairTimeout()
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, protocol.MaxUDPDatagram+1)
@@ -326,12 +337,20 @@ func isTimeoutErr(err error) bool {
 }
 
 // readNativeUDP 读取原生 UDP 数据面回包并回写到本地第三方源地址。
-func (c *client) readNativeUDP(s *udpSession, conn *net.UDPConn) {
+func (c *client) readNativeUDP(s *udpSession, conn net.Conn) {
 	buf := make([]byte, protocol.MaxUDPDatagram+1)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			if c.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if c.ctx.Err() != nil || s.isClosed() || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// DTLS 对端被 relay 回收（空闲超时/停机）会以 close_notify → io.EOF
+			// 结束：这是正常生命周期事件，不需要 WARN，下一次数据报会重新握手。
+			if errors.Is(err, io.EOF) {
+				c.log.Info("relay 关闭了 UDP DTLS 会话，关闭本地会话", "event", "udp_session_close",
+					"service_id", s.svcID, "pairing_key", s.displayKey())
+				c.closeUDPSession(s, "relay_closed", nil)
 				return
 			}
 			c.log.Warn("relay UDP 数据面读取失败，关闭会话", "event", "data_close",

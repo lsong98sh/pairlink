@@ -13,11 +13,9 @@ import (
 var goroutineTotalRe = regexp.MustCompile(`goroutine profile: total (\d+)`)
 
 // TestE2EGoroutineNoLeak 验收项（task.md §10）：整轮流量后无僵尸配对与
-// goroutine 泄漏；用 runtime.NumGoroutine + runtime/pprof 佐证。
+// goroutine 泄漏；用运行中/退出后的 runtime/pprof 栈帧佐证，整包结束时再由
+// TestMain 的 goleak 兜底（不再用 NumGoroutine 数字容差）。
 func TestE2EGoroutineNoLeak(t *testing.T) {
-	guardGoroutines(t)
-	base := runtime.NumGoroutine()
-
 	echoAddr := startTCPEchoServer(t)
 
 	relayManage := hostPort(freeTCPPort(t))
@@ -119,12 +117,8 @@ func TestE2EGoroutineNoLeak(t *testing.T) {
 		}
 	}
 
-	after := runtime.NumGoroutine()
-	if after > base+2 {
-		t.Fatalf("goroutine 计数 base=%d after=%d 超过容差 +2", base, after)
-	}
-	t.Logf("goroutine 实测: 基线=%d Run 全部退出后=%d（容差 +2）", base, after)
 	t.Logf("pprof 结论: 运行中无转发 goroutine 残留；退出后无 internal/relay|agent|client|forward 栈帧")
+	t.Log("整包结束时由 TestMain 的 goleak 兜底检查进程内无未退出 goroutine")
 }
 
 // TestE2EWSLOrCrossCompileNote 记录 Linux 真机 / WSL 可用性。

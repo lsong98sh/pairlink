@@ -278,7 +278,8 @@ func (a *agent) saveMainService(proto, local string) error {
 		_ = config.DeleteKey(a.cfg.Path, "server", "local")
 	}
 
-	// 先写 local 再写 protocol：两者都会保留行格式；失败时统一回滚。
+	// 先写 local 再写 protocol：两次写回都会用 ini 库重写该文件（注释/排版可能归一，
+	// 原子替换且权限不变），失败时统一回滚。
 	if err := config.PatchValue(a.cfg.Path, "server", "local", svc.Addr); err != nil {
 		revert()
 		return fmt.Errorf("主服务已在 relay 生效，但写回 [server] local 失败，已尝试回滚: %w", err)

@@ -29,7 +29,7 @@
 | `internal/relay` | 阶段2（独占） | relay 全部实现 |
 | `internal/agent` | 阶段2（独占） | agent 全部实现 |
 | `internal/client` | 阶段2（独占） | client 全部实现 |
-| `internal/version` | 阶段4（新增） | 唯一版本号常量（`Version = "v0.2.0"`），main 与三模式管理页共用 |
+| `internal/version` | 阶段4（新增） | 唯一版本号常量（`Version = "v0.5.0"` / `Number = "0.5.0"`），main 与三模式管理页共用 |
 | `docs/`、`README.md` | 阶段1（冻结，阶段3 追加验证结果） | 规范与使用说明 |
 
 依赖方向（箭头表示 import）：
@@ -277,7 +277,32 @@ type carrier struct {
    阶段 2 不得再为同一对连接起后台 goroutine。
 4. 清理顺序统一为：**关连接 → 等转发返回 → 删表项**。禁止先删表项再关连接
    （否则新一轮同键报到会与旧连接抢配对）。
-5. 阶段 3 会用 goroutine 计数 / pprof 验证无泄漏；阶段 2 自测也应覆盖。
+5. goroutine 泄漏由测试侧 `go.uber.org/goleak` 兜底（v0.5.0 起）；不再使用
+   `runtime.NumGoroutine()` 计数 + 固定容差，`pprof` 仅用于人工排查。
+
+### 5.1 测试策略：goleak 兜底 goroutine 泄漏
+
+v0.4.0 及以前，`internal/{agent,client,relay,forward,tunnelqueue}` 与 `test/`
+的用例用 `runtime.NumGoroutine()` 记录基线、轮询等待回落，并允许 `+2` 容差。
+这种断言依赖进程内 goroutine 的瞬时快照：`-race` 全量并行时，测试框架、
+子进程回收等基础设施的短暂 goroutine 会让计数短暂偏高，已因此误报两次。
+
+v0.5.0 起统一改为 `go.uber.org/goleak`：
+
+- 每个相关测试包在 `TestMain` 里调用 `goleak.VerifyTestMain(m)`，等整包所有
+  用例（含 `t.Cleanup` 的 `Run` 关停、监听器关闭、子进程 Kill+Wait）结束后
+  再按栈帧判定；不再做数字比较，也没有 `+2` 容差。
+- `test/`（顶层 e2e）的 `TestMain` 在 `m.Run()` 之后走同一入口；e2e 有真实
+  子进程与监听端口，但 `os/exec.(*Cmd).Wait` 由 `childProc.kill` 的
+  `Kill+Wait` 保证结束、产品 `Run` 的 `net/http` goroutine 必须随 Run 退出，
+  因此**不添加任何 ignore**。只有确属测试基础设施的 goroutine 才能用
+  `IgnoreTopFunction` / `IgnoreAnyFunction` 排除，并必须在代码注释里写明是
+  哪个 goroutine、为什么不是产品泄漏。
+- 报出 `internal/{relay,agent,client,forward,tunnelqueue}` 栈帧即视为真实
+  泄漏，先修产品代码，禁止用 ignore 掩盖。
+- 反向验证：临时在用例里 `go func(){ time.Sleep(time.Hour) }()`，`go test`
+  应输出 `goleak: Errors on successful test run: found unexpected goroutines`
+  且退出码非 0；验证后已删除临时代码。
 
 ## 6. 日志字段约定
 
@@ -340,7 +365,20 @@ type carrier struct {
 注册机制；每个模式只写主体 HTML（`<section>` 片段），不重复写 `<html>`。
 写操作只有 `Action`（默认 POST + 一次性 CSRF 令牌），第一阶段唯一写操作是 relay 的踢出。
 
-**P1-2 刷新策略**：只读页默认 `1s` 自动刷新；**可写实例或页面正文含 `<form` 时默认暂停**
+**v0.5.0 渲染层（html/template）**：布局、索引页与三种模式的页面主体全部改为
+`html/template` 预编译（`template.Must`，解析失败启动期即 panic），不再用
+`fmt.Fprintf` + 手写 `EscapeString` 拼串。约定：
+
+- 框架值（标题/模式/版本/运行时长/刷新开关/导航/提示条）与页面数据（服务 ID、`tcp/udp:host:port`
+  端点、客户端连接 ID、错误信息）一律作为普通 `string`/`bool` 传入模板，由上下文感知转义处理
+  （HTML 文本、属性、URL 各按上下文改写）；**只有页面主体本身**允许 `template.HTML`。
+- 整页先渲染到 `bytes.Buffer`，成功后才 `WriteHeader(200)+Write`；渲染失败回 500 并记
+  `event=admin_render_failed`，不会写出半截页面（`Server.WritePage`）。
+- "页面是否含表单"由页面数据实现 `admin.FormReporter`（`ShowForms() bool`）报告，或由
+  `admin.Page.ShowForms` 提供；**不再扫描生成后的 HTML**（旧实现用 `bytes.Contains("<form")`）。
+- `WriteHTML`/`CSRFInput`/`NoticeBar` 保留为兼容入口（各模式页面在迁移前使用）。
+
+**P1-2 刷新策略**：只读页默认 `1s` 自动刷新；**可写实例或页面正文含表单时默认暂停**
 （否则整页重载会清空正在输入的表单），顶栏链接 `?refresh=1` 恢复、`?refresh=0` 强制关闭。
 
 **SEC-M1 写 Action 门禁**（`internal/admin/guard.go`）：在任何写 Action 执行前校验
@@ -359,8 +397,16 @@ CSP `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-an
 ### 7.5 日志输出与 Windows 服务
 
 - 前台模式：stdout/stderr（slog text/json）。
-- Windows 服务模式：日志落到 **exe 同目录的 `pairlink-<mode>.log`**（`service.LogPath`），
-  同时把 `os.Stderr`/`os.Stdout` 指向该文件，保证各包内 `logx.New` 的日志也落盘。
+- Windows 服务模式：日志落到 **exe 同目录的 `pairlink-<mode>-YYYY-MM-DD.log`**
+  （`service.LogPath` 只给基名 `pairlink-<mode>.log`，`internal/logx` 追加**本地日期**后缀；
+  写入时发现日期变化就切文件）。
+- **命名与清理规则（v0.5.0）**：`<base>-YYYY-MM-DD<ext>`（无扩展名时不加点）；
+  `[common] log_keep_days`（默认 7，0 = 永久保留，负数校验失败）控制启动与每次切文件时
+  对**同目录、同基名、严格匹配 `<base>-YYYY-MM-DD[.ext]`** 且日期早于 `today - keepDays`
+  的日文件清理（不同基名/无日期/格式非法/同名目录绝不删），删除失败只 WARN；
+  清理失败 WARN 走独立 handler 直达文件（slog handler 在 Write 期间持锁，不能在 Write
+  里回调同一 logger）。各包内 `logx.New` 的日志经 `logx.SetDefaultOutput` 指向同一日文件，
+  不再重定向 `os.Stderr`/`os.Stdout`（代价：panic 栈等裸 stderr 输出不落盘）。
 
 ### 7.6 TLS 策略（阶段 6G：E7 显式开关）
 
@@ -509,16 +555,17 @@ POST /action/<name> + 一次性 CSRF
   relay 拒绝/超时回滚内存；写 ini 失败回滚内存并尽力反向注册/注销。
 - client：先开关/切换监听 → 成功才写 ini；写盘失败关闭新监听、恢复旧监听与映射。
 
-**ini patch 的原子性与并发**（`internal/config/patch.go`）：
+**ini 读写与原子性**（`internal/config/ini.go`、`patch.go`）：
 
-- 进程内包级 `patchMu` 串行化"读整份文件 → 改行 → 原子替换"；HTTP handler 并发写同一
-  ini 不会互相覆盖。跨进程（编辑器/另一实例）不在保证范围，可能后写覆盖先写。
-- 只做行级替换：保留注释、空行、键顺序、键名写法、`=` 前对齐、LF/CRLF、结尾换行、
-  BOM 与权限位；不重新格式化、不清理连续空行。
-- `os.CreateTemp`（同目录）→ 写入 → `Sync` → `Chmod` → `Close` → `os.Rename`；
+- 解析与写回都走 `gopkg.in/ini.v1`（v0.5.0 起，见 `docs/contract.md` §3.10）：
+  键名/段名大小写不敏感、只支持整行注释（值里的 `;`/`#` 属于值）、未知键按 `Validate` 报错。
+  写回是"读整份 → `SetValue`/`DeleteKey` → 原子替换"，因此**注释与原有排版会归一**
+  （这是有意的取舍：不再维护行级补丁，换来更可靠的解析与更少的自研代码）。
+- 进程内包级 `patchMu` 串行化，HTTP handler 并发写同一 ini 不会互相覆盖；
+  跨进程（编辑器/另一实例）不在保证范围，可能后写覆盖先写。
+- 原子写：`os.CreateTemp`（同目录）→ 写入 → `Sync` → `Chmod` → `Close` → `os.Rename`
+  → **父目录 `fsync`**（`patch_unix.go`；Windows 无此语义，`patch_windows.go` 空实现）；
   任一步失败删除临时文件，原文件保持完整。
-- 同一段重复键：Patch 替换全部同名键、Delete 删除全部同名行；同名段重复出现时也会
-  覆盖全部同名段（ini 解析器会合并重复段）。
 - 参数校验拒绝含换行/方括号的段名与含换行的键/值，防止行注入。
 
 **审计字段**（`internal/admin/notice.go`）：`event=admin_action`、`remote`、`action`、
@@ -553,9 +600,40 @@ POST /action/<name> + 一次性 CSRF
 
 | 编号 | 风险 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| SEC-T1 | 数据面（TCP）无 TLS，公网明文 | **已修复（v0.4.0）** | `data_tls` 三态，TCP 数据面复用隧道证书与 TLS 1.2；原生 UDP 仍无 DTLS（`udp_mode=native` 明文，建议 `tcp_tunnel`） |
+| SEC-T1 | 数据面（TCP）无 TLS，公网明文 | **已修复（v0.4.0）** | `data_tls` 三态，TCP 数据面复用隧道证书与 TLS 1.2；原生 UDP 的加密见 SEC-D3 |
 | SEC-A2 | 服务名先注册者得，可被抢占 | **已修复（v0.4.0）** | `service_allow` 白名单 + `max_services_per_agent` + 在线归属/离线接管；未配白名单仅 WARN |
-| SEC-D3 | 原生 UDP 会话可被源地址伪造/抢注 | 未修复 | 缩短 `token_ttl`；敏感场景改用 `udp_mode = tcp_tunnel`；UDP 端口 ACL；计划引入 UDP cookie/DTLS |
+| SEC-D3 | 原生 UDP 会话可被源地址伪造/抢注 | **已修复（v0.5.0）** | 原生 UDP 默认 DTLS-PSK（`udp_dtls = true`，HKDF(auth_token) 派生，pairing_key 作 identity），无 `auth_token` 者无法握手；详见 §7.11 |
+
+### 7.11 原生 UDP 的 DTLS 数据面与按 IP 限速（v0.5.0）
+
+**DTLS-PSK（SEC-D3）**：`[relay] udp_listen` 配置且 `udp_dtls = true`（默认）时，原生 UDP
+数据面的外层是 DTLS 1.2 + PSK，内层仍是原帧格式与 `MsgBind` 鉴权。
+
+- **单 socket、多对端**（`internal/relay/udp_dtls.go`）：一个 `net.UDPConn` 由唯一读循环
+  `ReadFromUDP`；按源地址查 `peers[addr]`，投递到该对端的报文队列（`packetio.Buffer`，
+  上限 32 个数据报，满则丢弃——UDP 语义允许丢包，绝不阻塞读循环）。每个对端一个虚拟
+  `net.PacketConn`（`ReadFrom` 返回固定对端地址、`WriteTo` 忽略地址、deadline 只作用于本对端），
+  交给 `dtls.Server` 完成握手。对端表有全局上限 4096，空闲 1s 粒度清理。
+- **首包预筛**：只看 13 字节 DTLS 记录头（content type 20–23 + 版本 `0xFEFC/FEFD/FEFF`），
+  v0.4.0 明文端与随机垃圾不会为每个数据报建一个"握手中的对端"（每个对端一个 goroutine）。
+  预筛不是安全判断，伪造记录头仍会进入握手，由 PSK 决定成败。
+- **密钥**：`PSK = HKDF-SHA256(ikm=auth_token, salt=nil, info="pairlink-udp-dtls/v1|"+pairing_key)`，
+  32 字节；PSK identity = `pairing_key`。派生实现集中在 `internal/udpdtls`（三端共用一份，
+  参数改动会让三端一起变，不会出现"只改一端"的握手失败）。relay 的 `PSK` 回调对 identity 做
+  `pairing.ParsePairingKey` 校验，非法即返回错误（**绝不回退到全局/默认密钥**）。
+  因此持有 `auth_token` 是完成握手的必要条件，也就同时挡住了会话抢注与数据报注入。
+- **agent/client 侧**（`internal/{agent,client}/udp_dtls.go`）：对 relay UDP 端口建
+  `dtls.Client`，把原 socket 包成 `net.PacketConn`；握手完成后走原有帧收发路径，
+  断开按现有会话清理回收。
+- **重放与 MTU**：依赖 DTLS 记录层的抗重放窗口；DTLS 记录受路径 MTU 约束，
+  大数据报会 IP 分片（丢一片即整报丢失），需要大报文用 `udp_mode = tcp_tunnel`。
+- **可观测**：握手失败 `event=udp_dtls_handshake_fail`（5s 限速 WARN）、
+  `udp_dtls = false` 启动 WARN `event=udp_dtls_disabled`、对端达上限 WARN。
+
+**按 IP 签发限速**（`internal/relay/tunnel.go` + `internal/config`）：`token_rate_per_ip`
+（默认 10/s）与 `token_burst_per_ip`（默认 30）用 `golang.org/x/time/rate` 做**按来源 IP**
+的令牌桶；超限不签发配对令牌并记 `event=token_rate_limited`（限速 WARN）。限速器表按最后一次
+使用时间过期清理，随 relay 的 sweep 循环回收，不会无界增长。`token_rate_per_ip = 0` 关闭限速。
 
 ## 8. 可观测性
 

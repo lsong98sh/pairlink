@@ -104,7 +104,6 @@ func writePEM(t *testing.T, path, blockType string, der []byte) {
 // 自签 CA → relay tls.Listen（tls_cert/tls_key）→ agent/client 用 tls_ca 校验 →
 // 注册 → 配对 → TCP echo → 断开清理。数据面按设计仍是明文。
 func TestE2ETLSTCPEcho(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -155,7 +154,6 @@ func TestE2ETLSTCPEcho(t *testing.T) {
 // TestE2ETLSInsecureSkipVerify 覆盖"client 只配 tls_insecure_skip_verify=true
 // （没有 tls_ca）也能连 TLS relay"这条明确支持的组合。
 func TestE2ETLSInsecureSkipVerify(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -205,7 +203,6 @@ func TestE2ETLSInsecureSkipVerify(t *testing.T) {
 // 必须**明确失败**而不是卡住或静默：Run 返回可读错误（含 "agent:" 前缀与
 // 握手/读取失败的底层原因），进程退出由外部守护重启。
 func TestE2ETLSPlaintextAgentAgainstTLSRelay(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -251,7 +248,6 @@ func TestE2ETLSPlaintextAgentAgainstTLSRelay(t *testing.T) {
 
 // TestE2ETLSPlaintextClientAgainstTLSRelay 覆盖 client 侧的同一类配置错误。
 func TestE2ETLSPlaintextClientAgainstTLSRelay(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -292,7 +288,6 @@ func TestE2ETLSPlaintextClientAgainstTLSRelay(t *testing.T) {
 // TestE2ETLSAgentTLSAgainstPlaintextRelay 覆盖反方向的配置不匹配：
 // relay 明文、agent 配了 tls_ca → TLS 握手失败，错误必须点明 TLS。
 func TestE2ETLSAgentTLSAgainstPlaintextRelay(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -323,7 +318,6 @@ func TestE2ETLSAgentTLSAgainstPlaintextRelay(t *testing.T) {
 // TestE2ETLSExplicitOn 覆盖三端都显式 tls=true 的正向路径：
 // relay tls=true + 自签证书，agent/client tls=true + tls_ca 正常校验，TCP echo 通。
 func TestE2ETLSExplicitOn(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -374,7 +368,6 @@ func TestE2ETLSExplicitOn(t *testing.T) {
 // 必须使用系统根证书做标准校验，因此自签 relay 证书**必然被拒绝**——
 // 这证明 tls=true 不会像 tls_insecure_skip_verify 那样静默跳过校验。
 func TestE2ETLSSystemRootsRejectsSelfSigned(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -417,7 +410,6 @@ func TestE2ETLSSystemRootsRejectsSelfSigned(t *testing.T) {
 // TestE2ETLSPlainWhenFalse 覆盖 tls=false 强制明文：
 // 即使 relay 配了证书，三端都显式 false 时也必须按明文连通。
 func TestE2ETLSPlainWhenFalse(t *testing.T) {
-	guardGoroutines(t)
 	pki := newTestPKI(t)
 	echoAddr := startTCPEchoServer(t)
 
@@ -465,7 +457,6 @@ func TestE2ETLSPlainWhenFalse(t *testing.T) {
 // TestE2ETLSMismatchExplicit 覆盖显式不匹配：relay tls=false（明文）而 agent tls=true。
 // TLS 握手必须失败，且错误要指向 tls 配置（而不是静默卡住或重试）。
 func TestE2ETLSMismatchExplicit(t *testing.T) {
-	guardGoroutines(t)
 	echoAddr := startTCPEchoServer(t)
 
 	relayCfg, _ := writeRelayINI(t, relaySpec{

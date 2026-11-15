@@ -1,4 +1,4 @@
-﻿# ============================================================================
+# ============================================================================
 # PairLink Windows 部署公共函数库（内部文件，**不是入口脚本**）。
 # ----------------------------------------------------------------------------
 # 由 deploy\windows\install-relay.ps1 / install-agent.ps1 / install-client.ps1
@@ -61,12 +61,32 @@ function Get-PairLinkServiceName {
     return 'pairlink-' + $Mode
 }
 
+# v0.5.0 起日志按日期分文件：<service>-YYYY-MM-DD.log。
+# 本函数返回"今天"的日志路径，用于提示用户 Get-Content -Wait。
 function Get-PairLinkLogPath {
     param(
         [Parameter(Mandatory = $true)][string]$BinaryPath,
         [Parameter(Mandatory = $true)][string]$ServiceName
     )
-    return (Join-Path (Split-Path -Parent $BinaryPath) ($ServiceName + '.log'))
+    $logDir = Split-Path -Parent $BinaryPath
+    return (Join-Path $logDir ($ServiceName + '-' + (Get-Date -Format 'yyyy-MM-dd') + '.log'))
+}
+
+# 列出该服务全部日志文件：日文件 + v0.4.x 及更早的无日期单文件。
+function Get-PairLinkLogFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinaryPath,
+        [Parameter(Mandatory = $true)][string]$ServiceName
+    )
+    $logDir = Split-Path -Parent $BinaryPath
+    if (-not (Test-Path -LiteralPath $logDir -PathType Container)) {
+        return @()
+    }
+    return @(Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq ($ServiceName + '.log') -or $_.Name -like ($ServiceName + '-????-??-??.log')
+            } |
+            Sort-Object Name)
 }
 
 function Show-PairLinkServiceState {
@@ -107,20 +127,27 @@ function Invoke-PairLinkServiceCommand {
 
 function Remove-PairLinkLog {
     param(
-        [string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$BinaryPath,
+        [Parameter(Mandatory = $true)][string]$ServiceName,
         [bool]$KeepLogs
     )
-    if ([string]::IsNullOrWhiteSpace($LogPath)) {
-        return
-    }
-    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
-        Write-Host ("  日志文件 : 不存在（{0}）" -f $LogPath)
+    $files = Get-PairLinkLogFiles -BinaryPath $BinaryPath -ServiceName $ServiceName
+    if ($files.Count -eq 0) {
+        Write-Host ("  日志文件 : 不存在（{0}-YYYY-MM-DD.log）" -f $ServiceName)
         return
     }
     if ($KeepLogs) {
-        Write-Host ("  日志文件 : 已保留（{0}）" -f $LogPath) -ForegroundColor Yellow
+        foreach ($f in $files) {
+            Write-Host ("  日志文件 : 已保留（{0}）" -f $f.FullName) -ForegroundColor Yellow
+        }
         return
     }
-    Remove-Item -LiteralPath $LogPath -Force
-    Write-Host ("  日志文件 : 已删除（{0}）" -f $LogPath)
+    foreach ($f in $files) {
+        try {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+            Write-Host ("  日志文件 : 已删除（{0}）" -f $f.FullName)
+        } catch {
+            Write-Host ("  日志文件 : 删除失败（{0}）：{1}" -f $f.FullName, $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
 }

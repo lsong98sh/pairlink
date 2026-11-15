@@ -185,6 +185,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		Format: cfg.Common.LogFormat,
 		Mode:   modeName,
 	})
+	// v0.5.0：原生 UDP 数据面默认 DTLS-PSK；关闭时启动即提示风险（须与 relay 一致）。
+	if !cfg.Server.UDPDTLS {
+		log.Warn("udp_dtls = false：原生 UDP 数据面按 v0.4.0 明文运行（业务数据可被链路上的人读取），且必须与 relay 的 udp_dtls 一致",
+			"event", "udp_dtls_disabled", "udp_dtls", false)
+	}
 	return newAgent(ctx, cfg, log).run()
 }
 

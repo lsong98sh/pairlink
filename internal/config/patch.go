@@ -1,69 +1,102 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-)
 
-// 包级互斥锁的说明见 patchMu。
+	ini "gopkg.in/ini.v1"
+)
 
 // patchMu 串行化同一进程内对 ini 文件的读改写。
 //
 // 管理页的写操作来自多个 HTTP handler，而 PatchValue/DeleteKey 都是
-// "读整份文件 → 改一行 → 原子替换"，并发执行会互相覆盖，因此用包级互斥锁
+// "读整份文件 → 改一项 → 原子替换"，并发执行会互相覆盖，因此用包级互斥锁
 // 保证进程内串行。跨进程（例如同时用编辑器改同一个 ini）不在保证范围内。
 var patchMu sync.Mutex
 
 // PatchValue 把 ini 文件中 [section] 段的 key 值替换为 value。
 //
-// 语义（阶段 7，docs/contract.md §3.10）：
-//   - 只替换 "=" 之后的值部分，保留原行的前导空白、键名大小写与 "=" 前的对齐；
-//   - 同一段内重复出现的同名键全部替换（ini 解析器以最后一个为准，只换一个会
-//     让新值不生效）；
-//   - 段内没有该键时，插到该段最后一个非空行之后（下一个段头之前）；
-//   - 段不存在时在文件末尾追加空行、[section]、key = value；
-//   - 保留原文件的换行风格（LF / CRLF）、结尾是否有换行、BOM 与权限位；
-//   - 写盘使用同目录临时文件 + Rename，失败不会留下半截文件。
+// 语义（v0.5.0 起改用 gopkg.in/ini.v1 读写，docs/contract.md §3.10）：
+//   - 用 ini.v1 重新生成整份文件：注释会尽量保留，但空行、键顺序、对齐、
+//     换行风格（LF/CRLF）、键名大小写、重复键/重复段的写法都可能被归一；
+//   - 段名/键名大小写不敏感；同名段会被合并成一段（解析器语义）；
+//   - 键不存在时追加到该段末尾；段不存在时在文件末尾追加 [section]；
+//   - 保留原文件的 BOM 与权限位；写盘使用同目录临时文件 + Rename + 父目录 fsync；
+//   - 进程内用包级互斥锁串行化。
 //
-// 本函数不做任何"重新格式化"：注释、空行、未知键都原样保留。
+// 值中的换行、段名中的方括号、键名中的 '=' 一律拒绝（防 ini 行注入）。
 func PatchValue(path, section, key, value string) error {
 	if err := validatePatchArgs(section, key, value); err != nil {
 		return err
 	}
+	// 与读取语义一致：值两侧空白在解析时本来就会被裁剪，这里先归一，
+	// 避免 ini.v1 把带首尾空白的值写成带引号的形式。
+	section = strings.TrimSpace(section)
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+
 	patchMu.Lock()
 	defer patchMu.Unlock()
 
-	f, err := readPatchFile(path)
+	doc, info, err := loadPatchDoc(path)
 	if err != nil {
 		return err
 	}
-	if !f.patchValue(section, key, value) {
-		return nil
+	keys := matchingKeys(doc, section, key)
+	if len(keys) == 0 {
+		sec := matchingSection(doc, section)
+		if sec == nil {
+			sec, err = doc.NewSection(section)
+			if err != nil {
+				return fmt.Errorf("config: 新增段 [%s]: %w", section, err)
+			}
+		}
+		if _, err := sec.NewKey(key, value); err != nil {
+			return fmt.Errorf("config: 写入 [%s] %s: %w", section, key, err)
+		}
 	}
-	return f.write(path)
+	for _, k := range keys {
+		k.SetValue(value)
+	}
+	return writePatchDoc(info, doc)
 }
 
-// DeleteKey 删除 ini 文件中 [section] 段的 key 行（含重复键）。
+// DeleteKey 删除 ini 文件中 [section] 段的 key（同名键大小写不敏感，全部删除）。
 //
-// 键或段不存在视为成功；其余行原样保留（连续空行不清理）。
+// 键或段不存在视为成功（且不写盘，文件逐字节不变）。
 func DeleteKey(path, section, key string) error {
 	if err := validatePatchArgs(section, key, ""); err != nil {
 		return err
 	}
+	section = strings.TrimSpace(section)
+	key = strings.TrimSpace(key)
+
 	patchMu.Lock()
 	defer patchMu.Unlock()
 
-	f, err := readPatchFile(path)
+	doc, info, err := loadPatchDoc(path)
 	if err != nil {
 		return err
 	}
-	if !f.deleteKey(section, key) {
+	changed := false
+	for _, sec := range matchingSections(doc, section) {
+		for _, k := range sec.Keys() {
+			if !strings.EqualFold(k.Name(), key) {
+				continue
+			}
+			// 先按精确键名删除自己，避免大小写变体互相干扰。
+			sec.DeleteKey(k.Name())
+			changed = true
+		}
+	}
+	if !changed {
 		return nil
 	}
-	return f.write(path)
+	return writePatchDoc(info, doc)
 }
 
 // validatePatchArgs 校验补丁参数，拒绝会破坏行结构或越界的内容。
@@ -80,244 +113,128 @@ func validatePatchArgs(section, key, value string) error {
 	if strings.ContainsAny(section, "[]") {
 		return fmt.Errorf("config: 段名 %q 不能包含方括号", section)
 	}
+	if strings.EqualFold(strings.TrimSpace(section), ini.DefaultSection) {
+		return fmt.Errorf("config: 段名 %q 是 ini 保留段名，不能作为 [section] 写入", section)
+	}
 	if strings.Contains(key, "=") {
 		return fmt.Errorf("config: 键名 %q 不能包含 '='", key)
 	}
 	return nil
 }
 
-// patchFile 是保留行结构与换行风格的 ini 文本。
-type patchFile struct {
-	// lines 是去掉行尾 CR 的各行；不含 '\n'。
-	lines []string
-	// crlf 表示原文件使用 CRLF 换行。
-	crlf bool
-	// trailingNewline 表示原文件以换行结尾。
-	trailingNewline bool
-	// bom 表示原文件带 UTF-8 BOM。
-	bom bool
+// patchFileInfo 是写回时需要保留的文件元信息。
+type patchFileInfo struct {
+	// path 是配置文件的绝对路径。
+	path string
 	// mode 是原文件权限位。
 	mode os.FileMode
-	// path 是原文件路径（写入用）。
-	path string
+	// bom 表示原文件带 UTF-8 BOM（写回时保留）。
+	bom bool
 }
 
-// readPatchFile 读取并解析 ini 文本结构。
-func readPatchFile(path string) (*patchFile, error) {
+// loadPatchDoc 读取并解析 ini 文件，同时记录待保留的元信息。
+func loadPatchDoc(path string) (*ini.File, patchFileInfo, error) {
 	if strings.TrimSpace(path) == "" {
-		return nil, fmt.Errorf("config: 配置文件路径为空")
+		return nil, patchFileInfo{}, fmt.Errorf("config: 配置文件路径为空")
 	}
 	abs, err := filepath.Abs(filepath.FromSlash(path))
 	if err != nil {
-		return nil, fmt.Errorf("config: 解析配置文件路径 %q: %w", path, err)
+		return nil, patchFileInfo{}, fmt.Errorf("config: 解析配置文件路径 %q: %w", path, err)
 	}
-	info, err := os.Stat(abs)
+	stat, err := os.Stat(abs)
 	if err != nil {
-		return nil, fmt.Errorf("config: 读取配置文件 %q: %w", abs, err)
+		return nil, patchFileInfo{}, fmt.Errorf("config: 读取配置文件 %q: %w", abs, err)
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
-		return nil, fmt.Errorf("config: 读取配置文件 %q: %w", abs, err)
+		return nil, patchFileInfo{}, fmt.Errorf("config: 读取配置文件 %q: %w", abs, err)
 	}
-
-	f := &patchFile{path: abs, mode: info.Mode().Perm()}
-	text := string(data)
-	if strings.HasPrefix(text, "\ufeff") {
-		f.bom = true
-		text = strings.TrimPrefix(text, "\ufeff")
+	doc, err := ini.LoadSources(iniLoadOptions, normalizeSectionHeaders(data))
+	if err != nil {
+		return nil, patchFileInfo{}, fmt.Errorf("config: 解析配置文件 %q: %w", abs, translateINIError(err))
 	}
-	f.crlf = strings.Contains(text, "\r\n")
-	f.trailingNewline = strings.HasSuffix(text, "\n")
-	if f.trailingNewline {
-		text = strings.TrimSuffix(text, "\n")
+	// 段前键值在 Load 阶段会被拒绝；写回也不能把它留在文件里。
+	if def, derr := doc.GetSection(ini.DefaultSection); derr == nil && len(def.Keys()) > 0 {
+		return nil, patchFileInfo{}, fmt.Errorf("config: 配置文件 %q 的键值出现在任何段之前（缺少 [section] 段头）", abs)
 	}
-	if text == "" {
-		return f, nil
+	// ini.v1 写回时会把"第一个、大小写不敏感等于 DEFAULT 的段"当作隐式默认段
+	// 并省略段头（[default] 也会中招），写回后再 Load 会变成"段前键值"。
+	// 这种段名是保留名，直接拒绝写回，避免把文件写坏。
+	for _, sec := range doc.Sections() {
+		if sec.Name() != ini.DefaultSection && strings.EqualFold(sec.Name(), ini.DefaultSection) {
+			return nil, patchFileInfo{}, fmt.Errorf("config: 配置文件 %q 包含 ini 保留段名 [%s]，拒绝写回", abs, sec.Name())
+		}
 	}
-	raw := strings.Split(text, "\n")
-	f.lines = make([]string, len(raw))
-	for i, line := range raw {
-		f.lines[i] = strings.TrimSuffix(line, "\r")
+	info := patchFileInfo{
+		path: abs,
+		mode: stat.Mode().Perm(),
+		bom:  bytes.HasPrefix(data, []byte("\ufeff")),
 	}
-	return f, nil
+	return doc, info, nil
 }
 
-// eol 返回该文件使用的换行符。
-func (f *patchFile) eol() string {
-	if f.crlf {
-		return "\r\n"
-	}
-	return "\n"
-}
-
-// render 把行结构还原为字节。
-func (f *patchFile) render() []byte {
-	var b strings.Builder
-	if f.bom {
-		b.WriteString("\ufeff")
-	}
-	eol := f.eol()
-	b.WriteString(strings.Join(f.lines, eol))
-	if f.trailingNewline && len(f.lines) > 0 {
-		b.WriteString(eol)
-	}
-	return []byte(b.String())
-}
-
-// write 原子写回文件。
-func (f *patchFile) write(path string) error {
-	return writeFileAtomic(path, f.render(), f.mode)
-}
-
-// sectionRanges 返回 [section] 段头行号与下一个段头行号（不含）。
-//
-// 同名段重复出现时返回多个区间（ini 解析器会合并同名段，补丁必须覆盖所有出现）。
-// 段不存在时返回空切片。
-func (f *patchFile) sectionRanges(section string) [][2]int {
-	var out [][2]int
-	start := -1
-	for i, line := range f.lines {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {
+// matchingSections 返回段名不区分大小写匹配的全部段（不含隐式默认段）。
+func matchingSections(doc *ini.File, name string) []*ini.Section {
+	var out []*ini.Section
+	for _, sec := range doc.Sections() {
+		if sec.Name() == ini.DefaultSection {
 			continue
 		}
-		if start >= 0 {
-			out = append(out, [2]int{start, i})
-			start = -1
+		if strings.EqualFold(strings.TrimSpace(sec.Name()), name) {
+			out = append(out, sec)
 		}
-		name := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
-		if strings.EqualFold(name, section) {
-			start = i
-		}
-	}
-	if start >= 0 {
-		out = append(out, [2]int{start, len(f.lines)})
 	}
 	return out
 }
 
-// keyLineEq 判断一行是否是目标键；返回 '=' 的位置。
-func keyLineEq(line, key string) (int, bool) {
-	trimmed := strings.TrimSpace(line)
-	if trimmed == "" || strings.HasPrefix(trimmed, ";") || strings.HasPrefix(trimmed, "#") ||
-		strings.HasPrefix(trimmed, "[") {
-		return 0, false
+// matchingSection 返回第一个匹配的段，不存在时返回 nil。
+func matchingSection(doc *ini.File, name string) *ini.Section {
+	secs := matchingSections(doc, name)
+	if len(secs) == 0 {
+		return nil
 	}
-	eq := strings.Index(line, "=")
-	if eq < 0 {
-		return 0, false
-	}
-	if !strings.EqualFold(strings.TrimSpace(line[:eq]), key) {
-		return 0, false
-	}
-	return eq, true
+	return secs[0]
 }
 
-// patchValue 替换或插入键值；返回是否有改动。
-func (f *patchFile) patchValue(section, key, value string) bool {
-	ranges := f.sectionRanges(section)
-	if len(ranges) == 0 {
-		f.appendSection(section, key, value)
-		return true
-	}
-	replaced := false
-	for _, r := range ranges {
-		for i := r[0] + 1; i < r[1]; i++ {
-			eq, isKey := keyLineEq(f.lines[i], key)
-			if !isKey {
-				continue
-			}
-			f.lines[i] = replaceValuePart(f.lines[i], eq, value)
-			replaced = true
-		}
-	}
-	if replaced {
-		return true
-	}
-
-	// 键不存在：插到最后一个同名段内最后一个非空行之后；段内全空则紧跟段头。
-	last := ranges[len(ranges)-1]
-	insertAt := last[0] + 1
-	for i := last[0] + 1; i < last[1]; i++ {
-		if strings.TrimSpace(f.lines[i]) != "" {
-			insertAt = i + 1
-		}
-	}
-	f.insertLine(insertAt, key+" = "+value)
-	return true
-}
-
-// deleteKey 删除键行；返回是否有改动。
-func (f *patchFile) deleteKey(section, key string) bool {
-	ranges := f.sectionRanges(section)
-	if len(ranges) == 0 {
-		return false
-	}
-	remove := make(map[int]bool, len(f.lines))
-	for _, r := range ranges {
-		for i := r[0] + 1; i < r[1]; i++ {
-			if _, isKey := keyLineEq(f.lines[i], key); isKey {
-				remove[i] = true
+// matchingKeys 返回所有匹配段中键名不区分大小写匹配的键。
+//
+// 同一段内大小写不同的重复键在 ini.v1 里是不同条目（不设置 Insensitive 时），
+// 这里全部返回，保证写回后读取仍拿到新值（与旧实现"重复键全部替换"一致）。
+func matchingKeys(doc *ini.File, section, key string) []*ini.Key {
+	var out []*ini.Key
+	for _, sec := range matchingSections(doc, section) {
+		for _, k := range sec.Keys() {
+			if strings.EqualFold(k.Name(), key) {
+				out = append(out, k)
 			}
 		}
 	}
-	if len(remove) == 0 {
-		return false
-	}
-	out := make([]string, 0, len(f.lines)-len(remove))
-	for i, line := range f.lines {
-		if remove[i] {
-			continue
-		}
-		out = append(out, line)
-	}
-	f.lines = out
-	return true
+	return out
 }
 
-// appendSection 在文件末尾追加空行、段头与键值。
-func (f *patchFile) appendSection(section, key, value string) {
-	if len(f.lines) > 0 {
-		// 文件末尾补一个空行；若已有尾部空行则不重复添加。
-		if strings.TrimSpace(f.lines[len(f.lines)-1]) != "" {
-			f.lines = append(f.lines, "")
-		}
+// writePatchDoc 把 ini.v1 文档渲染为字节并原子写回。
+func writePatchDoc(info patchFileInfo, doc *ini.File) error {
+	var buf bytes.Buffer
+	if info.bom {
+		buf.WriteString("\ufeff")
 	}
-	f.lines = append(f.lines, "["+section+"]", key+" = "+value)
-	f.trailingNewline = true
+
+	// ini.v1 的排版参数是包级变量：默认 PrettyFormat=true 会把同一段内的
+	// "=" 对齐到最长键，换行符在 Windows 上还会变成 CRLF。这里在写回期间
+	// 临时改成统一的 "key = value" + LF（patchMu 保证串行），写回后再恢复，
+	// 避免把依赖库的全局状态永久改掉。
+	prettyFormat, prettyEqual, lineBreak := ini.PrettyFormat, ini.PrettyEqual, ini.LineBreak
+	ini.PrettyFormat, ini.PrettyEqual, ini.LineBreak = false, true, "\n"
+	defer func() {
+		ini.PrettyFormat, ini.PrettyEqual, ini.LineBreak = prettyFormat, prettyEqual, lineBreak
+	}()
+	if _, err := doc.WriteTo(&buf); err != nil {
+		return fmt.Errorf("config: 生成配置文本: %w", err)
+	}
+	return writeFileAtomic(info.path, buf.Bytes(), info.mode)
 }
 
-// insertLine 在指定位置插入一行。
-func (f *patchFile) insertLine(at int, line string) {
-	if at < 0 {
-		at = 0
-	}
-	if at > len(f.lines) {
-		at = len(f.lines)
-	}
-	f.lines = append(f.lines, "")
-	copy(f.lines[at+1:], f.lines[at:])
-	f.lines[at] = line
-}
-
-// replaceValuePart 只替换 "=" 之后的值，保留 "=" 前的内容、值前空白与行尾空白。
-func replaceValuePart(line string, eq int, value string) string {
-	if eq < 0 || eq >= len(line) {
-		return line
-	}
-	rest := line[eq+1:]
-	lead := 0
-	for lead < len(rest) && (rest[lead] == ' ' || rest[lead] == '\t') {
-		lead++
-	}
-	end := len(rest)
-	for end > lead && (rest[end-1] == ' ' || rest[end-1] == '\t') {
-		end--
-	}
-	return line[:eq+1] + rest[:lead] + value + rest[end:]
-}
-
-// writeFileAtomic 通过同目录临时文件 + Rename 原子替换目标文件。
+// writeFileAtomic 通过同目录临时文件 + Rename + 父目录 fsync 原子替换目标文件。
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".pairlink-ini-*.tmp")
@@ -348,6 +265,11 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("config: 替换配置文件 %s: %w", path, err)
+	}
+	// Rename 只改目录项：不 fsync 父目录时，崩溃/掉电后 rename 可能没有落盘，
+	// 文件会回到旧内容甚至消失。Windows 没有等价的目录 fsync，见 syncDir 的分平台实现。
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("config: 同步目录 %s: %w", dir, err)
 	}
 	return nil
 }

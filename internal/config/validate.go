@@ -5,6 +5,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"github.com/lsong98sh/pairlink/internal/logx"
 )
 
 // knownKeys 列出各段已知键，用于未知键警告。
@@ -14,6 +16,7 @@ var knownKeys = map[string]map[string]bool{
 		"pprof":         true,
 		"log_level":     true,
 		"log_format":    true,
+		"log_keep_days": true,
 	},
 	"relay": {
 		"tunnel_listen":          true,
@@ -34,6 +37,9 @@ var knownKeys = map[string]map[string]bool{
 		"heartbeat_timeout":      true,
 		"udp_session_timeout":    true,
 		"token_ttl":              true,
+		"udp_dtls":               true,
+		"token_rate_per_ip":      true,
+		"token_burst_per_ip":     true,
 	},
 	"server": {
 		"relay_addr":               true,
@@ -47,6 +53,7 @@ var knownKeys = map[string]map[string]bool{
 		"heartbeat":                true,
 		"dial_timeout":             true,
 		"udp_session_timeout":      true,
+		"udp_dtls":                 true,
 		"reconnect":                true,
 		"reconnect_max_backoff":    true,
 	},
@@ -62,6 +69,7 @@ var knownKeys = map[string]map[string]bool{
 		"dial_timeout":             true,
 		"pair_timeout":             true,
 		"udp_session_timeout":      true,
+		"udp_dtls":                 true,
 		"reconnect":                true,
 		"reconnect_max_backoff":    true,
 	},
@@ -73,7 +81,7 @@ func (b *builder) warnUnknown() {
 		sec := b.file.sections[name]
 		keys, knownSection := knownKeys[name]
 		if !knownSection {
-			b.warnf("未知配置段 [%s]（第 %d 行），已忽略", sec.Name, sec.Line)
+			b.warnf("未知配置段 [%s]，已忽略", sec.Name)
 			continue
 		}
 		for _, normKey := range sec.order {
@@ -84,7 +92,7 @@ func (b *builder) warnUnknown() {
 			if (name == "server" || name == "client") && strings.HasPrefix(normKey, "service.") {
 				continue
 			}
-			b.warnf("未知配置项 [%s] %s（第 %d 行），已忽略", sec.Name, v.Key, v.Line)
+			b.warnf("未知配置项 [%s] %s，已忽略", sec.Name, v.Key)
 		}
 	}
 }
@@ -141,6 +149,9 @@ func (c *Config) validateCommon() error {
 	case "text", "json":
 	default:
 		return fmt.Errorf("[common] log_format = %q 非法，只允许 text / json", c.Common.LogFormat)
+	}
+	if err := logx.ValidateKeepDays(c.Common.LogKeepDays); err != nil {
+		return err
 	}
 	if c.Common.ManageListen != "" {
 		if err := checkListenAddr("[common] manage_listen", c.Common.ManageListen); err != nil {
@@ -260,8 +271,11 @@ func (c *Config) validateRelay() error {
 	if dataMode == TLSFalse && tunnelTLS {
 		c.addWarning("[relay] data_tls = false：TCP 数据面按明文运行（业务数据与 pairing_token 可被链路上的人读取），隧道 TLS 只保护控制面")
 	}
-	if dataTLS && strings.TrimSpace(r.UDPListen) != "" {
-		c.addWarning("[relay] 数据面 TLS 只覆盖 TCP 数据面：已配置 udp_listen，原生 UDP 数据面仍为明文；如需加密请移除 udp_listen 改用 udp_mode = tcp_tunnel")
+	if dataTLS && strings.TrimSpace(r.UDPListen) != "" && !r.UDPDTLS {
+		c.addWarning("[relay] 数据面 TLS 只覆盖 TCP 数据面：已配置 udp_listen 且 udp_dtls = false，原生 UDP 数据面仍为明文；如需加密请设置 udp_dtls = true（DTLS-PSK）或移除 udp_listen 改用 udp_mode = tcp_tunnel")
+	}
+	if strings.TrimSpace(r.UDPListen) != "" && !r.UDPDTLS {
+		c.addWarning("[relay] udp_dtls = false：原生 UDP 数据面（udp_listen）按 v0.4.0 明文运行，业务数据与 pairing_token 可被链路上的人读取；仅用于与旧版本混合过渡，生产环境请保持 udp_dtls = true")
 	}
 
 	// SEC-A2：服务名白名单与单 agent 服务数上限。
@@ -309,6 +323,16 @@ func (c *Config) validateRelay() error {
 		if l.value < 0 {
 			return fmt.Errorf("[relay] %s = %d 不能为负数（0 表示不限制）", l.name, l.value)
 		}
+	}
+	// v0.5.0：按来源 IP 的令牌签发限速。rate = 0 表示不限速（此时 burst 被忽略）。
+	if r.TokenRatePerIP < 0 {
+		return fmt.Errorf("[relay] token_rate_per_ip = %d 不能为负数（0 表示不限制）", r.TokenRatePerIP)
+	}
+	if r.TokenBurstPerIP < 0 {
+		return fmt.Errorf("[relay] token_burst_per_ip = %d 不能为负数", r.TokenBurstPerIP)
+	}
+	if r.TokenRatePerIP > 0 && r.TokenBurstPerIP < 1 {
+		return fmt.Errorf("[relay] token_rate_per_ip = %d 时 token_burst_per_ip 必须 >= 1（当前 %d）", r.TokenRatePerIP, r.TokenBurstPerIP)
 	}
 	if c.Common.ManageListen != "" {
 		manageKey := canonicalAddr(c.Common.ManageListen)
